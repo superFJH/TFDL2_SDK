@@ -1,0 +1,11 @@
+cmake_minimum_required(VERSION 3.2)
+project(Cityscape)
+find_package(OpenCV REQUIRED)
+set(CMAKE_CXX_STANDARD 14)
+
+add_executable(Cityscape main.cpp)
+target_include_directories(Cityscape PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+target_link_directories(Cityscape PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../lib)
+target_link_directories(Cityscape PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../lib/CV_NPU10T)
+target_link_libraries(Cityscape TFDL2_LITE_C_API TFCV tfg tfgs tfdec mk_api)
+target_link_libraries(Cityscape ${OpenCV_LIBS})

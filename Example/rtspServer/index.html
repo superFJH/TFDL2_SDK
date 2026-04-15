@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Manager</title>
+    <script src="https://cdn.bootcss.com/jquery/3.2.1/jquery.min.js"></script>
+</head>
+<body>
+    <img id="img">
+ </body>
+ <script>
+     $(document).ready(()=>{
+        setInterval(()=>{
+            $.get("/Img",(data)=>{
+                if(data === "No")return;
+                $("#img").attr("src",data);
+            })
+        },30);
+     });
+
+ </script>
+ </html>

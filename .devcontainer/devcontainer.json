@@ -1,0 +1,22 @@
+{
+    "name": "Thinkforce TFDL SDK Dev Env",
+    "dockerFile": "Dockerfile",  // 指向 Dockerfile
+    "privileged": true,
+    "runArgs": ["--network=host"],
+    "mounts": [{
+      "source": "/mnt",
+      "target": "/mnt",
+      "type": "bind",
+    },
+      {
+        "source": "/dev",
+        "target": "/dev",
+        "type": "bind"
+      },
+      {
+        "source": "/lib/firmware",
+        "target": "/lib/firmware",
+        "type": "bind"
+      }
+    ]
+  }

@@ -1,0 +1,5 @@
+本项目是一个基于CityScape数据集的语义分割模型，使用NPU SDK进行推理。该模型使用paddlepaddle提供的pplite模型，并使用NPU SDK进行推理加速。
+
+模型训练和验证数据集为CityScape数据集，该数据集包含多个场景，包括城市街道、建筑物、植被等。模型使用CityScape数据集进行训练和验证，以实现语义分割任务。
+
+模型使用paddlepaddle提供的pplite模型，该模型是一个轻量级的模型，可以在NPU上进行推理加速。模型使用NPU SDK进行推理，以实现更快的推理速度和更低的功耗。

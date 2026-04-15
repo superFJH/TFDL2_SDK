@@ -1,0 +1,9 @@
+本项目是一个基于yolov5的目标检测项目，使用NPU进行加速推理。
+
+模型文件：yolov5su.onnx
+
+使用方法：
+1. 先在Example文件夹下执行mkimglist.sh获得coco.list。
+2. 使用ConvertandQuant.sh将目录下的yolov5su.onnx转换为yolov5su.fb 和yolov5su.quant.fb。
+3. mkdir build && cd build && cmake .. && make
+4. 运行run.sh，即可进行推理。

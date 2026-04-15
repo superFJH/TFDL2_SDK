@@ -1,0 +1,32 @@
+# 忽略所有文件
+*/
+
+# 但保留你选择的文件夹（例如：src, docs, config 等）
+!AddonOps
+!bin
+!Example
+!Doc
+!ConvertTools
+!include
+!lib
+!Python
+!.devcontainer
+
+
+!AddonOps/**
+!bin/**
+!Example/**
+!Doc/**
+!ConvertTools/**
+!include/**
+!lib/**
+!Python/**
+!.devcontainer/**
+
+
+
+# 忽略所有 __pycache__ 文件夹
+**/__pycache__/
+# 忽略所有build文件夹 这里默认所有cmake都是用的build
+**/build/
+**/*egg-info/

@@ -1,0 +1,21 @@
+{
+  "UseHardware": true,
+  "FrugalMode": true,
+  "Eltmode": 2,
+  "Core": [-1],
+  "cpuLimit" : 8,
+  "compileMod": 0,
+  "useCache": true,
+  "shareConcatslice": false,
+  "useInterleave": false,
+  "optimize":{
+    "DoAlign": false,
+    "MakeAlign": true,
+    "MakeBroadCast": false,
+    "MakeUnfold": true,
+    "SplitDeconv": true,
+    "AttnSoftmaxImpl": false,
+    "HighAccuracy": false
+  },
+  "InputShape":[{"NodeName":"images","Shape":[1,3,360,320]}]
+}
