@@ -124,8 +124,41 @@ LoadCustomOp("libTFDLAddOn.so")
 ctx = TFContext("my_model")
 with ctx:
     x = Op.Placeholder2(ctx, shape=[1, 3, 224, 224], outDatatype=TFDataType.TFDL_FLOAT)
-    ctx.LoadProto("model.quant.fb")
-    ctx.SetOutputs(ctx.GetOutputNames())
+    x = Op.Convolution(x,kernel=3,pad=1,stride=1,dilation=1,group=1,hasBias=True)
+    x = Op.Swish(x)
+
+# 创建执行器并推理
+executor = TFExecutor(context=ctx, config={"UseHardware": True, "FrugalMode": True})
+inputs = executor.GetInputs()
+inputs[0].fromNumpy(numpy_array)  # 填入输入数据
+outputs = executor()               # 执行推理
+result = outputs[0].toNumpy()      # 获取输出
+```
+### 当需要使用自定义算子时
+```python
+from TFDL2 import TFContext, TFExecutor, Op
+from TFDL2.Common import TFDataType
+from TFDL2.utils import LoadCustomOp
+
+# 加载自定义算子（如需要）
+LoadCustomOp("libTFDLAddOn.so")
+
+# 构建网络
+ctx = TFContext("my_model")
+with ctx:
+        q_sym = Op.Placeholder2(ctx, shape=(B, num_heads, N, head_dim), outDatatype=TFDataType.TFDL_FLOAT)
+        k_sym = Op.Placeholder2(ctx, shape=(B, num_heads, N, head_dim), outDatatype=TFDataType.TFDL_FLOAT)
+        sin_sym = Op.Placeholder2(ctx, shape=(1, 1, hw, head_dim), outDatatype=TFDataType.TFDL_FLOAT)
+        cos_sym = Op.Placeholder2(ctx, shape=(1, 1, hw, head_dim), outDatatype=TFDataType.TFDL_FLOAT)
+
+        #这里用ApplyRope作为示例，实际使用时需要替换成自定义算子
+        q_out,k_out = Op.Custom(
+                (q_sym, k_sym, sin_sym, cos_sym),
+                ("q_out", "k_out"),#输出名称
+                "ApplyRope",#这个名称严格与AddonOps里定义的算子名称一致
+                json.dumps({"scale": 0.365})
+        )
+ctx.SetOutputs(["q_out", "k_out"])
 
 # 创建执行器并推理
 executor = TFExecutor(context=ctx, config={"UseHardware": True, "FrugalMode": True})
