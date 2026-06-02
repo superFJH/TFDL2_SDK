@@ -33,6 +33,7 @@ namespace TFDLOP {
     namespace ApplyRope {
         struct ApplyRopeParam {
             bool useFp16 = false;  // 使用 FP16 NEON 加速 (精度略降, 速度更快)
+            bool interleaved = false;  // Adjacent complex pairs, used by MoonViT.
         };
 
         void Prepare(TFContext tfContext, TFNode node) {
@@ -43,6 +44,7 @@ namespace TFDLOP {
             ApplyRopeParam *p = new ApplyRopeParam();
             if (err.empty()) {
                 p->useFp16 = param["useFp16"].bool_value();
+                p->interleaved = param["interleaved"].bool_value();
             }
 
             FreeNodeCustomParam(node, [](void *customparam) {
@@ -76,12 +78,13 @@ namespace TFDLOP {
             auto sinShape = GetTensorShape(sinData);
             auto cosShape = GetTensorShape(cosData);
 
-            // q and k must have same shape: [B, num_heads, N, head_dim]
+            // q/k are [B, heads, N, head_dim].  ViT uses equal head counts,
+            // while Qwen-style GQA uses more query heads than KV heads.
             TFCHECK_EQ(qShape.size(), 4);
-            TFCHECK_EQ(qShape.size(), kShape.size());
-            for (size_t i = 0; i < qShape.size(); i++) {
-                TFCHECK_EQ(qShape[i], kShape[i]);
-            }
+            TFCHECK_EQ(kShape.size(), 4);
+            TFCHECK_EQ(qShape[0], kShape[0]);
+            TFCHECK_EQ(qShape[2], kShape[2]);
+            TFCHECK_EQ(qShape[3], kShape[3]);
 
             // sin and cos must have same shape: [broadcast..., hw, head_dim]
             TFCHECK_EQ(sinShape.size(), cosShape.size());
@@ -99,7 +102,7 @@ namespace TFDLOP {
             int hw = sinShape[sinShape.size() - 2];
             TFCHECK_GE(N, hw);
 
-            // Output shapes same as q and k
+            // Output shapes follow each input independently.
             ReSizeTensor(qOutData, qShape);
             SetTensorType(qOutData, GetTensorType(qData));
             ReSizeTensor(kOutData, kShape);
@@ -113,7 +116,7 @@ namespace TFDLOP {
                 const float *x, float *out,
                 const float *sin, const float *cos,
                 int B, int numHeads, int N, int headDim,
-                int sinB, int sinH, int hw) {
+                int sinB, int sinH, int hw, bool interleaved = false) {
             int half = headDim / 2;
             int prefix = N - hw;
 
@@ -140,13 +143,20 @@ namespace TFDLOP {
                         const float *cosPtr = cos + ((sb * sinH + sh) * hw + sn) * headDim;
                         float *outPtr = out + ((b * numHeads + h) * N + n) * headDim;
 
-                        // 前半: out[d] = x[d]*cos[d] - x[d+half]*sin[d]
-                        for (int d = 0; d < half; d++) {
-                            outPtr[d] = xPtr[d] * cosPtr[d] - xPtr[d + half] * sinPtr[d];
-                        }
-                        // 后半: out[d] = x[d]*cos[d] + x[d-half]*sin[d]
-                        for (int d = half; d < headDim; d++) {
-                            outPtr[d] = xPtr[d] * cosPtr[d] + xPtr[d - half] * sinPtr[d];
+                        if (interleaved) {
+                            for (int d = 0; d + 1 < headDim; d += 2) {
+                                outPtr[d] = xPtr[d] * cosPtr[d] - xPtr[d + 1] * sinPtr[d];
+                                outPtr[d + 1] = xPtr[d + 1] * cosPtr[d + 1] + xPtr[d] * sinPtr[d + 1];
+                            }
+                        } else {
+                            // 前半: out[d] = x[d]*cos[d] - x[d+half]*sin[d]
+                            for (int d = 0; d < half; d++) {
+                                outPtr[d] = xPtr[d] * cosPtr[d] - xPtr[d + half] * sinPtr[d];
+                            }
+                            // 后半: out[d] = x[d]*cos[d] + x[d-half]*sin[d]
+                            for (int d = half; d < headDim; d++) {
+                                outPtr[d] = xPtr[d] * cosPtr[d] + xPtr[d - half] * sinPtr[d];
+                            }
                         }
                     }
                 }
@@ -378,7 +388,11 @@ namespace TFDLOP {
                 const float *x, float *out,
                 const float *sin, const float *cos,
                 int B, int numHeads, int N, int headDim,
-                int sinB, int sinH, int hw, bool useFp16) {
+                int sinB, int sinH, int hw, bool useFp16, bool interleaved = false) {
+            if (interleaved) {
+                ropeApplyScalar(x, out, sin, cos, B, numHeads, N, headDim, sinB, sinH, hw, true);
+                return;
+            }
 #if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
             if (useFp16) {
                 ropeApplyFp16Neon(x, out, sin, cos, B, numHeads, N, headDim, sinB, sinH, hw);
@@ -411,10 +425,12 @@ namespace TFDLOP {
             auto kOutData = GetTensorByName(tfContext, info.OutputNames[1]);
 
             auto qShape = GetTensorShape(qData);
+            auto kShape = GetTensorShape(kData);
             auto sinShape = GetTensorShape(sinData);
 
             int B = qShape[0];
-            int numHeads = qShape[1];
+            int qNumHeads = qShape[1];
+            int kNumHeads = kShape[1];
             int N = qShape[2];
             int headDim = qShape[3];
             int hw = sinShape[sinShape.size() - 2];
@@ -432,32 +448,33 @@ namespace TFDLOP {
                 float *qOutPtr = (float *) GetTensordata(qOutData);
                 float *kOutPtr = (float *) GetTensordata(kOutData);
 
-                ropeApplyFloat(qPtr, qOutPtr, sinPtr, cosPtr, B, numHeads, N, headDim, sinB, sinH, hw, param->useFp16);
-                ropeApplyFloat(kPtr, kOutPtr, sinPtr, cosPtr, B, numHeads, N, headDim, sinB, sinH, hw, param->useFp16);
+                ropeApplyFloat(qPtr, qOutPtr, sinPtr, cosPtr, B, qNumHeads, N, headDim, sinB, sinH, hw, param->useFp16, param->interleaved);
+                ropeApplyFloat(kPtr, kOutPtr, sinPtr, cosPtr, B, kNumHeads, N, headDim, sinB, sinH, hw, param->useFp16, param->interleaved);
 
             } else if (GetTensorType(qData) == TFCAPI_UINT8 && GetTensorType(kData) == TFCAPI_UINT8) {
                 // Uint8 path: dequantize -> float RoPE -> requantize
-                int totalElements = B * numHeads * N * headDim;
+                int qTotalElements = B * qNumHeads * N * headDim;
+                int kTotalElements = B * kNumHeads * N * headDim;
                 auto qQuant = GetTensorQuantizeInfo(tfContext, info.InputNames[0]);
                 auto kQuant = GetTensorQuantizeInfo(tfContext, info.InputNames[1]);
 
                 // Dequantize q and k to float
-                float *qFloat = new float[totalElements];
-                float *kFloat = new float[totalElements];
-                DeQuantizeTensorData(qFloat, (uint8_t *) GetTensordata(qData), totalElements, qQuant);
-                DeQuantizeTensorData(kFloat, (uint8_t *) GetTensordata(kData), totalElements, kQuant);
+                float *qFloat = new float[qTotalElements];
+                float *kFloat = new float[kTotalElements];
+                DeQuantizeTensorData(qFloat, (uint8_t *) GetTensordata(qData), qTotalElements, qQuant);
+                DeQuantizeTensorData(kFloat, (uint8_t *) GetTensordata(kData), kTotalElements, kQuant);
 
                 // Apply RoPE in float
-                float *qOutFloat = new float[totalElements];
-                float *kOutFloat = new float[totalElements];
-                ropeApplyFloat(qFloat, qOutFloat, sinPtr, cosPtr, B, numHeads, N, headDim, sinB, sinH, hw, param->useFp16);
-                ropeApplyFloat(kFloat, kOutFloat, sinPtr, cosPtr, B, numHeads, N, headDim, sinB, sinH, hw, param->useFp16);
+                float *qOutFloat = new float[qTotalElements];
+                float *kOutFloat = new float[kTotalElements];
+                ropeApplyFloat(qFloat, qOutFloat, sinPtr, cosPtr, B, qNumHeads, N, headDim, sinB, sinH, hw, param->useFp16, param->interleaved);
+                ropeApplyFloat(kFloat, kOutFloat, sinPtr, cosPtr, B, kNumHeads, N, headDim, sinB, sinH, hw, param->useFp16, param->interleaved);
 
                 // Requantize back to uint8
                 auto qOutQuant = GetTensorQuantizeInfo(tfContext, info.OutputNames[0]);
                 auto kOutQuant = GetTensorQuantizeInfo(tfContext, info.OutputNames[1]);
-                QuantizeTensorData((uint8_t *) GetTensordata(qOutData), qOutFloat, totalElements, qOutQuant);
-                QuantizeTensorData((uint8_t *) GetTensordata(kOutData), kOutFloat, totalElements, kOutQuant);
+                QuantizeTensorData((uint8_t *) GetTensordata(qOutData), qOutFloat, qTotalElements, qOutQuant);
+                QuantizeTensorData((uint8_t *) GetTensordata(kOutData), kOutFloat, kTotalElements, kOutQuant);
 
                 delete[] qFloat;
                 delete[] kFloat;
