@@ -211,13 +211,27 @@ class ConvTransposeParser(OnnxParser):
         group = node.attr["group"]
         assert node.attr["dilations"][0] == node.attr["dilations"][1],"dilations must eq"
         dilations = node.attr["dilations"][0]
+        outPadH = 0
+        outPadW = 0
+        if "output_padding" in node.attr:
+            if isinstance(node.attr["output_padding"],list):
+                if len(node.attr["output_padding"]) > 2:
+                    raise Exception("deconv only support same outPadH or outpadW")
+                outPadH = node.attr["output_padding"][0]
+                if len(node.attr["output_padding"]) == 2:
+                    outPadW = node.attr["output_padding"][1]
+                else:
+                    outPadW = outPadH
+            elif isinstance(node.attr["output_padding"],int):
+                outPadW = node.attr["output_padding"]
+                outPadH = node.attr["output_padding"]
         Bias = None
         if len(args) > 2:
             Bias = args[2]
 
         outchannel = node.graph.params[node.inputs[1]].shape[0]
 
-        return DeConvolution2(args[0],args[1],Bias,kernel_shape,pads,strides,dilations,outchannel,group)
+        return DeConvolution2(args[0],args[1],Bias,kernel_shape,pads,strides,dilations,outchannel,group,outPadH,outPadW)
 
 class ActivationParser(OnnxParser):
     @classmethod

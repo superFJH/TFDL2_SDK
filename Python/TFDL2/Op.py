@@ -330,7 +330,7 @@ def TFConvolution(Input: TFSymbol,kernel,Same:bool,stride,dilation:int,outChanne
         raise RuntimeError("Wrong kernel type")
     return TFDL2.TFConvolution(Input,kernel,Same,stride,dilation,outChannel,group,hasBias)
 
-def DeConvolution(Input: TFSymbol,kernel,pad,stride,dilation:int,outChannel:int,group:int,hasBias:bool=True)->TFSymbol:
+def DeConvolution(Input: TFSymbol,kernel,pad,stride,dilation:int,outChannel:int,group:int,hasBias:bool=True,outPadH:int=0,outPadW:int=0)->TFSymbol:
     if isinstance(kernel,int):
         kernel = (kernel,kernel)
     elif isinstance(kernel,list):
@@ -373,9 +373,9 @@ def DeConvolution(Input: TFSymbol,kernel,pad,stride,dilation:int,outChannel:int,
         stride = stride
     else:
         raise RuntimeError("Wrong kernel type")
-    return TFDL2.DeConvolution(Input,kernel,pad,stride,dilation,outChannel,group,hasBias)
+    return TFDL2.DeConvolution(Input,kernel,pad,stride,dilation,outChannel,group,hasBias,outPadH,outPadW)
 
-def DeConvolution2(Input: TFSymbol,weight: TFSymbol,bias: TFSymbol,kernel,pad,stride,dilation:int,outChannel:int,group:int)->TFSymbol:
+def DeConvolution2(Input: TFSymbol,weight: TFSymbol,bias: TFSymbol,kernel,pad,stride,dilation:int,outChannel:int,group:int,outPadH:int=0,outPadW:int=0)->TFSymbol:
     if weight is None:
         weight = TFSymbol()
     if bias is None:
@@ -423,7 +423,7 @@ def DeConvolution2(Input: TFSymbol,weight: TFSymbol,bias: TFSymbol,kernel,pad,st
         stride = stride
     else:
         raise RuntimeError("Wrong kernel type")
-    return TFDL2.DeConvolution2(Input,weight,bias,kernel,pad,stride,dilation,outChannel,group)
+    return TFDL2.DeConvolution2(Input,weight,bias,kernel,pad,stride,dilation,outChannel,group,outPadH,outPadW)
 
 def GlobalAvePooling(Input:TFSymbol):
     if type(Input) == tuple:

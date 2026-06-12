@@ -1448,7 +1448,7 @@ namespace PythonInter {
 
         return TFSymbol(tfContext,TFFunc::TensorflowConvolution(tfContext,input.getName(),kernel_,Same,stride_,dilation,outChannel,group,hasBias));
     }
-    TFSymbol DeConvolution(TFSymbol input,py::tuple kernel,py::tuple pad,py::tuple stride,int dilation,int outChannel,int group,bool hasBias){
+    TFSymbol DeConvolution(TFSymbol input,py::tuple kernel,py::tuple pad,py::tuple stride,int dilation,int outChannel,int group,bool hasBias, int outPadH, int outPadW){
         vector<int>kernel_,stride_,pad_;
         for(int i = 0;i<py::len(kernel);i++){
             kernel_.push_back(py::cast<int>(kernel[i]));
@@ -1460,9 +1460,9 @@ namespace PythonInter {
             pad_.push_back(py::cast<int>(pad[i]));
         }
         TFContext tfContext = input.GetContext();
-        return TFSymbol(tfContext,TFFunc::DeConvolution(tfContext,input.getName(),kernel_,pad_,stride_,dilation,outChannel,group,hasBias));
+        return TFSymbol(tfContext,TFFunc::DeConvolution(tfContext,input.getName(),kernel_,pad_,stride_,dilation,outChannel,group,hasBias,outPadH,outPadW));
     }
-    TFSymbol DeConvolution2(TFSymbol input,TFSymbol weight,TFSymbol bias,py::tuple kernel,py::tuple pad,py::tuple stride,int dilation,int outChannel,int group){
+    TFSymbol DeConvolution2(TFSymbol input,TFSymbol weight,TFSymbol bias,py::tuple kernel,py::tuple pad,py::tuple stride,int dilation,int outChannel,int group,int outPadH, int outPadW){
         vector<int>kernel_,stride_,pad_;
         for(int i = 0;i<py::len(kernel);i++){
             kernel_.push_back(py::cast<int>(kernel[i]));
@@ -1474,7 +1474,7 @@ namespace PythonInter {
             pad_.push_back(py::cast<int>(pad[i]));
         }
         TFContext tfContext = input.GetContext();
-        return TFSymbol(tfContext,TFFunc::DeConvolution(tfContext,input.getName(),weight.getName(),bias.getName(),kernel_,pad_,stride_,dilation,outChannel,group));
+        return TFSymbol(tfContext,TFFunc::DeConvolution(tfContext,input.getName(),weight.getName(),bias.getName(),kernel_,pad_,stride_,dilation,outChannel,group,outPadH,outPadW));
     }
     TFSymbol MatMul(TFSymbol inputA, TFSymbol inputB,bool transA=false,bool transB=false,bool hasBias=false,bool bias2row=false){
         TPlog(inputA.GetContext() == inputB.GetContext(),"inputs' Context is different")

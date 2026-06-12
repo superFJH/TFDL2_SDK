@@ -95,7 +95,7 @@ namespace TFDL_CAPI {
 
         TFDL2_CAPI_EXPORT  string
         DeConvolution(TFContext &, string input, vector<int> kernel, vector<int> pad, vector<int> stride, int dilation,
-                      int outChannel, int group, bool hasBias);
+                      int outChannel, int group, bool hasBias, int outPadH, int outPadW);
 
         TFDL2_CAPI_EXPORT  string Scale(TFContext &, string input, bool hasbias);
 
@@ -107,7 +107,7 @@ namespace TFDL_CAPI {
 
         TFDL2_CAPI_EXPORT  string
         DeConvolution(TFContext &, string input,string weight,string bias, vector<int> kernel, vector<int> pad, vector<int> stride, int dilation,
-                      int outChannel, int group);
+                      int outChannel, int group, int outPadH, int outPadW);
 
         TFDL2_CAPI_EXPORT  string Scale(TFContext &, string input, string weight,string bias);
 
