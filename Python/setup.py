@@ -78,7 +78,7 @@ module = Extension(
 # 打包
 setup(
     name="TFDL2",
-    version="1.2.0",
+    version="1.3.0",
     description="熠知 TFDL2 Python package with version-specific .so files",
     author="ThinkForce.Inc",
     author_email="feng.jianhao@think-force.com",

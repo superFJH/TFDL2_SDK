@@ -29,3 +29,6 @@ class TFCalibration(_TFCalibration):
         for data in inputs:
             newinputs.append(TFTensor(data))
         return newinputs
+    
+    def ConvertCalibrationFp32ToFp16(self):
+        self._Fp32ToFp16()

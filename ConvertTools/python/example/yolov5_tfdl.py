@@ -46,10 +46,14 @@ def from_onnx(args):
             else:
                 print("没有量化图片集，使用随机数量化")
                 convertor.quantContext(calibration_list=None,decoderflags=DECODER_FLAGS(args.cvtype),MergeConcate=False,avoidtensors=("/model.24/dfl/conv/Conv",),stopquanttensors=("/model.24/Reshape","/model.24/Reshape_1","/model.24/Reshape_2"))
+            if args.fp16:
+                convertor.toFp16()
             convertor.dump("./{0}.quant".format(args.output_name))
         else:
             print("Convert Fail!")
     else:
+        if args.fp16:
+            convertor.toFp16()
         convertor.dump("./{0}".format(args.output_name))
 
 
@@ -59,6 +63,7 @@ if __name__ == "__main__":
     parser.add_argument('--onnxpath', type=str, help='用来转化的onnx模型地址',required=True)
     parser.add_argument('--testonnxpath', type=str,help='如果onnx模型是修改过的无法直接forward,此时使用这个备用onnx模型地址,如果没有修改onnx则不需要指定此参数')
     parser.add_argument('--output_name', type=str, help='导出模型名称',required=True)
+    parser.add_argument('--fp16', action='store_true', help='将fp32模型降为半精度')
     parser.add_argument('--quantimgDir', type=str, help='使用的量化图片集的文件夹地址')
     parser.add_argument('--cvtype', type=int, help='模型接受的输入图片通道类型 0:BGR 1:RGB 2Gray',default=1)
     parser.add_argument('--mean', type=float, nargs='+', help='preproce mean')

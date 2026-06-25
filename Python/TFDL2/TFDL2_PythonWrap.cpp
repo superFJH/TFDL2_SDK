@@ -426,10 +426,15 @@ namespace PythonInter {
                 return array;
             }
             case(TFCAPI_FLOAT16):{
-                for(auto& i : dims){
-                    i *= sizeof(short);
+                std::vector<py::ssize_t> py_shape;
+                py_shape.reserve(shape.size());
+
+                for (auto s : shape) {
+                    py_shape.push_back(static_cast<py::ssize_t>(s));
                 }
-                auto array = py::array_t<short >(shape,dims);
+
+                auto array = py::array(py::dtype("float16"), py_shape);
+                
                 auto buf = array.request();
                 memcpy(buf.ptr,GetTensordata(self.self),GetTensorDataSize(self.self));
                 return array;
@@ -2156,6 +2161,10 @@ namespace PythonInter {
         Calibration(self.self);
     }
 
+    void pyConvertCalibrationFp32ToFp16(pyTFCalibration& self){
+        ConvertCalibrationFp32ToFp16(self.self);
+    }
+
     py::list GetInputTensorCalibration(pyTFCalibration& self){
         py::list outlist;
         auto inputs = GetInputTensors(self.self);
@@ -2675,6 +2684,7 @@ PYBIND11_MODULE(TFDL2,m) {
             .def(py::init<PythonInter::pyTFContext &, TFCalibrationMode,py::str>())
             .def("_Calibration", PythonInter::pyCalibration)
             .def("_Getinputs", PythonInter::GetInputTensorCalibration)
+            .def("_Fp32ToFp16", PythonInter::pyConvertCalibrationFp32ToFp16)
             .def("_Quantize", PythonInter::QuantizeCalibration);
 /*
     py::class_<PythonInter::pyImgReader>(m, "_TFImgReader",

@@ -220,6 +220,10 @@ class TFConvertor(object):
     #注册自定义算子转化函数，对于onnx中一些不支持的算子，使用这个自定义函数来转化，避免直接报错退出
     def registorCustomNodeConvertor(self,opName,func):
         self.customNodeConvertormap[opName] = func
+    #只能在量化之前做，不能对量化的模型使用
+    def toFp16(self):
+        calibration = TFCalibration(self._context,CalibrationMode.Naive)
+        calibration.ConvertCalibrationFp32ToFp16()
 
     def quantContext(self,calibration_list:list=None,quant_input:dict=None,decoderflags:DECODER_FLAGS=None,MergeConcate:bool=True, avoidtensors:tuple=(),stopquanttensors:tuple=()):
         calibration = TFCalibration(self._context,CalibrationMode.Naive)
@@ -247,6 +251,8 @@ class TFConvertor(object):
                         img = cv2.imread(item,cv2.IMREAD_GRAYSCALE)
                     if inputs[0].dtype == TFDataType.TFDL_FLOAT:
                         tensor = preprocess(img,inputsize=(inputs[0].shape[3],inputs[0].shape[2]),dtype=np.float32)
+                    elif inputs[0].dtype == TFDataType.TFDL_FLOAT16:
+                        tensor = preprocess(img,inputsize=(inputs[0].shape[3],inputs[0].shape[2]),dtype=np.float16)
                     else:
                         tensor = preprocess(img,inputsize=(inputs[0].shape[3],inputs[0].shape[2]),dtype=np.uint8)
                     inputs[0].fromNumpy(tensor)

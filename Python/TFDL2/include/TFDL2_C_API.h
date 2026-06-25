@@ -550,6 +550,8 @@ namespace TFDL_CAPI {
     TFDL2_CAPI_EXPORT extern bool
     Convert(TFCalibration tfCalibration, TFConvertType tfConvertType, string protopath, string modelpath = "");
 
+    TFDL2_CAPI_EXPORT extern void ConvertCalibrationFp32ToFp16(TFCalibration tfCalibration);
+
     TFDL2_CAPI_EXPORT extern TFCalibration CompileCalibration(TFCalibrationMode calibrationMode, TFContext context);
 // build Calibration from netjson(define by User)
     TFDL2_CAPI_EXPORT extern void ModifyCalibration(TFCalibration tfCalibration, string netjson);

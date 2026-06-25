@@ -42,14 +42,24 @@ def from_onnx(args):
             print("Convert Success!!!")
             if args.quantimgDir is not None:
                 imglist = glob.glob(os.path.join(args.quantimgDir,"*.jpg"))
-                convertor.quantContext(calibration_list=imglist,decoderflags=DECODER_FLAGS(args.cvtype),MergeConcate=False,stopquanttensors=("/model.23/Reshape","/model.23/Reshape_1","/model.23/Reshape_2","/model.23/Reshape_3","/model.23/Reshape_4","/model.23/Reshape_5","/model.23/Reshape_6","/model.23/Reshape_7","/model.23/Reshape_8"))
+                if args.detectOnly:
+                    convertor.quantContext(calibration_list=imglist,decoderflags=DECODER_FLAGS(args.cvtype),MergeConcate=False,stopquanttensors=("/model.23/Reshape","/model.23/Reshape_1","/model.23/Reshape_2"))
+                else:
+                    convertor.quantContext(calibration_list=imglist,decoderflags=DECODER_FLAGS(args.cvtype),MergeConcate=False,stopquanttensors=("/model.23/Reshape","/model.23/Reshape_1","/model.23/Reshape_2","/model.23/Reshape_3","/model.23/Reshape_4","/model.23/Reshape_5","/model.23/Reshape_6","/model.23/Reshape_7","/model.23/Reshape_8"))
             else:
                 print("没有量化图片集，使用随机数量化")
-                convertor.quantContext(calibration_list=None,decoderflags=DECODER_FLAGS(args.cvtype),MergeConcate=False,stopquanttensors=("/model.23/Reshape","/model.23/Reshape_1","/model.23/Reshape_2","/model.23/Reshape_3","/model.23/Reshape_4","/model.23/Reshape_5","/model.23/Reshape_6","/model.23/Reshape_7","/model.23/Reshape_8"))
+                if args.detectOnly:
+                    convertor.quantContext(calibration_list=None,decoderflags=DECODER_FLAGS(args.cvtype),MergeConcate=False,stopquanttensors=("/model.23/Reshape","/model.23/Reshape_1","/model.23/Reshape_2"))
+                else:
+                    convertor.quantContext(calibration_list=None,decoderflags=DECODER_FLAGS(args.cvtype),MergeConcate=False,stopquanttensors=("/model.23/Reshape","/model.23/Reshape_1","/model.23/Reshape_2","/model.23/Reshape_3","/model.23/Reshape_4","/model.23/Reshape_5","/model.23/Reshape_6","/model.23/Reshape_7","/model.23/Reshape_8"))
+            if args.fp16:
+                convertor.toFp16()
             convertor.dump("./{0}.quant".format(args.output_name))
         else:
             print("Convert Fail!")
     else:
+        if args.fp16:
+            convertor.toFp16()
         convertor.dump("./{0}".format(args.output_name))
 
 
@@ -58,6 +68,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(prog='from_onnx.py')
     parser.add_argument('--onnxpath', type=str, help='用来转化的onnx模型地址',required=True)
     parser.add_argument('--testonnxpath', type=str,help='如果onnx模型是修改过的无法直接forward,此时使用这个备用onnx模型地址,如果没有修改onnx则不需要指定此参数')
+    parser.add_argument('--fp16', action='store_true', help='将fp32模型降为半精度')
+    parser.add_argument('--detectOnly', action='store_true', help='对于yolo pose seg等模型比普通detect多几个输出头,需要区分')
     parser.add_argument('--output_name', type=str, help='导出模型名称',required=True)
     parser.add_argument('--quantimgDir', type=str, help='使用的量化图片集的文件夹地址')
     parser.add_argument('--cvtype', type=int, help='模型接受的输入图片通道类型 0:BGR 1:RGB 2Gray',default=1)

@@ -28,7 +28,7 @@ def MergeHardSigmoidOnnx(Model:TFConvertor):
             matchnodes = matchfunc(index,matches)
             if matchnodes is None:
                 continue
-            removeNodes = [node.name for node in matchnodes[:-1]]
+            removeNodes.extend([node.name for node in matchnodes[:-1]])
             nodes[index+2].inputs = [nodes[index].inputs[0]]
             nodes[index+2].op = "HardSigmoid"
 

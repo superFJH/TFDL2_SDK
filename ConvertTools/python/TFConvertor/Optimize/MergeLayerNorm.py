@@ -28,7 +28,7 @@ def MergeLayerNormOnnx(Model:TFConvertor):
             matchnodes = matchfunc(index,matches)
             if matchnodes is None:
                 continue
-            removeNodes = [node.name for node in matchnodes[:-1]]
+            removeNodes.extend([node.name for node in matchnodes[:-1]])
             nodes[index+8].inputs = [matchnodes[0].inputs[0],matchnodes[7].inputs[1],matchnodes[8].inputs[1]]
             matchnodes[7].inputs = [matchnodes[7].inputs[0]]
             nodes[index+8].op = "LayerNorm"
