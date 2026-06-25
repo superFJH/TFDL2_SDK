@@ -715,8 +715,13 @@ namespace PythonInter {
     }
 
     py::list Forward(pyTFExecutor& self,bool alone = true){
-        if(alone)ForwardExecutorAlone(self.self);
-        else ForwardExecutor(self.self);
+        {
+            // 只在重计算期间释放 GIL, 让多线程并发跑不同 executor 成为可能;
+            // 退出作用域自动重新持有 GIL, 之后构造 py::list / pyTFTensor 才安全.
+            py::gil_scoped_release gil;
+            if(alone)ForwardExecutorAlone(self.self);
+            else ForwardExecutor(self.self);
+        }
         py::list outlist;
         auto inputs = GetOutputTensors(self.self);
         for(auto& input : inputs){
