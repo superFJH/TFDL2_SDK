@@ -15,9 +15,15 @@ namespace PythonInter {
     class PyLog : public TLOG{
     public:
         void TFLOG(std::string err) {
+            // Forward() 里会 gil_scoped_release 以支持多线程并发推理,
+            // SDK 内部日志可能在不持有 GIL 的工作线程中回调到这里,
+            // 因此调用任何 Python API (py::print) 前必须重新获取 GIL,
+            // 否则会触发 "Fatal Python error: ... NULL tstate" 之类的崩溃.
+            py::gil_scoped_acquire gil;
             py::print(err);
         }
         void Warning(std::string err) {
+            py::gil_scoped_acquire gil;
             py::print("Warning:"+err);
         }
     };
@@ -2608,7 +2614,11 @@ PYBIND11_MODULE(TFDL2,m) {
             .def("_scales", PythonInter::tensorScales)
             .def("_zeropoints", PythonInter::tensorZeroPoints)
             .def("_name", PythonInter::tensorName)
-            .def("__str__", PythonInter::Tostring);
+            // 暴露内部 C++ TFTensor 的地址 (uintptr), 供跨模块的 _tfcv 等直接操作同一张量
+            // (如 DumpImgData 进 tensor / GetTensordata 写 tensor), 避免跨模块 C++ 类型传递.
+            .def("_tftensor_handle", [](PythonInter::pyTFTensor &t) {
+                return (uintptr_t)&t.self;
+            });
 
 
     py::class_<PythonInter::TFSymbol>(m, "TFSymbol", "TFSymbol of TFDL for python")

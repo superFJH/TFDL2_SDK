@@ -1,95 +1,130 @@
-import os
-import sys
-from setuptools import setup,find_packages
-from setuptools.command.install import install
+# -*- coding: utf-8 -*-
+"""
+TFDL2 Python 包构建脚本.
 
-# 获取当前 Python 版本
-python_version = f"{sys.version_info.major}.{sys.version_info.minor}"
-'''
-# 支持的 Python 版本和对应的 .so 文件
-SUPPORTED_VERSIONS = {
-    "3.6": "TFDL2_3_6.so",
-    "3.8": "TFDL2_3_8.so",
-    "3.10": "TFDL2_3_10.so",
+- 头文件/库一律取自 SDK 根的 include/ 与 lib/ (不再用 Python/TFDL2 下重复的副本).
+- 自动按 CPU 核心类型判定芯片: Cortex-A77(0xd0d)->NPU40T, Cortex-A53(0xd03)->NPU10T.
+  可用环境变量 CHIP=NPU40T/NPU10T 覆盖.
+- 安装时把所需运行时 .so 从 SDK 复制到 安装目录/TFDL2/lib, 扩展模块 rpath=$ORIGIN/lib,
+  使安装后的包自包含.
+
+构建:  cd Python && pip install .
+"""
+import os
+import glob
+import shutil
+
+from setuptools import setup, find_packages, Extension
+from setuptools.command.install import install as _install
+import pybind11
+
+HERE = os.path.dirname(os.path.abspath(__file__))   # .../Python
+SDK = os.path.dirname(HERE)                          # SDK 根
+INCLUDE = os.path.join(SDK, "include")               # 头文件 (TFCV/, TFDL2_C_API.h, ...)
+LIB = os.path.join(SDK, "lib")                       # libTFDL2_LITE_C_API.so, libNPU{CHIP}.so
+CV_NPU = lambda chip: os.path.join(LIB, "CV_" + chip)  # lib/CV_NPU40T 等
+
+# ---- 芯片自动识别 (CPU part) ----
+# Cortex-A53=0xd03 A57=0xd07 A72=0xd08 A73=0xd09  -> NPU10T (TF16110)
+# Cortex-A76=0xd0b A77=0xd0d A78=0xd41 Neoverse-N1=0xd0c -> NPU40T (TF7000)
+_CHIP_PARTS = {
+    "0xd03": "NPU10T", "0xd07": "NPU10T", "0xd08": "NPU10T", "0xd09": "NPU10T",
+    "0xd0d": "NPU40T", "0xd0b": "NPU40T", "0xd41": "NPU40T", "0xd0c": "NPU40T",
 }
 
-# 检查当前 Python 版本是否支持
-if python_version not in SUPPORTED_VERSIONS:
-    raise RuntimeError(f"Unsupported Python version: {python_version}. Supported versions are: {list(SUPPORTED_VERSIONS.keys())}")
 
-# 获取对应的 .so 文件
-so_file = SUPPORTED_VERSIONS[python_version]
+def detect_chip():
+    env = os.environ.get("CHIP") or os.environ.get("TFCV_CHIP")
+    if env:
+        return env
+    try:
+        with open("/proc/cpuinfo", "r") as f:
+            for line in f:
+                if "CPU part" in line:
+                    part = line.split(":", 1)[-1].strip().lower()
+                    return _CHIP_PARTS.get(part, "NPU40T")
+    except Exception:
+        pass
+    return "NPU40T"  # 探测失败默认 40T
 
-# 自定义安装类
-class CustomInstall(install):
-    def run(self):
-        # 调用父类的安装方法
-        super().run()
 
-        # 创建软链接
-        target_so = os.path.join(self.install_lib, "TFDL2", so_file)
-        link_so = os.path.join(self.install_lib, "TFDL2", "TFDL2.so")
+CHIP = detect_chip()
+CV = CV_NPU(CHIP)
+print("[setup] 芯片 = %s  (CPU 探测; 可用 CHIP= 环境变量覆盖)" % CHIP)
+print("[setup] include = %s" % INCLUDE)
+print("[setup] lib     = %s" % LIB)
+print("[setup] cv      = %s" % CV)
 
-        # 删除已存在的软链接
-        if os.path.exists(link_so):
-            os.remove(link_so)
-
-        # 创建软链接
-        os.symlink(target_so, link_so)
-        print(f"Created symlink: {link_so} -> {target_so}")
-
-# 打包并安装
-setup(
-    name="TFDL2",
-    version="1.0.0",
-    description="熠知 TFDL2 Python package with version-specific .so files",
-    author="ThinkForce.Inc",
-    author_email="feng.jianhao@think-force.com",
-    packages=find_packages(),  # 自动查找所有包（包括子目录）
-    package_dir={"": "."},  # 包的根目录
-    package_data={
-        "TFDL2": [so_file, "**/*.py", "**/*.so"],  # 包含所有 .so 文件和子目录中的 .py 文件
-    },
-    include_package_data=True,
-    cmdclass={"install": CustomInstall},  # 自定义安装类
-)
-'''
-from setuptools import setup, Extension
-import pybind11
-import glob
-
-# 获取 lib/ 目录下所有库文件（.so 和 .a）
-lib_dir = os.path.join(os.path.dirname(__file__), "TFDL2/lib")
-libs = [os.path.basename(f).replace(".so", "").replace(".a", "").replace("lib", "") 
-        for f in glob.glob(os.path.join(lib_dir, "lib*"))]
-# 获取头文件路径（假设 TFDL2/include 在项目根目录下）
-include_dir = os.path.abspath("TFDL2/include")
-# 定义扩展模块
-module = Extension(
-    name="TFDL2.TFDL2",       # 导入路径：my_module.core
+# ---- 扩展模块 ----
+core = Extension(
+    name="TFDL2.TFDL2",
     sources=["TFDL2/TFDL2_PythonWrap.cpp"],
-    include_dirs=[include_dir,pybind11.get_include()],  # pybind11 头文件路径
-    libraries=libs,             # 需要链接的库名（去掉前缀 `lib` 和后缀 `.so/.a`）
-    library_dirs=[lib_dir],      # 库文件搜索路径
-    extra_compile_args=['-O3','-std=c++14'],  # 可选：优化选项
-    extra_link_args=["-Wl,--disable-new-dtags","-Wl,-rpath=$ORIGIN/lib"],  # 相对路径
-    language="c++",              # 如果是 C++ 代码
-)
-# 打包
-setup(
-    name="TFDL2",
-    version="1.3.0",
-    description="熠知 TFDL2 Python package with version-specific .so files",
-    author="ThinkForce.Inc",
-    author_email="feng.jianhao@think-force.com",
-    ext_modules=[module],
-    setup_requires=['pybind11'],  # 自动安装 pybind11
-    install_requires=["numpy"],  # 仍声明运行时依赖
-    packages=find_packages(),  # 自动查找所有包（包括子目录）
-    package_dir={"": "."},  # 包的根目录
-    package_data={
-        "TFDL2": ["**/*.py", "**/*.so"],  # 包含所有 .so 文件和子目录中的 .py 文件
-    },
-    include_package_data=True,
+    include_dirs=[INCLUDE, pybind11.get_include()],
+    libraries=["TFDL2_LITE_C_API"],
+    library_dirs=[LIB],
+    extra_compile_args=["-O3", "-std=c++14"],
+    extra_link_args=["-Wl,--disable-new-dtags", "-Wl,-rpath,$ORIGIN/lib"],
+    language="c++",
 )
 
+ext_modules = [core]
+if os.path.isfile(os.path.join(CV, "libTFCV.so")):
+    ext_modules.append(Extension(
+        name="TFDL2._tfcv",
+        sources=["TFDL2/TFCV_PythonWrap.cpp"],
+        include_dirs=[INCLUDE, pybind11.get_include()],
+        # _tfcv 只直接引用 TFCV:: 和 TFDL2_C_API 函数; CV 子库 (tfdec/tfenc/tfg/tfgs/mk_api,
+        # 不同芯片集合不同) 是 libTFCV 的传递依赖, 由 rpath 在运行时解析, 无需在此 -l.
+        libraries=["TFCV", "TFDL2_LITE_C_API"],
+        library_dirs=[CV, LIB],
+        extra_compile_args=["-O2", "-std=c++14"],
+        # 运行时库都复制到 $ORIGIN/lib, 故只指该目录
+        extra_link_args=["-Wl,--disable-new-dtags", "-Wl,-rpath,$ORIGIN/lib"],
+        language="c++",
+    ))
+    print("[setup] 将构建 _tfcv (TFCV 流式推理)")
+else:
+    print("[setup] 跳过 _tfcv (未找到 %s/libTFCV.so)" % CV)
+
+# ---- 安装时从 SDK 复制运行时库到 安装目录/TFDL2/lib (rpath=$ORIGIN/lib) ----
+RUNTIME_LIBS = ["libTFDL2_LITE_C_API.so", "lib%s.so" % CHIP]   # 核心 + 芯片 NPU 驱动
+
+
+class CustomInstall(_install):
+    def run(self):
+        super().run()
+        dest = os.path.join(self.install_lib, "TFDL2", "lib")
+        os.makedirs(dest, exist_ok=True)
+        # 清掉上次安装残留的 .so (如旧的另一芯片 NPU 驱动 / 旧的 CV 子库), 保证本次只装所需集合
+        for stale in glob.glob(os.path.join(dest, "*.so")):
+            os.remove(stale)
+        copied = []
+        for name in RUNTIME_LIBS:
+            src = os.path.join(LIB, name)
+            if os.path.isfile(src):
+                shutil.copy2(src, dest)
+                copied.append(name)
+        # CV 子库集合随芯片不同 (40T: tfdec/tfenc/tfgs/mk_api; 10T: tfdec/tfg/tfgs/mk_api),
+        # 故直接复制 CV 目录下全部 .so, 不写死列表.
+        if os.path.isdir(CV):
+            for src in glob.glob(os.path.join(CV, "*.so")):
+                shutil.copy2(src, dest)
+                copied.append("CV/" + os.path.basename(src))
+        print("[install] 复制运行时库到 %s: %s" % (dest, copied))
+
+
+setup(
+    name="TFDL2",
+    version="2.0.0",
+    description="熠知 TFDL2 Python package",
+    author="ThinkForce.Inc",
+    author_email="feng.jianhao@think-force.com",
+    ext_modules=ext_modules,
+    setup_requires=["pybind11"],
+    install_requires=["numpy"],
+    packages=find_packages(),
+    package_dir={"": "."},
+    package_data={"TFDL2": ["**/*.py"]},   # 运行时 .so 由 CustomInstall 从 SDK 复制
+    include_package_data=False,
+    cmdclass={"install": CustomInstall},
+)
