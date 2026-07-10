@@ -6,6 +6,7 @@
 !bin
 !Example
 !Doc
+!Driver
 !ConvertTools
 !include
 !lib
@@ -16,6 +17,7 @@
 !AddonOps/**
 !bin/**
 !Example/**
+!Driver/**
 !Doc/**
 !ConvertTools/**
 !include/**

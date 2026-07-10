@@ -22,7 +22,8 @@ TFDL2_SDK/
 ├── lib/                # 预编译共享库
 │   ├── libTFDL2_C_API.so         # 完整运行时API
 │   ├── libTFDL2_LITE_C_API.so    # 精简运行时API
-│   ├── libNPU10T.so / libNPU40T.so  # NPU硬件驱动
+│   ├── libNPU40T.so  # 7140系列NPU硬件驱动
+│   ├── NPU10T  # 16110系列芯片lib，包括TFDL2_C_API TFDL2_LITE_C_API libNPU10T.so
 │   ├── CV_NPU10T/      # TF16110芯片相关库
 │   └── CV_NPU40T/      # TF7000芯片相关库
 ├── AddonOps/           # 自定义算子实现（构建生成libTFDLAddOn.so）
@@ -66,6 +67,22 @@ numactl --membind=1 --cpunodebind=1 ./your_program
 - 操作系统：Linux（aarch64）
 - Python版本：3.6及以上
 - CMake 3.10及以上（编译自定义算子需要）
+- gcc/g++ 4.9及以上（编译自定义算子需要）
+- build-essentials（编译驱动需要）
+
+### 安装驱动
+```bash
+# 16110系列芯片
+# 不需要安装驱动
+
+
+# 7000系列芯片
+cd Driver
+
+tar -xvf driver.tgz
+
+./insmodTFDriver.sh
+```
 
 ### 1. 安装 Python SDK
 
