@@ -23,5 +23,5 @@ endif()
 # 启用 OpenMP 多线程
 find_package(OpenMP)
 if(OpenMP_CXX_FOUND)
-    target_link_libraries(TFDLAddOn PRIVATE OpenMP::OpenMP_CXX)
+    target_link_libraries(TFDLAddOn PUBLIC OpenMP::OpenMP_CXX)
 endif()
