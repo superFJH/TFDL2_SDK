@@ -1,119 +1,88 @@
-from ..TFConvertor import NodeConvertor,TFConvertor
+from ..TFConvertor import TFConvertor
 import numpy as np
 
 
-def MergeBatchNormOnnx(Model:TFConvertor):
-    matches1 = ["Conv","BatchNormalization"]
-    matches2 = ["ConvTranspose","BatchNormalization"]
-    matches3 = ["MatMul","BatchNormalization"]
-    removeNodes = []
-    nodes = list(Model.nodes.values())
-    def matchfunc(index,matches):
-        lastoutput = None
-        matchnodes = []
-        for one in matches:
-            found = False
-            for i in range(index,len(nodes),1):
-                if nodes[i].op == one and (lastoutput is None or lastoutput in nodes[i].inputs):
-                    found = True
-                    index = i + 1
-                    lastoutput = nodes[i].outputs[0]
-                    matchnodes.append(nodes[i])
-                    break
-            if found is False:
-                return None
-        return matchnodes
+def _consumers(nodes):
+    result = {}
+    for node in nodes:
+        for input_name in node.inputs:
+            result.setdefault(input_name, []).append(node)
+    return result
 
-    for index,node in enumerate(nodes):
-        if node.op == "Conv" or node.op == "ConvTranspose" or node.op == "MatMul":
-            pass
-        else:
+
+def MergeBatchNormOnnx(Model: TFConvertor):
+    nodes = list(Model.nodes.values())
+    consumers = _consumers(nodes)
+    remove_names = []
+
+    for node in nodes:
+        if node.op not in ("Conv", "ConvTranspose", "MatMul") or not node.outputs:
+            continue
+        users = consumers.get(node.outputs[0], [])
+        if len(users) != 1 or users[0].op != "BatchNormalization":
+            continue
+        batchnorm = users[0]
+        if len(node.inputs) < 2 or node.inputs[1] not in Model.params:
             continue
 
-        if node.op == "Conv":
-            matchnodes = matchfunc(index,matches1)
-            if matchnodes is None:
-                continue
-            batchnormNode = matchnodes[1]
+        weight = Model.params[node.inputs[1]]
+        old_bias = Model.params[node.inputs[2]] if len(node.inputs) >= 3 and node.inputs[2] in Model.params else None
+        eps = batchnorm.attr["epsilon"]
+        scale = Model.params[batchnorm.inputs[1]]
+        bias = Model.params[batchnorm.inputs[2]]
+        mean = Model.params[batchnorm.inputs[3]]
+        var = Model.params[batchnorm.inputs[4]]
+        normalized_scale = scale / np.sqrt(var + eps)
+        normalized_bias = bias - normalized_scale * mean
 
-        elif node.op == "ConvTranspose":
-            matchnodes = matchfunc(index,matches2)
-            if matchnodes is None:
-                continue
-            batchnormNode = matchnodes[1]
-        elif node.op == "MatMul":
-            matchnodes = matchfunc(index,matches3)
-            if matchnodes is None:
-                continue
-            batchnormNode = matchnodes[1]
-        
-        convnode = node
-        if convnode.inputs[1] not in Model.params.keys():
-            raise RuntimeError("Merge BatchNorm Error Can't find W")
-        W = Model.params[convnode.inputs[1]]
-        B = None if len(convnode.inputs) < 3 else Model.params[convnode.inputs[2]]
-        removeNodes.append(batchnormNode.name)
-        eps = batchnormNode.attr["epsilon"]
-        scale = Model.params[batchnormNode.inputs[1]]
-        bias = Model.params[batchnormNode.inputs[2]]
-        mean = Model.params[batchnormNode.inputs[3]]
-        var = Model.params[batchnormNode.inputs[4]]
-        var = np.sqrt(var+eps)
-        scale = scale / var
-        bias = bias - scale*mean
-        if convnode.op == "MatMul":
-            W = np.transpose(W,(1,0))
-        assert W.shape[0] == scale.size, "conv weight mismatcht with batchnorm"
-        Wshape = W.shape
-
-        W = (W.reshape((Wshape[0],-1)) * scale.reshape((Wshape[0],1))).reshape(Wshape)
-        if B is None:
-            B = bias
-            convnode.inputs.append(convnode.name+":Bias")
-        else:
-            B = B * scale + bias
-        if convnode.op == "MatMul":
-            W = np.transpose(W,(1,0))
-        Model.params[convnode.inputs[1]] = np.ascontiguousarray(W)
-        Model.params[convnode.inputs[2]] = np.ascontiguousarray(B)
-        convnode.outputs = batchnormNode.outputs
-
-
-    for node in removeNodes:
-        for iname in Model.nodes[node].inputs:
-            if iname in Model.params:
-                del Model.params[iname]
-        Model.nodes.pop(node)
-
-def ReplaceBatchNorm(Model:TFConvertor):
-    removeNodes = []
-    nodes = list(Model.nodes.values())
-    
-
-    for index,node in enumerate(nodes):
-        if node.op != "BatchNormalization":
+        if node.op == "MatMul":
+            weight = np.transpose(weight, (1, 0))
+        if weight.shape[0] != normalized_scale.size:
             continue
-        batchnormNode = node
-        eps = batchnormNode.attr["epsilon"]
-        scale = Model.params[batchnormNode.inputs[1]]
-        bias = Model.params[batchnormNode.inputs[2]]
-        mean = Model.params[batchnormNode.inputs[3]]
-        var = Model.params[batchnormNode.inputs[4]]
-        var = np.sqrt(var+eps)
-        scale = scale / var
-        bias = bias - scale*mean
-        Model.params[batchnormNode.inputs[1]] = np.ascontiguousarray(scale)
-        Model.params[batchnormNode.inputs[2]] = np.ascontiguousarray(bias)
-        
-        Model.params.pop(batchnormNode.inputs[3])
-        Model.params.pop(batchnormNode.inputs[4])
-        batchnormNode.inputs = [batchnormNode.inputs[0],batchnormNode.inputs[1],batchnormNode.inputs[2]]
-        batchnormNode.op = "Scale"
+        weight_shape = weight.shape
+        weight = (weight.reshape((weight_shape[0], -1)) * normalized_scale.reshape((-1, 1))).reshape(weight_shape)
+        if old_bias is None:
+            fused_bias = normalized_bias
+        else:
+            fused_bias = old_bias * normalized_scale + normalized_bias
+        if node.op == "MatMul":
+            weight = np.transpose(weight, (1, 0))
+
+        # Never mutate or delete tied initializers: onnxslim deliberately ties
+        # identical BN parameters across many LeViT blocks.
+        weight_name = f"{node.name}:BatchNormWeight"
+        bias_name = f"{node.name}:BatchNormBias"
+        Model.params[weight_name] = np.ascontiguousarray(weight)
+        Model.params[bias_name] = np.ascontiguousarray(fused_bias)
+        node.inputs[1] = weight_name
+        if len(node.inputs) >= 3:
+            node.inputs[2] = bias_name
+        else:
+            node.inputs.append(bias_name)
+        node.outputs = batchnorm.outputs
+        remove_names.append(batchnorm.name)
+
+    for name in remove_names:
+        Model.nodes.pop(name, None)
 
 
-    for node in removeNodes:
-        for iname in Model.nodes[node].inputs:
-            if iname in Model.params:
-                del Model.params[iname]
-        Model.nodes.pop(node)
+def ReplaceBatchNorm(Model: TFConvertor):
+    for batchnorm in list(Model.nodes.values()):
+        if batchnorm.op != "BatchNormalization":
+            continue
+        eps = batchnorm.attr["epsilon"]
+        scale = Model.params[batchnorm.inputs[1]]
+        bias = Model.params[batchnorm.inputs[2]]
+        mean = Model.params[batchnorm.inputs[3]]
+        var = Model.params[batchnorm.inputs[4]]
+        normalized_scale = scale / np.sqrt(var + eps)
+        normalized_bias = bias - normalized_scale * mean
 
+        # Give every Scale private parameters. Shared/tied source tensors must
+        # not be overwritten by the first BatchNorm that consumes them.
+        scale_name = f"{batchnorm.name}:Scale"
+        bias_name = f"{batchnorm.name}:Bias"
+        Model.params[scale_name] = np.ascontiguousarray(normalized_scale)
+        Model.params[bias_name] = np.ascontiguousarray(normalized_bias)
+        batchnorm.inputs = [batchnorm.inputs[0], scale_name, bias_name]
+        batchnorm.op = "Scale"

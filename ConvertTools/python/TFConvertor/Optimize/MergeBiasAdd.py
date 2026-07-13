@@ -1,81 +1,76 @@
-from ..TFConvertor import NodeConvertor,TFConvertor
+from ..TFConvertor import TFConvertor
 import numpy as np
 
 
-def MergeBiasAddOnnx(Model:TFConvertor):
-    matches1 = ["Conv","Add"]
-    matches2 = ["ConvTranspose","Add"]
-    matches3 = ["MatMul","Add"]
-    removeNodes = []
+def _consumers(nodes):
+    result = {}
+    for node in nodes:
+        for input_name in node.inputs:
+            result.setdefault(input_name, []).append(node)
+    return result
+
+
+def _output_channels(Model: TFConvertor, node) -> int | None:
+    if len(node.inputs) < 2 or node.inputs[1] not in Model.params:
+        return None
+    weight = Model.params[node.inputs[1]]
+    if not isinstance(weight, np.ndarray):
+        return None
+    if node.op in ("Conv", "ConvTranspose"):
+        return int(weight.shape[0])
+    if node.op == "MatMul" and weight.ndim == 2:
+        return int(weight.shape[1])
+    return None
+
+
+def MergeBiasAddOnnx(Model: TFConvertor):
+    """Fold only a directly-consumed channel bias Add into a weighted op.
+
+    The old implementation searched arbitrarily far forward in node order.  A
+    PiT spatial residual Add could therefore be mistaken for a Conv bias, and
+    an attention relative-position Add could be attached to activation x
+    activation MatMul.  Both rewrites change graph semantics.
+    """
+
     nodes = list(Model.nodes.values())
-    def matchfunc(index,matches):
-        lastoutput = None
-        matchnodes = []
-        for one in matches:
-            found = False
-            for i in range(index,len(nodes),1):
-                if nodes[i].op == one and (lastoutput is None or lastoutput in nodes[i].inputs):
-                    found = True
-                    index = i + 1
-                    lastoutput = nodes[i].outputs[0]
-                    matchnodes.append(nodes[i])
-                    break
-            if found is False:
-                return None
-        return matchnodes
+    consumers = _consumers(nodes)
+    remove_names = []
 
-    for index,node in enumerate(nodes):
-        if node.op == "Conv" or node.op == "ConvTranspose" or node.op == "MatMul":
-            pass
-        else:
+    for node in nodes:
+        if node.op not in ("Conv", "ConvTranspose", "MatMul") or not node.outputs:
+            continue
+        # MatMul bias folding is valid only for a parameterized projection.
+        if node.op == "MatMul" and (len(node.inputs) < 2 or node.inputs[1] not in Model.params):
+            continue
+        users = consumers.get(node.outputs[0], [])
+        if len(users) != 1 or users[0].op != "Add":
+            continue
+        add_node = users[0]
+        param_inputs = [name for name in add_node.inputs if name in Model.params]
+        if len(param_inputs) != 1 or node.outputs[0] not in add_node.inputs:
             continue
 
-        if node.op == "Conv":
-            matchnodes = matchfunc(index,matches1)
-            if matchnodes is None:
-                continue
-            biasaddNode = matchnodes[1]
-
-        elif node.op == "ConvTranspose":
-            matchnodes = matchfunc(index,matches2)
-            if matchnodes is None:
-                continue
-            biasaddNode = matchnodes[1]
-        elif node.op == "MatMul":
-            matchnodes = matchfunc(index,matches3)
-            if matchnodes is None:
-                continue
-            biasaddNode = matchnodes[1]
-        #biasaddNode = nodes[index+1]
-        
-        if biasaddNode.inputs[0] not in Model.params and biasaddNode.inputs[1] not in Model.params:
+        new_bias = Model.params[param_inputs[0]]
+        out_channels = _output_channels(Model, node)
+        if not isinstance(new_bias, np.ndarray) or out_channels is None or new_bias.size != out_channels:
             continue
+        new_bias = new_bias.reshape(-1)
 
-        if biasaddNode.inputs[0] in Model.params:
-            newbias = Model.params[biasaddNode.inputs[0]]
-        if biasaddNode.inputs[1] in Model.params:
-            newbias = Model.params[biasaddNode.inputs[1]]
+        old_bias = None
+        if len(node.inputs) >= 3 and node.inputs[2] in Model.params:
+            old_bias = Model.params[node.inputs[2]]
+            if not isinstance(old_bias, np.ndarray) or old_bias.size != out_channels:
+                continue
+            new_bias = old_bias.reshape(-1) + new_bias
 
-        
-
-        convnode = node
-        B = None if len(convnode.inputs) < 3 else Model.params[convnode.inputs[2]]
-
-        if B is None:
-            B = newbias
-            convnode.inputs.append(convnode.name+":Bias")
+        bias_name = f"{node.name}:Bias"
+        Model.params[bias_name] = np.ascontiguousarray(new_bias)
+        if len(node.inputs) >= 3:
+            node.inputs[2] = bias_name
         else:
-            B = B  + newbias
-        B = B.flatten()
-        Model.params[convnode.inputs[2]] = np.ascontiguousarray(B)
-        convnode.outputs = biasaddNode.outputs
-        biasaddNode.inputs = []
-        removeNodes.append(biasaddNode.name)
+            node.inputs.append(bias_name)
+        node.outputs = add_node.outputs
+        remove_names.append(add_node.name)
 
-
-    for node in removeNodes:
-        for iname in Model.nodes[node].inputs:
-            if iname in Model.params:
-                del Model.params[iname]
-        Model.nodes.pop(node)
-
+    for name in remove_names:
+        Model.nodes.pop(name, None)

@@ -18,6 +18,7 @@ from .Optimize.MergeMaskSoftmax import MergeMaskSoftmaxOnnx
 from .Optimize.MergeBert import MergeBertOnnx,MergeConvBertOnnx
 from .Optimize.replacedilationconv import ReplaceDilationConv
 from .Optimize.SplitConv import SplitConvOnnx
+from .Optimize.TransformerNPU import TransformerNPUOptimizeOnnx,RemoveSoftmaxMatMulPassThroughOnnx,RefreshTransformerShapesOnnx,MergeAdjacentConcatParamsOnnx
 def parseAttr(attr):
     if attr.type == 1:
         return attr.f
@@ -194,6 +195,161 @@ class GemmParser(OnnxParser):
         channels1 = node.graph.params[str(args[1])].shape[0]
         return InnerProduct2(args[0],args[1],None if len(args) < 3 else args[2],channels1)
 
+class LinearConvParser(OnnxParser):
+    @classmethod
+    def _impl_v11(cls,*args,node:NodeConvertor):
+        batch = node.attr["batch"]
+        seq_len = node.attr["seq_len"]
+        seq_h = node.attr["seq_h"]
+        seq_w = node.attr["seq_w"]
+        in_channels = node.attr["in_channels"]
+        out_channels = node.attr["out_channels"]
+        output_shape = tuple(node.attr["output_shape"])
+
+        hidden = args[0]
+        hidden = Reshape(hidden,(batch,seq_len,in_channels))
+        hidden = Transpose(hidden,(0,2,1))
+        hidden = Reshape(hidden,(batch,in_channels,seq_h,seq_w))
+        hidden = Convolution2(
+            hidden,
+            args[1],
+            None if len(args) < 3 else args[2],
+            kernel=1,
+            pad=0,
+            stride=1,
+            dilation=1,
+            outChannel=out_channels,
+            group=1,
+        )
+        hidden = Reshape(hidden,(batch,out_channels,seq_len))
+        hidden = Transpose(hidden,(0,2,1))
+        if len(output_shape) != 3 or output_shape[0] != batch or output_shape[1] != seq_len or output_shape[2] != out_channels:
+            hidden = Reshape(hidden,output_shape)
+        return hidden
+
+class MLPLinearConvParser(OnnxParser):
+    @classmethod
+    def _impl_v11(cls,*args,node:NodeConvertor):
+        batch = node.attr["batch"]
+        seq_len = node.attr["seq_len"]
+        seq_h = node.attr["seq_h"]
+        seq_w = node.attr["seq_w"]
+        in_channels = node.attr["in_channels"]
+        mid_channels = node.attr["mid_channels"]
+        out_channels = node.attr["out_channels"]
+        output_shape = tuple(node.attr["output_shape"])
+        activation = node.attr["activation"]
+
+        hidden = Reshape(args[0],(batch,seq_len,in_channels))
+        hidden = Transpose(hidden,(0,2,1))
+        hidden = Reshape(hidden,(batch,in_channels,seq_h,seq_w))
+        hidden = Convolution2(
+            hidden,
+            args[1],
+            args[2],
+            kernel=1,
+            pad=0,
+            stride=1,
+            dilation=1,
+            outChannel=mid_channels,
+            group=1,
+        )
+        if activation == "GeLU":
+            hidden = GeLU(hidden)
+        elif activation == "Swish":
+            hidden = Swish(hidden)
+        elif activation == "Relu6":
+            hidden = ReLUX(hidden,6.0)
+        elif activation == "ReLU":
+            hidden = ReLU(hidden)
+        else:
+            raise NotImplementedError("{} activation not implemented for MLPLinearConv".format(activation))
+        hidden = Convolution2(
+            hidden,
+            args[3],
+            args[4],
+            kernel=1,
+            pad=0,
+            stride=1,
+            dilation=1,
+            outChannel=out_channels,
+            group=1,
+        )
+        hidden = Reshape(hidden,(batch,out_channels,seq_len))
+        hidden = Transpose(hidden,(0,2,1))
+        if len(output_shape) != 3 or output_shape[0] != batch or output_shape[1] != seq_len or output_shape[2] != out_channels:
+            hidden = Reshape(hidden,output_shape)
+        return hidden
+
+class QKVLinearConvParser(OnnxParser):
+    @classmethod
+    def _impl_v11(cls,*args,node:NodeConvertor):
+        batch = node.attr["batch"]
+        seq_len = node.attr["seq_len"]
+        seq_h = node.attr["seq_h"]
+        seq_w = node.attr["seq_w"]
+        in_channels = node.attr["in_channels"]
+        out_channels = node.attr["out_channels"]
+
+        hidden = Reshape(args[0],(batch,seq_len,in_channels))
+        hidden = Transpose(hidden,(0,2,1))
+        hidden = Reshape(hidden,(batch,in_channels,seq_h,seq_w))
+
+        q = Convolution2(hidden,args[1],args[2],kernel=1,pad=0,stride=1,dilation=1,outChannel=out_channels,group=1)
+        k = Convolution2(hidden,args[3],args[4],kernel=1,pad=0,stride=1,dilation=1,outChannel=out_channels,group=1)
+        v = Convolution2(hidden,args[5],args[6],kernel=1,pad=0,stride=1,dilation=1,outChannel=out_channels,group=1)
+
+        def conv_to_head(tensor, prefix):
+            shape = tuple(node.attr[f"{prefix}_shape"])
+            layout = node.attr[f"{prefix}_layout"]
+            if len(shape) != 4:
+                return Reshape(tensor,shape)
+            num_heads = shape[1]
+            if layout == "BHSD":
+                head_dim = shape[3]
+                tensor = Reshape(tensor,(batch,num_heads,head_dim,seq_len))
+                return Transpose(tensor,(0,1,3,2))
+            if layout == "BHDS":
+                head_dim = shape[2]
+                return Reshape(tensor,(batch,num_heads,head_dim,seq_len))
+            return Reshape(tensor,shape)
+
+        return [conv_to_head(q,"q"), conv_to_head(k,"k"), conv_to_head(v,"v")]
+
+class AttentionOutLinearConvParser(OnnxParser):
+    @classmethod
+    def _impl_v11(cls,*args,node:NodeConvertor):
+        batch = node.attr["batch"]
+        seq_len = node.attr["seq_len"]
+        seq_h = node.attr["seq_h"]
+        seq_w = node.attr["seq_w"]
+        in_channels = node.attr["in_channels"]
+        out_channels = node.attr["out_channels"]
+        output_shape = tuple(node.attr["output_shape"])
+        attn_shape = tuple(node.attr["attn_shape"])
+        attn_layout = node.attr["attn_layout"]
+
+        hidden = args[0]
+        if len(attn_shape) == 4 and attn_layout == "BHSD":
+            hidden = Transpose(hidden,(0,1,3,2))
+        hidden = Reshape(hidden,(batch,in_channels,seq_h,seq_w))
+        hidden = Convolution2(
+            hidden,
+            args[1],
+            args[2],
+            kernel=1,
+            pad=0,
+            stride=1,
+            dilation=1,
+            outChannel=out_channels,
+            group=1,
+        )
+        hidden = Reshape(hidden,(batch,out_channels,seq_len))
+        hidden = Transpose(hidden,(0,2,1))
+        if len(output_shape) != 3 or output_shape[0] != batch or output_shape[1] != seq_len or output_shape[2] != out_channels:
+            hidden = Reshape(hidden,output_shape)
+        return hidden
+
 class ConvTransposeParser(OnnxParser):
     @classmethod
     def _impl_v11(cls,*args,node:NodeConvertor):
@@ -321,10 +477,183 @@ class ShapeParser(OnnxParser):
     def _impl_v11(cls,*args,node:NodeConvertor):
         return Shape(args[0])
 
+def _static_tensor_value(graph, tensor_name, stack=None):
+    if tensor_name in graph.params:
+        return graph.params[tensor_name]
+    if not tensor_name:
+        return None
+    cache = getattr(graph, "_static_tensor_cache", None)
+    if cache is None:
+        cache = {}
+        graph._static_tensor_cache = cache
+    if tensor_name in cache:
+        return cache[tensor_name]
+    if stack is None:
+        stack = set()
+    if tensor_name in stack:
+        return None
+    stack = set(stack)
+    stack.add(tensor_name)
+    producers = getattr(graph, "_onnx_producers", None)
+    if producers is None:
+        producers = {output: node for node in graph.nodes.values() for output in node.outputs}
+        graph._onnx_producers = producers
+    node = producers.get(tensor_name)
+    if node is None:
+        return None
+
+    values = [_static_tensor_value(graph, name, stack) for name in node.inputs if name]
+    result = None
+    try:
+        if node.op == "Shape":
+            shape = getattr(graph, "tensor_shapes", {}).get(node.inputs[0])
+            if shape is not None and all(dim > 0 for dim in shape):
+                result = np.asarray(shape, dtype=np.int64)
+        elif node.op == "Gather" and len(values) == 2 and all(value is not None for value in values):
+            result = np.take(values[0], values[1], axis=node.attr.get("axis", 0))
+        elif node.op == "Unsqueeze" and values and values[0] is not None:
+            axes = node.attr.get("axes")
+            if axes is None and len(values) > 1 and values[1] is not None:
+                axes = values[1].reshape(-1).tolist()
+            result = values[0]
+            for axis in sorted(int(value) for value in axes or []):
+                result = np.expand_dims(result, axis)
+        elif node.op == "Squeeze" and values and values[0] is not None:
+            axes = node.attr.get("axes")
+            if axes is None and len(values) > 1 and values[1] is not None:
+                axes = values[1].reshape(-1).tolist()
+            result = np.squeeze(values[0], axis=tuple(int(value) for value in axes)) if axes is not None else np.squeeze(values[0])
+        elif node.op == "Concat" and values and all(value is not None for value in values):
+            result = np.concatenate(values, axis=node.attr["axis"])
+        elif node.op in ("Add", "Sub", "Mul", "Div", "Mod") and len(values) == 2 and all(value is not None for value in values):
+            if node.op == "Add":
+                result = values[0] + values[1]
+            elif node.op == "Sub":
+                result = values[0] - values[1]
+            elif node.op == "Mul":
+                result = values[0] * values[1]
+            elif node.op == "Div":
+                result = values[0] // values[1] if np.issubdtype(values[0].dtype, np.integer) else values[0] / values[1]
+            else:
+                result = np.mod(values[0], values[1])
+        elif node.op == "Cast" and values and values[0] is not None:
+            dtype_map = {
+                onnx.TensorProto.INT32: np.int32,
+                onnx.TensorProto.INT64: np.int64,
+                onnx.TensorProto.FLOAT: np.float32,
+                onnx.TensorProto.DOUBLE: np.float64,
+            }
+            if node.attr.get("to") in dtype_map:
+                result = values[0].astype(dtype_map[node.attr["to"]])
+        elif node.op == "Reshape" and len(values) == 2 and all(value is not None for value in values):
+            result = np.reshape(values[0], tuple(int(value) for value in values[1].reshape(-1)))
+        elif node.op == "Transpose" and values and values[0] is not None:
+            axes = node.attr.get("perm")
+            result = np.transpose(values[0], axes=tuple(axes) if axes is not None else None)
+        elif node.op == "Slice" and len(values) >= 3 and all(value is not None for value in values):
+            starts = values[1].reshape(-1).tolist()
+            ends = values[2].reshape(-1).tolist()
+            axes = values[3].reshape(-1).tolist() if len(values) > 3 else list(range(len(starts)))
+            steps = values[4].reshape(-1).tolist() if len(values) > 4 else [1] * len(starts)
+            slices = [slice(None)] * values[0].ndim
+            for axis, start, end, step in zip(axes, starts, ends, steps):
+                slices[int(axis)] = slice(int(start), int(end), int(step))
+            result = values[0][tuple(slices)]
+    except (ValueError, TypeError, IndexError, ZeroDivisionError):
+        result = None
+    if result is not None:
+        # Keep ONNX scalar tensors as rank-0 arrays.  np.ascontiguousarray()
+        # promotes a scalar to shape (1,), which makes a following Unsqueeze
+        # produce (1, 1) and prevents shape-only Concat chains (notably the
+        # dynamic padding calculation exported by timm Swin) from folding.
+        result = np.asarray(result)
+        if result.ndim > 0:
+            result = np.ascontiguousarray(result)
+    cache[tensor_name] = result
+    return result
+
+
+def FoldStaticShapeSubgraphsOnnx(graph):
+    """Fold small shape-only expressions after transformer shape recovery.
+
+    onnxslim cannot fold a Shape chain whose source shape was left symbolic by
+    ONNX inference.  TransformerNPUOptimize recovers those fixed shapes, so a
+    second, deliberately size-limited fold removes runtime padding/reshape
+    bookkeeping without materializing activation tensors or large weights.
+    """
+
+    foldable_ops = {
+        "Shape", "Gather", "Unsqueeze", "Squeeze", "Concat", "Add", "Sub",
+        "Mul", "Div", "Mod", "Cast", "Reshape", "Slice", "Transpose",
+    }
+    graph._static_tensor_cache = {}
+    graph._onnx_producers = {
+        output: node for node in graph.nodes.values() for output in node.outputs
+    }
+    remove = []
+    for name, node in graph.nodes.items():
+        if node.op not in foldable_ops or not node.outputs:
+            continue
+        values = [_static_tensor_value(graph, output) for output in node.outputs]
+        if not all(value is not None and np.asarray(value).size <= 4096 for value in values):
+            continue
+        for output, value in zip(node.outputs, values):
+            value = np.asarray(value)
+            graph.params[output] = np.ascontiguousarray(value) if value.ndim > 0 else value
+        remove.append(name)
+    for name in remove:
+        del graph.nodes[name]
+
+    used_params = {
+        input_name
+        for node in graph.nodes.values()
+        for input_name in node.inputs
+        if input_name
+    }
+    used_params.update(graph.outputs)
+    for name in list(graph.params):
+        if name not in used_params:
+            del graph.params[name]
+    graph._static_tensor_cache = {}
+    graph._onnx_producers = {
+        output: node for node in graph.nodes.values() for output in node.outputs
+    }
+    if remove:
+        print("[StaticShapeFold] fold {} shape-only nodes".format(len(remove)))
+    return len(remove)
+
 class ReshapeParser(OnnxParser):
     @classmethod
     def _impl_v11(cls,*args,node:NodeConvertor):
         if len(args) > 1:
+            static_shape = _static_tensor_value(node.graph, node.inputs[1]) if len(node.inputs) > 1 else None
+            if static_shape is not None:
+                shape = tuple(int(value) for value in static_shape.reshape(-1))
+                input_shape = getattr(node.graph, "tensor_shapes", {}).get(node.inputs[0])
+                resolved = list(shape)
+                unknown = [index for index, dim in enumerate(resolved) if dim < 0]
+                if input_shape is not None and all(dim > 0 for dim in input_shape) and len(unknown) == 1:
+                    known = int(np.prod([dim for dim in resolved if dim > 0]))
+                    total = int(np.prod(input_shape))
+                    if known > 0 and total % known == 0:
+                        resolved[unknown[0]] = total // known
+                if all(dim > 0 for dim in resolved):
+                    node.graph.tensor_shapes[node.outputs[0]] = resolved
+                    node.graph._static_tensor_cache = {}
+                    shape = tuple(resolved)
+                return Reshape(args[0],shape)
+            target = getattr(node.graph, "tensor_shapes", {}).get(node.outputs[0])
+            input_shape = getattr(node.graph, "tensor_shapes", {}).get(node.inputs[0])
+            if target is not None and input_shape is not None and all(dim > 0 for dim in input_shape):
+                resolved = list(target)
+                unknown = [index for index, dim in enumerate(resolved) if dim <= 0]
+                if len(unknown) == 1:
+                    known = int(np.prod([dim for dim in resolved if dim > 0]))
+                    total = int(np.prod(input_shape))
+                    if known > 0 and total % known == 0:
+                        resolved[unknown[0]] = total // known
+                if all(dim > 0 for dim in resolved):
+                    return Reshape(args[0],tuple(resolved))
             return Reshape2(*args)
         else:
             return Reshape(args[0],node.attr["shape"])
@@ -347,9 +676,22 @@ class BinaryOpParser(OnnxParser):
         elif node.op == "Div":
             return args[0] / args[1]
 
+class IdentityParser(OnnxParser):
+    @classmethod
+    def _impl_v11(cls,*args,node:NodeConvertor):
+        return args[0]
+
 class ConcatOpParser(OnnxParser):
     @classmethod
     def _impl_v11(cls,*args,node:NodeConvertor):
+        input_shapes = [getattr(node.graph, "tensor_shapes", {}).get(name) for name in node.inputs]
+        if input_shapes and all(shape is not None and all(dim > 0 for dim in shape) for shape in input_shapes):
+            axis = node.attr["axis"] % len(input_shapes[0])
+            if all(len(shape) == len(input_shapes[0]) and all(shape[index] == input_shapes[0][index] for index in range(len(shape)) if index != axis) for shape in input_shapes):
+                output_shape = list(input_shapes[0])
+                output_shape[axis] = sum(shape[axis] for shape in input_shapes)
+                node.graph.tensor_shapes[node.outputs[0]] = output_shape
+                node.graph._static_tensor_cache = {}
         return Concat(tuple(args),node.attr["axis"])
 
 class SliceOpParser(OnnxParser):
@@ -357,12 +699,72 @@ class SliceOpParser(OnnxParser):
     def _impl_v11(cls,*args,node:NodeConvertor):
         if "starts" in node.attr and "ends" in node.attr and 'axes' in node.attr:
             return Crop3(args[0],startAxis=node.attr['axes'][0],crops=((node.attr["starts"][0],node.attr['ends'][0]-1,1),))
+        if len(node.inputs) >= 3 and all(name in node.graph.params for name in node.inputs[1:] if name):
+            starts = node.graph.params[node.inputs[1]].reshape(-1).tolist()
+            ends = node.graph.params[node.inputs[2]].reshape(-1).tolist()
+            axes = (
+                node.graph.params[node.inputs[3]].reshape(-1).tolist()
+                if len(node.inputs) > 3 and node.inputs[3]
+                else list(range(len(starts)))
+            )
+            steps = (
+                node.graph.params[node.inputs[4]].reshape(-1).tolist()
+                if len(node.inputs) > 4 and node.inputs[4]
+                else [1] * len(starts)
+            )
+            ordered = sorted(zip(axes, starts, ends, steps))
+            ordered_axes = [int(item[0]) for item in ordered]
+            if ordered_axes == list(range(ordered_axes[0], ordered_axes[0] + len(ordered_axes))):
+                crops = []
+                input_shape = getattr(node.graph, "tensor_shapes", {}).get(node.inputs[0])
+                output_shape = list(input_shape) if input_shape is not None and all(dim > 0 for dim in input_shape) else None
+                for axis, start, end, step in ordered:
+                    step = int(step)
+                    axis = int(axis)
+                    if input_shape is not None and axis < len(input_shape) and input_shape[axis] > 0:
+                        start, stop, step = slice(int(start), int(end), step).indices(input_shape[axis])
+                        inclusive_end = stop - 1 if step > 0 else stop + 1
+                        if output_shape is not None:
+                            output_shape[axis] = len(range(start, stop, step))
+                    else:
+                        start = int(start)
+                        inclusive_end = int(end) - 1 if step > 0 else int(end) + 1
+                    # ONNX uses INT64_MAX/MIN for an open slice boundary,
+                    # while the TFDL Crop binding accepts C++ int.
+                    inclusive_end = max(min(inclusive_end, np.iinfo(np.int32).max), np.iinfo(np.int32).min)
+                    start = max(min(int(start), np.iinfo(np.int32).max), np.iinfo(np.int32).min)
+                    crops.append((start, inclusive_end, step))
+                if output_shape is not None:
+                    node.graph.tensor_shapes[node.outputs[0]] = output_shape
+                    node.graph._static_tensor_cache = {}
+                return Crop3(args[0],tuple(crops),ordered_axes[0])
         return Crop2(*args)
 
 class PadOpParser(OnnxParser):
     @classmethod
     def _impl_v11(cls,*args,node:NodeConvertor):
-        return Pad2(*args)
+        if node.attr.get("mode", "constant") != "constant":
+            raise NotImplementedError("Pad mode {} not implemented".format(node.attr["mode"]))
+        if len(node.inputs) > 2 and node.inputs[2] not in ("", "ISNULL"):
+            raise NotImplementedError("Pad with a non-default constant value is not implemented")
+        pads = _static_tensor_value(node.graph, node.inputs[1]) if len(node.inputs) > 1 else None
+        if pads is not None:
+            pads = np.asarray(pads).reshape(-1)
+            input_shape = getattr(node.graph, "tensor_shapes", {}).get(node.inputs[0])
+            if input_shape is not None and len(pads) == 2 * len(input_shape):
+                output_shape = [
+                    int(dim + pads[index] + pads[index + len(input_shape)])
+                    if dim > 0 else dim
+                    for index, dim in enumerate(input_shape)
+                ]
+                node.graph.tensor_shapes[node.outputs[0]] = output_shape
+                node.graph._static_tensor_cache = {}
+            # Fixed-shape exports often retain PyTorch's dynamic padding
+            # construction even though every pad is zero.  Do not emit the
+            # runtime shape subgraph/Pad in that case.
+            if np.all(pads == 0):
+                return args[0]
+        return Pad2(args[0],args[1])
 
 class CastParser(OnnxParser):
     @classmethod
@@ -429,6 +831,12 @@ class MathOpParser(OnnxParser):
         elif node.op == "Equal":
             assert len(args) == 2
             return EQ(args[0],args[1])
+        elif node.op == "Mod":
+            # ONNX integer Mod in the timm Swin graphs is used for positive
+            # tensor dimensions and padding. TFDL has no native Mod operator;
+            # integer division is truncating for these non-negative values.
+            assert len(args) == 2
+            return args[0] - (args[0] / args[1]) * args[1]
         else:
             raise NotImplementedError("{} not implemented".format(node.op))
 
@@ -509,6 +917,10 @@ def _get_convert_map(opset):
         "AveragePool":PoolingParser.get_converter(opset),
         "MatMul":MatMulParser.get_converter(opset),
         "Gemm":GemmParser.get_converter(opset),
+        "LinearConv":LinearConvParser.get_converter(opset),
+        "MLPLinearConv":MLPLinearConvParser.get_converter(opset),
+        "QKVLinearConv":QKVLinearConvParser.get_converter(opset),
+        "AttentionOutLinearConv":AttentionOutLinearConvParser.get_converter(opset),
         "ConvTranspose":ConvTransposeParser.get_converter(opset),
         "Relu":ActivationParser.get_converter(opset),
         "Relu6":ActivationParser.get_converter(opset),
@@ -532,6 +944,7 @@ def _get_convert_map(opset):
         "Mul":BinaryOpParser.get_converter(opset),
         "Sub":BinaryOpParser.get_converter(opset),
         "Div":BinaryOpParser.get_converter(opset),
+        "Identity":IdentityParser.get_converter(opset),
         "Concat":ConcatOpParser.get_converter(opset),
         "Slice":SliceOpParser.get_converter(opset),
         "Pad":PadOpParser.get_converter(opset),
@@ -539,6 +952,7 @@ def _get_convert_map(opset):
         "Unsqueeze":UnsqueezeParser.get_converter(opset),
         "Floor":MathOpParser.get_converter(opset),
         "Equal":MathOpParser.get_converter(opset),
+        "Mod":MathOpParser.get_converter(opset),
         "Split":SplitParser.get_converter(opset),
         "InstanceNormalization":LayerNormalParser.get_converter(opset),
         "LayerNorm":LayerNormalParser.get_converter(opset),
@@ -595,6 +1009,18 @@ class OnnxConvertor(TFConvertor):
     def load(self,path:str,stoptensor=None):
         assert path is not None
         self.onnxmodel = onnx.load_model(path)
+        self.tensor_shapes = {}
+        try:
+            inferred_model = onnx.shape_inference.infer_shapes(self.onnxmodel)
+            values = list(inferred_model.graph.input) + list(inferred_model.graph.value_info) + list(inferred_model.graph.output)
+            for value in values:
+                dims = []
+                for dim in value.type.tensor_type.shape.dim:
+                    dims.append(int(dim.dim_value) if dim.dim_value > 0 else 0)
+                if dims:
+                    self.tensor_shapes[value.name] = dims
+        except Exception:
+            pass
         if type(stoptensor) is not list:
             self.stoptensor = [stoptensor]
         else:
@@ -625,11 +1051,15 @@ class OnnxConvertor(TFConvertor):
                 '''
                 if type(nodeconvert.attr['value']) is np.ndarray:
                     self.params[nodeconvert.name] = nodeconvert.attr["value"]
+                    if len(nodeconvert.outputs) > 0:
+                        self.params[nodeconvert.outputs[0]] = nodeconvert.attr["value"]
                 else:
                     raise RuntimeError("Constant value is not np")
                 continue
-            elif nodeconvert.op == "Identity":
-                self.params[nodeconvert.name] = self.params[nodeconvert.inputs[0]]
+            elif nodeconvert.op == "Identity" and nodeconvert.inputs[0] in self.params:
+                # Consumers reference the Identity output tensor, not the ONNX
+                # node name. Keep activation Identity nodes in the graph.
+                self.params[nodeconvert.outputs[0]] = self.params[nodeconvert.inputs[0]]
                 continue
             isIgnore = False
             for stopname in self.stoptensor:
@@ -691,7 +1121,25 @@ class OnnxConvertor(TFConvertor):
         #RemoveCastOnnx(self)
         #RemoveCastOnnx(self)
         #MergeConvBertOnnx(self)
-        MergeBertOnnx(self)
+        MergeAdjacentConcatParamsOnnx(self)
+        RemoveSoftmaxMatMulPassThroughOnnx(self)
+        transformer_linear_count = TransformerNPUOptimizeOnnx(self)
+        # Swin's later blocks derive their spatial shape from the previous
+        # block's dynamic Reshape target.  Folding one layer exposes the fixed
+        # target needed to recover the next, so alternate the two bounded
+        # passes until no more shape-only nodes can be removed.
+        for _ in range(24):
+            folded = FoldStaticShapeSubgraphsOnnx(self)
+            if folded == 0:
+                break
+            RefreshTransformerShapesOnnx(self)
+        # Static folding can recover a previously symbolic final projection
+        # shape (for example Swin global-pool [B,C] -> classifier Gemm). Run a
+        # second bounded rewrite so those late-known Linear nodes also become
+        # shape-preserving 1x1 Conv instead of rank-expanding InnerProduct.
+        transformer_linear_count += TransformerNPUOptimizeOnnx(self)
+        if transformer_linear_count == 0:
+            MergeBertOnnx(self)
         SplitConvOnnx(self)
         for opt in CustomOptimize:
             opt(self)
@@ -780,8 +1228,3 @@ class OnnxConvertor(TFConvertor):
                 res = False
 
         return res
-
-
-
-
-

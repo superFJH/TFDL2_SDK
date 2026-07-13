@@ -1,7 +1,8 @@
 """
 Generic ViT / DINOv2 / DINOv3 TFDL2 direct builder.
 
-This file implements the conversion pattern described in Doc/Model_Conversion_Skill.md:
+This file implements the dual-graph conversion pattern described in
+Doc/ViT_TFDL_Dual_Graph_Quantization.md:
 
   * load HuggingFace safetensors weights
   * map source weights into a small canonical ViT namespace
