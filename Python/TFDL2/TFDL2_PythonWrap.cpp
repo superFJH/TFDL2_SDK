@@ -623,6 +623,7 @@ namespace PythonInter {
                 len *= shape[shape_i];
             }
             TFCAPI_DATATYPE dtype;
+            string dtypename = py::cast<string>(inputData.dtype().attr("name"));
             if (inputData.dtype().equal(py::dtype::of<float>())) {
                 dtype = TFCAPI_FLOAT;
             } else if (inputData.dtype().equal(py::dtype::of<uint8_t >())) {
@@ -635,10 +636,15 @@ namespace PythonInter {
                 dtype = TFCAPI_INT32;
             } else if (inputData.dtype().equal(py::dtype::of<int64_t >())) {
                 dtype = TFCAPI_INT64;
+            } else if (dtypename == "float16") {
+                dtype = TFCAPI_FLOAT16;
+            } else if (dtypename == "int16") {
+                dtype = TFCAPI_INT16;
             } else {
-                string err = "TFDL2 Can't support this dtype";
-                PyErr_SetString(PyExc_RuntimeError, err.c_str());
-                PyErr_Print();
+                throw py::type_error(
+                    "TFDL2 RegisterParamToContext can't support dtype: " +
+                    dtypename
+                );
             }
 
 

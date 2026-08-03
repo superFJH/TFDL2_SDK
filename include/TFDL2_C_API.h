@@ -174,6 +174,30 @@ namespace TFDL_CAPI {
  */
     TFDL2_CAPI_EXPORT extern bool RegisterQuantInfo(TFContext, string tensorName, float scale, int zeropoint);
 /*!
+ *  @brief: Register a Tensor's multi-channel Quantization with qmax/qmin.
+ *          The q-info arrays use the same channel order as the consumer Op.
+ *          if fail, return false
+ *  @param: target context
+ *  @param: tensor's name
+ *  @param: qmax of every channel
+ *  @param: qmin of every channel
+ */
+    TFDL2_CAPI_EXPORT extern bool RegisterQuantInfo(TFContext, string tensorName,
+                                                    const vector<float> &max,
+                                                    const vector<float> &min);
+/*!
+ *  @brief: Register a Tensor's multi-channel Quantization with scale/zeropoint.
+ *          The q-info arrays use the same channel order as the consumer Op.
+ *          if fail, return false
+ *  @param: target context
+ *  @param: tensor's name
+ *  @param: scale of every channel
+ *  @param: zeropoint of every channel
+ */
+    TFDL2_CAPI_EXPORT extern bool RegisterQuantInfo(TFContext, string tensorName,
+                                                    const vector<float> &scale,
+                                                    const vector<int> &zeropoint);
+/*!
  *  @brief: Dump context into file as protocol: TFDL1.0(json+bin)
  *  @param: target context
  *  @param: outfile name

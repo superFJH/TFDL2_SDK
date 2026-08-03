@@ -484,7 +484,7 @@ import numpy as np
 import cv2
 
 # 加载模型
-ctx = TFContext(path="yolov5sQ.fb")
+ctx = TFContext("yolov5sQ.fb")
 
 # 编译执行体
 option = {
