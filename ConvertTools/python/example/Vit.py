@@ -422,6 +422,39 @@ def canonicalize_weights(
     return out
 
 
+def apply_fp16_residual_reparameterization(
+    weights: dict[str, np.ndarray],
+    config: ViTOpConfig,
+    scale: float,
+) -> None:
+    """Start a scaled residual stream at block 0's MLP merge.
+
+    DINOv3 register-token residuals can exceed the finite FP16 range after the
+    first MLP. Scaling the block-0 residual merge and every later branch update
+    by the same positive factor preserves the pre-norm transformer function
+    (up to the LayerNorm epsilon) while keeping the residual stream finite.
+
+    The block-0 attention path remains unscaled. Its residual is scaled at the
+    block-0 MLP merge, so only block-0 FC2 and later output projections need
+    their weights and biases folded by ``scale``.
+    """
+    scale = float(scale)
+    if not (0.0 < scale <= 1.0):
+        raise ValueError("FP16 residual scale must be in (0, 1]")
+    if scale == 1.0:
+        return
+    weights["fp16_residual_scale.weight"] = np.asarray(
+        [scale], dtype=np.float32
+    )
+    weights["fp16_residual_scale.bias"] = np.zeros((1,), dtype=np.float32)
+    for layer_id in range(config.num_hidden_layers):
+        stems = ("fc2",) if layer_id == 0 else ("proj", "fc2")
+        for stem in stems:
+            for suffix in ("weight", "bias"):
+                name = f"layers.{layer_id}.{stem}.{suffix}"
+                weights[name] = _as_float32(weights[name] * scale)
+
+
 class RangeCollector:
     """Collect activation ranges without relying on SDK calibration modes.
 
@@ -731,6 +764,7 @@ class TorchViTOpGraph(torch.nn.Module):
         self.weights = {k: torch.from_numpy(v).to(device) for k, v in weights.items()}
         self.collector = RangeCollector()
         self.register_residual_scale = 1.0
+        self.fp16_residual_scale = 1.0
         self.stable_attention_window = 0.0
 
     def _w(self, name: str) -> torch.Tensor:
@@ -866,7 +900,13 @@ class TorchViTOpGraph(torch.nn.Module):
         self._record_token_groups(f"{c}.fc2.raw", mlp)
         mlp = self._scale_register_update(mlp, f"{c}.fc2.scaled")
         self._record_token_groups(f"{c}.fc2", mlp)
-        return self._record(f"{c}.resid2", hidden + mlp)
+        resid2_base = hidden
+        if layer_id == 0 and float(self.fp16_residual_scale) != 1.0:
+            resid2_base = self._record(
+                f"{c}.resid2_base_scaled",
+                hidden * float(self.fp16_residual_scale),
+            )
+        return self._record(f"{c}.resid2", resid2_base + mlp)
 
     def forward(self, pixel_values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         cfg = self.config
@@ -1011,11 +1051,13 @@ def collect_minmax_json(
     exclude_register_tokens: bool = False,
     register_range_policy: str = "include",
     register_residual_scale: float = 1.0,
+    fp16_residual_scale: float = 1.0,
     stable_attention_window: float = 0.0,
 ) -> dict[str, dict[str, Any]]:
     device = torch.device(device_name or ("cuda" if torch.cuda.is_available() else "cpu"))
     model = TorchViTOpGraph(config, weights, device).eval()
     model.register_residual_scale = float(register_residual_scale)
+    model.fp16_residual_scale = float(fp16_residual_scale)
     model.stable_attention_window = float(stable_attention_window)
     if exclude_register_tokens:
         if register_range_policy != "include":
@@ -1133,6 +1175,7 @@ def compare_with_reference(
     compare_torch_op: bool = True,
     compare_tfdl_fp: bool = False,
     addon_path: str | Path | None = None,
+    fp16_residual_scale: float = 1.0,
 ) -> dict[str, Any]:
     device = torch.device(device_name or ("cuda" if torch.cuda.is_available() else "cpu"))
     old_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
@@ -1148,13 +1191,20 @@ def compare_with_reference(
     try:
         reference = _load_reference_model(model_path, device)
         torch_op = TorchViTOpGraph(config, weights, device).eval() if compare_torch_op else None
+        if torch_op is not None:
+            torch_op.fp16_residual_scale = float(fp16_residual_scale)
         samples = _load_compare_samples(config, calib_dir, max(1, num_samples), device)
 
         tfdl_executor = None
         if compare_tfdl_fp:
             if addon_path is not None:
                 _load_addon_if_needed(config, addon_path)
-            _, tfdl_executor, _, _, _ = build_vit_tfdl_graph(config, weights, create_executor=True)
+            _, tfdl_executor, _, _, _ = build_vit_tfdl_graph(
+                config,
+                weights,
+                create_executor=True,
+                fp16_residual_scale=fp16_residual_scale,
+            )
 
         with torch.no_grad():
             for sample_id, (sample, tfdl_input) in enumerate(samples):
@@ -1506,6 +1556,7 @@ def _build_block_op(
     rope_sin=None,
     rope_cos=None,
     register_residual_scale: float = 1.0,
+    fp16_residual_scale: float = 1.0,
     split_mlp_token_groups: bool = False,
     split_attention_heads: bool = False,
     stable_attention_window: float = 0.0,
@@ -1700,7 +1751,22 @@ def _build_block_op(
                 Op.Concat(tuple(fc2_groups), axis=1),
             )
             symbol_map[f"{c}.fc2"] = str(mlp)
-            return _mark(symbol_map, f"{c}.resid2", Op.Add(hidden, mlp))
+            resid2_base = hidden
+            if layer_id == 0 and float(fp16_residual_scale) != 1.0:
+                resid2_base = _mark(
+                    symbol_map,
+                    f"{c}.resid2_base_scaled",
+                    Op.Scale2(
+                        hidden,
+                        ctx.GetParamSymbol("fp16_residual_scale.weight"),
+                        ctx.GetParamSymbol("fp16_residual_scale.bias"),
+                    ),
+                )
+            return _mark(
+                symbol_map,
+                f"{c}.resid2",
+                Op.Add(resid2_base, mlp),
+            )
         mlp = _pointwise_4d_op(ctx, normed2_4d, f"{c}.fc1.weight", f"{c}.fc1.bias", config.intermediate_size, symbol_map, f"{c}.fc1")
         mlp = _mark(symbol_map, f"{c}.mlp_mid", Op.GeLU(mlp))
     mlp = _mark(
@@ -1712,7 +1778,18 @@ def _build_block_op(
         config,
         ),
     )
-    return _mark(symbol_map, f"{c}.resid2", Op.Add(hidden, mlp))
+    resid2_base = hidden
+    if layer_id == 0 and float(fp16_residual_scale) != 1.0:
+        resid2_base = _mark(
+            symbol_map,
+            f"{c}.resid2_base_scaled",
+            Op.Scale2(
+                hidden,
+                ctx.GetParamSymbol("fp16_residual_scale.weight"),
+                ctx.GetParamSymbol("fp16_residual_scale.bias"),
+            ),
+        )
+    return _mark(symbol_map, f"{c}.resid2", Op.Add(resid2_base, mlp))
 
 
 def build_vit_tfdl_graph(
@@ -1721,6 +1798,7 @@ def build_vit_tfdl_graph(
     range_json: str | Path | None = None,
     create_executor: bool = False,
     register_residual_scale: float = 1.0,
+    fp16_residual_scale: float = 1.0,
     split_mlp_token_groups: bool = False,
     split_attention_heads: bool = False,
     stable_attention_window: float = 0.0,
@@ -1801,6 +1879,7 @@ def build_vit_tfdl_graph(
                 rope_sin,
                 rope_cos,
                 register_residual_scale=register_residual_scale,
+                fp16_residual_scale=fp16_residual_scale,
                 split_mlp_token_groups=split_mlp_token_groups,
                 split_attention_heads=split_attention_heads,
                 stable_attention_window=stable_attention_window,
@@ -1962,6 +2041,7 @@ def apply_outlier_bypass_modify(
     *,
     top_k: int,
     fp16_export: bool = False,
+    fp16_residual_scale: float = 1.0,
     dump_modify_json: str | Path | None = None,
     dump_bypass_report_json: str | Path | None = None,
 ) -> dict[str, Any]:
@@ -1978,6 +2058,39 @@ def apply_outlier_bypass_modify(
     report = select_outlier_branches(config, range_json, top_k)
     fp_attn_layers = frozenset(report["fp_attn_layers"])
     fp_mlp_layers = frozenset(report["fp_mlp_layers"])
+    if fp16_export:
+        fp16_limit = float(np.finfo(np.float16).max)
+        fp16_tags = ["tokens"]
+        for layer_id in range(config.num_hidden_layers):
+            prefix = f"layers.{layer_id}"
+            fp16_tags.extend(
+                (
+                    f"{prefix}.proj",
+                    f"{prefix}.resid1",
+                    f"{prefix}.fc2",
+                    f"{prefix}.resid2",
+                )
+            )
+        overflow = []
+        for tag in fp16_tags:
+            if tag not in ranges:
+                continue
+            qmin, qmax = _range_item(ranges, tag)
+            absolute = max(abs(qmin), abs(qmax))
+            if absolute > fp16_limit:
+                overflow.append((tag, absolute))
+        if overflow:
+            details = ", ".join(
+                f"{tag}={absolute:.6g}"
+                for tag, absolute in sorted(
+                    overflow, key=lambda item: item[1], reverse=True
+                )[:8]
+            )
+            raise ValueError(
+                "FP16 residual/branch range exceeds 65504; regenerate the "
+                "range JSON with the FP16 residual reparameterization enabled. "
+                f"Offenders: {details}"
+            )
     branch_dtype = "TFDtypeFp16" if fp16_export else "TFDtypeFp32"
     param_dtype = np.float16 if fp16_export else np.float32
     dequant_options: dict[str, Any] = (
@@ -2069,7 +2182,7 @@ def apply_outlier_bypass_modify(
                         f"{prefix}.norm1.bias",
                     ],
                     "layerName": norm1,
-                    "outputDataType": "TFDtypeFp32",
+                    "outputDataType": branch_dtype,
                 },
                 {
                     "input": [norm1],
@@ -2145,7 +2258,7 @@ def apply_outlier_bypass_modify(
                         f"{prefix}.norm2.bias",
                     ],
                     "layerName": norm2,
-                    "outputDataType": "TFDtypeFp32",
+                    "outputDataType": branch_dtype,
                 },
             )
         )
@@ -2288,9 +2401,28 @@ def apply_outlier_bypass_modify(
             )
             mlp_residual_input = dequant_mlp
 
+        resid2_base = resid1
+        resid2_base_tag = f"{prefix}.resid2_base_scaled"
+        if resid2_base_tag in symbol_map:
+            resid2_base = symbol(resid2_base_tag)
+            scale_weight = "fp16_residual_scale.weight"
+            scale_bias = "fp16_residual_scale.bias"
+            float_param_names.update((scale_weight, scale_bias))
+            layers.append(
+                {
+                    "input": [
+                        resid1,
+                        f"PostFP.{scale_weight}",
+                        f"PostFP.{scale_bias}",
+                    ],
+                    "layerName": resid2_base,
+                    "outputDataType": branch_dtype,
+                }
+            )
+
         layers.append(
             {
-                "input": [resid1, mlp_residual_input],
+                "input": [resid2_base, mlp_residual_input],
                 "layerName": resid2,
                 "outputDataType": branch_dtype,
             }
@@ -2304,7 +2436,7 @@ def apply_outlier_bypass_modify(
         {
             "input": [final_hidden, "norm.weight", "norm.bias"],
             "layerName": final_norm,
-            "outputDataType": "TFDtypeFp32",
+            "outputDataType": branch_dtype,
         }
     )
 
@@ -2319,6 +2451,7 @@ def apply_outlier_bypass_modify(
     report.update(
         {
             "fp16_export": bool(fp16_export),
+            "fp16_residual_scale": float(fp16_residual_scale),
             "restored_param_dtype": str(np.dtype(param_dtype)),
             "restored_params": sorted(restored_params),
             "modified_layer_entries": len(layers),
@@ -2434,6 +2567,16 @@ def build_arg_parser(default_arch: str | None = None) -> argparse.ArgumentParser
         ),
     )
     parser.add_argument(
+        "--fp16-residual-scale",
+        type=float,
+        default=None,
+        help=(
+            "Positive scale applied from the block-0 MLP residual merge "
+            "onward to keep register-token residuals inside FP16. "
+            "Default: 0.25 for FP16 models with register tokens, otherwise 1."
+        ),
+    )
+    parser.add_argument(
         "--dump-modify-json",
         default=None,
         help="Optional path for the generated post-quant Modify JSON",
@@ -2544,6 +2687,11 @@ def main(argv: list[str] | None = None, default_arch: str | None = None) -> None
     if args.outlier_bypass_top_k < 0:
         raise ValueError("--outlier-bypass-top-k must be non-negative")
     if (
+        args.fp16_residual_scale is not None
+        and not (0.0 < float(args.fp16_residual_scale) <= 1.0)
+    ):
+        raise ValueError("--fp16-residual-scale must be in (0, 1]")
+    if (
         (args.outlier_bypass_top_k or args.fp16_export)
         and not args.dump_quant_fb
     ):
@@ -2580,8 +2728,20 @@ def main(argv: list[str] | None = None, default_arch: str | None = None) -> None
         )
 
     config = ViTOpConfig.from_model_path(args.model_path, args.arch, image_size=args.image_size)
+    fp16_residual_scale = 1.0
+    if args.fp16_export:
+        fp16_residual_scale = (
+            float(args.fp16_residual_scale)
+            if args.fp16_residual_scale is not None
+            else (0.25 if config.num_register_tokens else 1.0)
+        )
     raw = load_safetensors(args.model_path)
     weights = canonicalize_weights(raw, config)
+    apply_fp16_residual_reparameterization(
+        weights,
+        config,
+        fp16_residual_scale,
+    )
     comparison_results: dict[str, Any] = {}
     if args.compare_reference or args.compare_tfdl_fp:
         comparison_results["fp_graph"] = compare_with_reference(
@@ -2595,6 +2755,7 @@ def main(argv: list[str] | None = None, default_arch: str | None = None) -> None
             compare_torch_op=args.compare_reference,
             compare_tfdl_fp=args.compare_tfdl_fp,
             addon_path=args.addon_path,
+            fp16_residual_scale=fp16_residual_scale,
         )
 
     needs_graph = bool(
@@ -2626,6 +2787,7 @@ def main(argv: list[str] | None = None, default_arch: str | None = None) -> None
                 exclude_register_tokens=args.exclude_register_tokens_from_ranges,
                 register_range_policy=args.register_range_policy,
                 register_residual_scale=args.register_residual_scale,
+                fp16_residual_scale=fp16_residual_scale,
                 stable_attention_window=args.stable_attention_window,
             )
             range_json = generated_range_json
@@ -2637,6 +2799,7 @@ def main(argv: list[str] | None = None, default_arch: str | None = None) -> None
             weights,
             range_json=range_json,
             register_residual_scale=args.register_residual_scale,
+            fp16_residual_scale=fp16_residual_scale,
             split_mlp_token_groups=args.split_mlp_token_groups,
             split_attention_heads=args.split_attention_heads,
             stable_attention_window=args.stable_attention_window,
@@ -2686,6 +2849,7 @@ def main(argv: list[str] | None = None, default_arch: str | None = None) -> None
                     symbol_map,
                     top_k=args.outlier_bypass_top_k,
                     fp16_export=args.fp16_export,
+                    fp16_residual_scale=fp16_residual_scale,
                     dump_modify_json=_method_output_path(
                         args.dump_modify_json, method, multiple_methods
                     ),
@@ -2704,6 +2868,7 @@ def main(argv: list[str] | None = None, default_arch: str | None = None) -> None
                 print(
                     f"[BYPASS] method={method} top_k="
                     f"{args.outlier_bypass_top_k} fp16={args.fp16_export} "
+                    f"residual_scale={fp16_residual_scale:g} "
                     f"selected=[{selected_summary}]"
                 )
             generated_quant_paths[method] = quant_output
