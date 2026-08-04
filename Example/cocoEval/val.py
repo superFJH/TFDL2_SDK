@@ -157,7 +157,6 @@ class TFDLValidator(DetectionValidator):
         inputs.fromNumpy(img)
         out = model()[0].toNumpy()                    
         out = torch.from_numpy(out)
-        torch.utils.cpp_extension
         return out
     
 

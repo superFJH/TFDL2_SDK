@@ -227,6 +227,24 @@ namespace TFDL_CAPI {
 
         TFDL2_CAPI_EXPORT  string DeQuantize(TFContext &, string input);
 
+        /*!
+        type:MathCeil = 0,
+            MathFloor = 1,
+            MathSqrt = 2,
+            MathLog2 = 3,
+            MathPow = 4,
+            MathSoftplus = 5,
+            MathAbs = 6,
+            MathCos = 7,
+            MathSin = 8,
+            MathNeg = 9,
+            MathErf = 10,
+            MathSinh = 11,
+            MathCosh = 12,
+            MathLog = 13
+        */
+        TFDL2_CAPI_EXPORT  string MathOp(TFContext &, string input, int type);
+
         TFDL2_CAPI_EXPORT  string Pow(TFContext &, string input,int power);
 
         TFDL2_CAPI_EXPORT  string Sqrt(TFContext &, string input);

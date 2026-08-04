@@ -2058,6 +2058,10 @@ namespace PythonInter {
         TFContext tfContext = img.GetContext();
         return TFSymbol(tfContext,TFFunc::Sqrt(tfContext,img.getName()));
     }
+    TFSymbol MathOp(TFSymbol img, int type){
+        TFContext tfContext = img.GetContext();
+        return TFSymbol(tfContext,TFFunc::MathOp(tfContext,img.getName(),type));
+    }
     TFSymbol Floor(TFSymbol img){
         TFContext tfContext = img.GetContext();
         return TFSymbol(tfContext,TFFunc::Floor(tfContext,img.getName()));
@@ -2584,6 +2588,7 @@ PYBIND11_MODULE(TFDL2,m) {
     defop(Floor)
     defop(Pow)
     defop(Sqrt)
+    defop(MathOp)
     defop(Log2)
     defop(ShapeOp)
     defop(Expand_dims)

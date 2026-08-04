@@ -19,7 +19,6 @@
 #include <cmath>
 #include <cstring>
 #include <cassert>
-#include <stdexcept>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -36,9 +35,6 @@ namespace TFDLOP {
             bool useFp16 = false;  // 使用 FP16 NEON 加速 (精度略降, 速度更快)
             bool interleaved = false;  // Adjacent complex pairs, used by MoonViT.
         };
-
-        // 小工作量直接串行执行，避免 OpenMP 线程唤醒成本高于计算本身。
-        static constexpr long long kMinParallelElements = 16 * 1024;
 
         void Prepare(TFContext tfContext, TFNode node) {
             json11::Json param;
@@ -98,7 +94,6 @@ namespace TFDLOP {
 
             // head_dim must match
             int headDim = qShape[3];
-            TFCHECK_EQ(headDim % 2, 0);
             TFCHECK_EQ(sinShape[sinShape.size() - 1], headDim);
             TFCHECK_EQ(cosShape[cosShape.size() - 1], headDim);
 
@@ -117,104 +112,54 @@ namespace TFDLOP {
         // ====================================================================
         // 标量实现 (fallback, 用于非 aarch64 平台)
         // ====================================================================
-        static void ropeApplyScalarPair(
-                const float *q, const float *k,
-                float *qOut, float *kOut,
+        static void ropeApplyScalar(
+                const float *x, float *out,
                 const float *sin, const float *cos,
-                int B, int qNumHeads, int kNumHeads, int N, int headDim,
+                int B, int numHeads, int N, int headDim,
                 int sinB, int sinH, int hw, bool interleaved = false) {
             int half = headDim / 2;
             int prefix = N - hw;
-            const int tokensPerWork = 16;
-            int tokenChunks = (N + tokensPerWork - 1) / tokensPerWork;
-            int qItems = B * qNumHeads * tokenChunks;
-            int kItems = B * kNumHeads * tokenChunks;
-            int totalItems = qItems + kItems;
-            long long totalElements =
-                (long long)B * (qNumHeads + kNumHeads) * N * headDim;
-            bool shouldParallel = false;
-#ifdef _OPENMP
-            shouldParallel =
-                totalElements >= kMinParallelElements
-                && omp_get_max_threads() > 1;
-#endif
 
-            // 将 Q/K 的所有 [b, head, token] 合并到同一个并行循环。
-            // 相比先 Q 后 K 各启动一次线程组，GQA 的少量 KV heads 也能与 Q
-            // 一起参与负载均衡。
-            auto applyRange = [=](
-                    const float *x, float *out, int numHeads,
-                    int headRow, int nBegin, int nEnd) {
-                int b = headRow / numHeads;
-                int h = headRow % numHeads;
-                int sb = (sinB == 1) ? 0 : b;
-                int sh = (sinH == 1) ? 0 : h;
-                long long headOffset = (long long)headRow * N * headDim;
+            #pragma omp parallel for collapse(2) schedule(static)
+            for (int b = 0; b < B; b++) {
+                for (int h = 0; h < numHeads; h++) {
+                    int sb = (sinB == 1) ? 0 : b;
+                    int sh = (sinH == 1) ? 0 : h;
 
-                for (int n = nBegin; n < nEnd; n++) {
-                    const float *xPtr = x + headOffset + (long long)n * headDim;
-                    float *outPtr = out + headOffset + (long long)n * headDim;
-
-                    if (n < prefix) {
-                        memcpy(outPtr, xPtr, headDim * sizeof(float));
-                        continue;
+                    // Copy prefix positions unchanged
+                    if (prefix > 0) {
+                        memcpy(
+                            out + ((b * numHeads + h) * N) * headDim,
+                            x + ((b * numHeads + h) * N) * headDim,
+                            prefix * headDim * sizeof(float)
+                        );
                     }
 
-                    int sn = n - prefix;
-                    const float *sinPtr =
-                        sin + ((sb * sinH + sh) * hw + sn) * headDim;
-                    const float *cosPtr =
-                        cos + ((sb * sinH + sh) * hw + sn) * headDim;
+                    // Apply RoPE to positions [prefix..N-1]
+                    for (int n = prefix; n < N; n++) {
+                        int sn = n - prefix;
+                        const float *xPtr = x + ((b * numHeads + h) * N + n) * headDim;
+                        const float *sinPtr = sin + ((sb * sinH + sh) * hw + sn) * headDim;
+                        const float *cosPtr = cos + ((sb * sinH + sh) * hw + sn) * headDim;
+                        float *outPtr = out + ((b * numHeads + h) * N + n) * headDim;
 
-                    if (interleaved) {
-                        for (int d = 0; d < headDim; d += 2) {
-                            outPtr[d] =
-                                xPtr[d] * cosPtr[d]
-                                - xPtr[d + 1] * sinPtr[d];
-                            outPtr[d + 1] =
-                                xPtr[d + 1] * cosPtr[d + 1]
-                                + xPtr[d] * sinPtr[d + 1];
-                        }
-                    } else {
-                        for (int d = 0; d < half; d++) {
-                            outPtr[d] =
-                                xPtr[d] * cosPtr[d]
-                                - xPtr[d + half] * sinPtr[d];
-                            outPtr[d + half] =
-                                xPtr[d + half] * cosPtr[d + half]
-                                + xPtr[d] * sinPtr[d + half];
+                        if (interleaved) {
+                            for (int d = 0; d + 1 < headDim; d += 2) {
+                                outPtr[d] = xPtr[d] * cosPtr[d] - xPtr[d + 1] * sinPtr[d];
+                                outPtr[d + 1] = xPtr[d + 1] * cosPtr[d + 1] + xPtr[d] * sinPtr[d + 1];
+                            }
+                        } else {
+                            // 前半: out[d] = x[d]*cos[d] - x[d+half]*sin[d]
+                            for (int d = 0; d < half; d++) {
+                                outPtr[d] = xPtr[d] * cosPtr[d] - xPtr[d + half] * sinPtr[d];
+                            }
+                            // 后半: out[d] = x[d]*cos[d] + x[d-half]*sin[d]
+                            for (int d = half; d < headDim; d++) {
+                                outPtr[d] = xPtr[d] * cosPtr[d] + xPtr[d - half] * sinPtr[d];
+                            }
                         }
                     }
                 }
-            };
-
-            if (!shouldParallel) {
-                for (int headRow = 0; headRow < B * qNumHeads; headRow++) {
-                    applyRange(q, qOut, qNumHeads, headRow, 0, N);
-                }
-                for (int headRow = 0; headRow < B * kNumHeads; headRow++) {
-                    applyRange(k, kOut, kNumHeads, headRow, 0, N);
-                }
-                return;
-            }
-
-            #pragma omp parallel for schedule(static)
-            for (int item = 0; item < totalItems; item++) {
-                bool isQ = item < qItems;
-                int localItem = isQ ? item : item - qItems;
-                int numHeads = isQ ? qNumHeads : kNumHeads;
-                int tokenChunk = localItem % tokenChunks;
-                int headRow = localItem / tokenChunks;
-                int nBegin = tokenChunk * tokensPerWork;
-                int nEnd = nBegin + tokensPerWork;
-                if (nEnd > N) nEnd = N;
-                applyRange(
-                    isQ ? q : k,
-                    isQ ? qOut : kOut,
-                    numHeads,
-                    headRow,
-                    nBegin,
-                    nEnd);
             }
         }
 
@@ -228,112 +173,71 @@ namespace TFDLOP {
         // 每次处理 4 个 float (float32x4_t)，用 vmlaq/vmlsq 完成乘加/乘减。
         // ====================================================================
 #ifdef __aarch64__
-        static void ropeApplyNeonPair(
-                const float *q, const float *k,
-                float *qOut, float *kOut,
+        static void ropeApplyNeon(
+                const float *x, float *out,
                 const float *sin, const float *cos,
-                int B, int qNumHeads, int kNumHeads, int N, int headDim,
+                int B, int numHeads, int N, int headDim,
                 int sinB, int sinH, int hw) {
             int half = headDim / 2;
             int prefix = N - hw;
-            const int tokensPerWork = 16;
-            int tokenChunks = (N + tokensPerWork - 1) / tokensPerWork;
-            int qItems = B * qNumHeads * tokenChunks;
-            int kItems = B * kNumHeads * tokenChunks;
-            int totalItems = qItems + kItems;
-            long long totalElements =
-                (long long)B * (qNumHeads + kNumHeads) * N * headDim;
-            bool shouldParallel = false;
-#ifdef _OPENMP
-            shouldParallel =
-                totalElements >= kMinParallelElements
-                && omp_get_max_threads() > 1;
-#endif
+            const int laneBytes = 4;  // sizeof(float)
 
-            auto applyRange = [=](
-                    const float *x, float *out, int numHeads,
-                    int headRow, int nBegin, int nEnd) {
-                int b = headRow / numHeads;
-                int h = headRow % numHeads;
-                int sb = (sinB == 1) ? 0 : b;
-                int sh = (sinH == 1) ? 0 : h;
-                long long headOffset = (long long)headRow * N * headDim;
+            #pragma omp parallel for collapse(2) schedule(static)
+            for (int b = 0; b < B; b++) {
+                for (int h = 0; h < numHeads; h++) {
+                    int sb = (sinB == 1) ? 0 : b;
+                    int sh = (sinH == 1) ? 0 : h;
 
-                for (int n = nBegin; n < nEnd; n++) {
-                    const float *xPtr = x + headOffset + (long long)n * headDim;
-                    float *outPtr = out + headOffset + (long long)n * headDim;
+                    int rowStride = (b * numHeads + h) * N;
+                    int scStride = (sb * sinH + sh) * hw;
 
-                    if (n < prefix) {
-                        memcpy(outPtr, xPtr, headDim * sizeof(float));
-                        continue;
+                    // ---- prefix memcpy ----
+                    if (prefix > 0) {
+                        memcpy(out + rowStride * headDim,
+                               x + rowStride * headDim,
+                               prefix * headDim * sizeof(float));
                     }
 
-                    int sn = n - prefix;
-                    int scOffset = ((sb * sinH + sh) * hw + sn) * headDim;
-                    const float *xFront = xPtr;
-                    const float *xBack = xPtr + half;
-                    const float *sinF = sin + scOffset;
-                    const float *sinBk = sinF + half;
-                    const float *cosF = cos + scOffset;
-                    const float *cosBk = cosF + half;
-                    float *outFront = outPtr;
-                    float *outBack = outPtr + half;
+                    // ---- RoPE on patch positions ----
+                    for (int n = prefix; n < N; n++) {
+                        int sn = n - prefix;
+                        const float *xFront = x   + (rowStride + n) * headDim;
+                        const float *xBack  = x   + (rowStride + n) * headDim + half;
+                        const float *sinF   = sin + (scStride + sn) * headDim;
+                        const float *sinBk  = sin + (scStride + sn) * headDim + half;
+                        const float *cosF   = cos + (scStride + sn) * headDim;
+                        const float *cosBk  = cos + (scStride + sn) * headDim + half;
+                        float *outFront     = out + (rowStride + n) * headDim;
+                        float *outBack      = out + (rowStride + n) * headDim + half;
 
-                    int d = 0;
-                    for (; d + 4 <= half; d += 4) {
-                        float32x4_t vxF = vld1q_f32(xFront + d);
-                        float32x4_t vxB = vld1q_f32(xBack + d);
-                        float32x4_t vcosF = vld1q_f32(cosF + d);
-                        float32x4_t vcosB = vld1q_f32(cosBk + d);
-                        float32x4_t vsinF = vld1q_f32(sinF + d);
-                        float32x4_t vsinB = vld1q_f32(sinBk + d);
+                        int d = 0;
+                        // ---- NEON 向量化: 每次处理 4 个 float ----
+                        for (; d + 4 <= half; d += 4) {
+                            float32x4_t vxF   = vld1q_f32(xFront + d);
+                            float32x4_t vxB   = vld1q_f32(xBack  + d);
+                            float32x4_t vcosF = vld1q_f32(cosF   + d);
+                            float32x4_t vcosB = vld1q_f32(cosBk  + d);
+                            float32x4_t vsinF = vld1q_f32(sinF   + d);
+                            float32x4_t vsinB = vld1q_f32(sinBk  + d);
 
-                        float32x4_t vOutF = vmulq_f32(vxF, vcosF);
-                        vOutF = vmlsq_f32(vOutF, vxB, vsinF);
-                        vst1q_f32(outFront + d, vOutF);
+                            // out_front = xF*cosF - xB*sinF
+                            float32x4_t vOutF = vmulq_f32(vxF, vcosF);
+                            vOutF = vmlsq_f32(vOutF, vxB, vsinF);
+                            vst1q_f32(outFront + d, vOutF);
 
-                        float32x4_t vOutB = vmulq_f32(vxB, vcosB);
-                        vOutB = vmlaq_f32(vOutB, vxF, vsinB);
-                        vst1q_f32(outBack + d, vOutB);
+                            // out_back = xB*cosB + xF*sinB
+                            float32x4_t vOutB = vmulq_f32(vxB, vcosB);
+                            vOutB = vmlaq_f32(vOutB, vxF, vsinB);
+                            vst1q_f32(outBack + d, vOutB);
+                        }
+
+                        // ---- 剩余元素标量处理 ----
+                        for (; d < half; d++) {
+                            outFront[d] = xFront[d] * cosF[d] - xBack[d] * sinF[d];
+                            outBack[d]  = xBack[d]  * cosBk[d] + xFront[d] * sinBk[d];
+                        }
                     }
-
-                    for (; d < half; d++) {
-                        outFront[d] =
-                            xFront[d] * cosF[d] - xBack[d] * sinF[d];
-                        outBack[d] =
-                            xBack[d] * cosBk[d] + xFront[d] * sinBk[d];
-                    }
                 }
-            };
-
-            // 串行/小张量走按 head 的紧凑循环，避免分块调度开销。
-            if (!shouldParallel) {
-                for (int headRow = 0; headRow < B * qNumHeads; headRow++) {
-                    applyRange(q, qOut, qNumHeads, headRow, 0, N);
-                }
-                for (int headRow = 0; headRow < B * kNumHeads; headRow++) {
-                    applyRange(k, kOut, kNumHeads, headRow, 0, N);
-                }
-                return;
-            }
-
-            #pragma omp parallel for schedule(static)
-            for (int item = 0; item < totalItems; item++) {
-                bool isQ = item < qItems;
-                int localItem = isQ ? item : item - qItems;
-                int numHeads = isQ ? qNumHeads : kNumHeads;
-                int tokenChunk = localItem % tokenChunks;
-                int headRow = localItem / tokenChunks;
-                int nBegin = tokenChunk * tokensPerWork;
-                int nEnd = nBegin + tokensPerWork;
-                if (nEnd > N) nEnd = N;
-                applyRange(
-                    isQ ? q : k,
-                    isQ ? qOut : kOut,
-                    numHeads,
-                    headRow,
-                    nBegin,
-                    nEnd);
             }
         }
 
@@ -348,40 +252,21 @@ namespace TFDLOP {
         // 对较大 headDim (如 64, 128) 有明显加速。
         // ====================================================================
 #if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
-        static void ropeApplyFp16NeonPair(
-                const float *q, const float *k,
-                float *qOut, float *kOut,
+        static void ropeApplyFp16Neon(
+                const float *x, float *out,
                 const float *sin, const float *cos,
-                int B, int qNumHeads, int kNumHeads, int N, int headDim,
+                int B, int numHeads, int N, int headDim,
                 int sinB, int sinH, int hw) {
             int half = headDim / 2;
             int prefix = N - hw;
-            int tokensPerWork = N;
-#ifdef _OPENMP
-            if (omp_get_max_threads() > 1) tokensPerWork = 16;
-#endif
-            int tokenChunks = (N + tokensPerWork - 1) / tokensPerWork;
-            int qItems = B * qNumHeads * tokenChunks;
-            int kItems = B * kNumHeads * tokenChunks;
-            int totalItems = qItems + kItems;
-            long long totalElements =
-                (long long)B * (qNumHeads + kNumHeads) * N * headDim;
 
-            // Q/K 共用 sin/cos，只做一次 FP16 转换。
+            // ---- 预转换 sin/cos 到 FP16 (仅做一次) ----
             int scTotal = sinB * sinH * hw * headDim;
             __fp16 *sinFp16 = new __fp16[scTotal];
             __fp16 *cosFp16 = new __fp16[scTotal];
-            int vectorizedScTotal = (scTotal / 8) * 8;
-            for (int i = vectorizedScTotal; i < scTotal; i++) {
-                sinFp16[i] = (__fp16)sin[i];
-                cosFp16[i] = (__fp16)cos[i];
-            }
-
-            // 一个线程组先并行转换 sin/cos，再处理 Q+K，避免重复创建线程组。
-            #pragma omp parallel if(totalElements >= kMinParallelElements)
             {
-                #pragma omp for schedule(static)
-                for (int i = 0; i < vectorizedScTotal; i += 8) {
+                int i = 0;
+                for (; i + 8 <= scTotal; i += 8) {
                     float32x4_t sLo = vld1q_f32(sin + i);
                     float32x4_t sHi = vld1q_f32(sin + i + 4);
                     vst1q_f16(sinFp16 + i,
@@ -391,109 +276,100 @@ namespace TFDLOP {
                     vst1q_f16(cosFp16 + i,
                               vcombine_f16(vcvt_f16_f32(cLo), vcvt_f16_f32(cHi)));
                 }
+                for (; i < scTotal; i++) {
+                    sinFp16[i] = (__fp16)sin[i];
+                    cosFp16[i] = (__fp16)cos[i];
+                }
+            }
 
-                #pragma omp for schedule(static)
-                for (int item = 0; item < totalItems; item++) {
-                    bool isQ = item < qItems;
-                    int localItem = isQ ? item : item - qItems;
-                    int numHeads = isQ ? qNumHeads : kNumHeads;
-                    const float *x = isQ ? q : k;
-                    float *out = isQ ? qOut : kOut;
-
-                    int tokenChunk = localItem % tokenChunks;
-                    int headRow = localItem / tokenChunks;
-                    int b = headRow / numHeads;
-                    int h = headRow % numHeads;
+            // ---- 主循环 (OpenMP 并行化) ----
+            #pragma omp parallel for collapse(2) schedule(static)
+            for (int b = 0; b < B; b++) {
+                for (int h = 0; h < numHeads; h++) {
                     int sb = (sinB == 1) ? 0 : b;
                     int sh = (sinH == 1) ? 0 : h;
-                    int nBegin = tokenChunk * tokensPerWork;
-                    int nEnd = nBegin + tokensPerWork;
-                    if (nEnd > N) nEnd = N;
-                    long long headOffset = (long long)headRow * N * headDim;
+                    int rowStride = (b * numHeads + h) * N;
+                    int scStride  = (sb * sinH + sh) * hw;
 
-                    for (int n = nBegin; n < nEnd; n++) {
-                        const float *xPtr =
-                            x + headOffset + (long long)n * headDim;
-                        float *outPtr =
-                            out + headOffset + (long long)n * headDim;
+                    // ---- prefix memcpy ----
+                    if (prefix > 0) {
+                        memcpy(out + rowStride * headDim,
+                               x  + rowStride * headDim,
+                               prefix * headDim * sizeof(float));
+                    }
 
-                        if (n < prefix) {
-                            memcpy(outPtr, xPtr, headDim * sizeof(float));
-                            continue;
-                        }
-
+                    // ---- RoPE on patch positions ----
+                    for (int n = prefix; n < N; n++) {
                         int sn = n - prefix;
-                        int scOffset =
-                            ((sb * sinH + sh) * hw + sn) * headDim;
-                        const float *xFront = xPtr;
-                        const float *xBack = xPtr + half;
-                        const __fp16 *sinF = sinFp16 + scOffset;
-                        const __fp16 *sinBk = sinF + half;
-                        const __fp16 *cosF = cosFp16 + scOffset;
-                        const __fp16 *cosBk = cosF + half;
-                        float *outFront = outPtr;
-                        float *outBack = outPtr + half;
+                        const float *xFront = x   + (rowStride + n) * headDim;
+                        const float *xBack  = x   + (rowStride + n) * headDim + half;
+                        const __fp16 *sinF  = sinFp16 + (scStride + sn) * headDim;
+                        const __fp16 *sinBk = sinFp16 + (scStride + sn) * headDim + half;
+                        const __fp16 *cosF  = cosFp16 + (scStride + sn) * headDim;
+                        const __fp16 *cosBk = cosFp16 + (scStride + sn) * headDim + half;
+                        float *outFront     = out + (rowStride + n) * headDim;
+                        float *outBack      = out + (rowStride + n) * headDim + half;
 
-                        const float *sinF32 = sin + scOffset;
-                        const float *sinBk32 = sinF32 + half;
-                        const float *cosF32 = cos + scOffset;
-                        const float *cosBk32 = cosF32 + half;
+                        // 用于尾部回退的 float 指针
+                        const float *sinF_f  = sin + (scStride + sn) * headDim;
+                        const float *sinBk_f = sin + (scStride + sn) * headDim + half;
+                        const float *cosF_f  = cos + (scStride + sn) * headDim;
+                        const float *cosBk_f = cos + (scStride + sn) * headDim + half;
 
                         int d = 0;
+                        // ---- FP16 向量化: 每次处理 8 个元素 ----
                         for (; d + 8 <= half; d += 8) {
+                            // f32 -> f16 (两批 4 个)
                             float16x8_t vxF = vcombine_f16(
                                 vcvt_f16_f32(vld1q_f32(xFront + d)),
                                 vcvt_f16_f32(vld1q_f32(xFront + d + 4)));
                             float16x8_t vxB = vcombine_f16(
-                                vcvt_f16_f32(vld1q_f32(xBack + d)),
-                                vcvt_f16_f32(vld1q_f32(xBack + d + 4)));
-                            float16x8_t vsinF = vld1q_f16(sinF + d);
+                                vcvt_f16_f32(vld1q_f32(xBack  + d)),
+                                vcvt_f16_f32(vld1q_f32(xBack  + d + 4)));
+
+                            // 加载预转换的 FP16 sin/cos
+                            float16x8_t vsinF = vld1q_f16(sinF  + d);
                             float16x8_t vsinB = vld1q_f16(sinBk + d);
-                            float16x8_t vcosF = vld1q_f16(cosF + d);
+                            float16x8_t vcosF = vld1q_f16(cosF  + d);
                             float16x8_t vcosB = vld1q_f16(cosBk + d);
 
+                            // out_front = xF*cosF - xB*sinF
                             float16x8_t vOutF = vmulq_f16(vxF, vcosF);
                             vOutF = vfmsq_f16(vOutF, vxB, vsinF);
+
+                            // out_back = xB*cosB + xF*sinB
                             float16x8_t vOutB = vmulq_f16(vxB, vcosB);
                             vOutB = vfmaq_f16(vOutB, vxF, vsinB);
 
-                            vst1q_f32(
-                                outFront + d,
-                                vcvt_f32_f16(vget_low_f16(vOutF)));
-                            vst1q_f32(
-                                outFront + d + 4,
-                                vcvt_f32_f16(vget_high_f16(vOutF)));
-                            vst1q_f32(
-                                outBack + d,
-                                vcvt_f32_f16(vget_low_f16(vOutB)));
-                            vst1q_f32(
-                                outBack + d + 4,
-                                vcvt_f32_f16(vget_high_f16(vOutB)));
+                            // f16 -> f32 并存储
+                            vst1q_f32(outFront + d,     vcvt_f32_f16(vget_low_f16(vOutF)));
+                            vst1q_f32(outFront + d + 4, vcvt_f32_f16(vget_high_f16(vOutF)));
+                            vst1q_f32(outBack  + d,     vcvt_f32_f16(vget_low_f16(vOutB)));
+                            vst1q_f32(outBack  + d + 4, vcvt_f32_f16(vget_high_f16(vOutB)));
                         }
 
+                        // ---- 剩余 4 个一组: 使用 float32 NEON ----
                         for (; d + 4 <= half; d += 4) {
-                            float32x4_t vxF = vld1q_f32(xFront + d);
-                            float32x4_t vxB = vld1q_f32(xBack + d);
-                            float32x4_t vOutF =
-                                vmulq_f32(vxF, vld1q_f32(cosF32 + d));
-                            vOutF = vmlsq_f32(
-                                vOutF, vxB, vld1q_f32(sinF32 + d));
-                            vst1q_f32(outFront + d, vOutF);
+                            float32x4_t vxF32   = vld1q_f32(xFront + d);
+                            float32x4_t vxB32   = vld1q_f32(xBack  + d);
+                            float32x4_t vcosF32 = vld1q_f32(cosF_f  + d);
+                            float32x4_t vcosB32 = vld1q_f32(cosBk_f + d);
+                            float32x4_t vsinF32 = vld1q_f32(sinF_f  + d);
+                            float32x4_t vsinB32 = vld1q_f32(sinBk_f + d);
 
-                            float32x4_t vOutB =
-                                vmulq_f32(vxB, vld1q_f32(cosBk32 + d));
-                            vOutB = vmlaq_f32(
-                                vOutB, vxF, vld1q_f32(sinBk32 + d));
-                            vst1q_f32(outBack + d, vOutB);
+                            float32x4_t vOutF32 = vmulq_f32(vxF32, vcosF32);
+                            vOutF32 = vmlsq_f32(vOutF32, vxB32, vsinF32);
+                            vst1q_f32(outFront + d, vOutF32);
+
+                            float32x4_t vOutB32 = vmulq_f32(vxB32, vcosB32);
+                            vOutB32 = vmlaq_f32(vOutB32, vxF32, vsinB32);
+                            vst1q_f32(outBack + d, vOutB32);
                         }
 
+                        // ---- 最终标量尾 ----
                         for (; d < half; d++) {
-                            outFront[d] =
-                                xFront[d] * cosF32[d]
-                                - xBack[d] * sinF32[d];
-                            outBack[d] =
-                                xBack[d] * cosBk32[d]
-                                + xFront[d] * sinBk32[d];
+                            outFront[d] = xFront[d] * cosF_f[d] - xBack[d] * sinF_f[d];
+                            outBack[d]  = xBack[d]  * cosBk_f[d] + xFront[d] * sinBk_f[d];
                         }
                     }
                 }
@@ -508,478 +384,28 @@ namespace TFDLOP {
         // ====================================================================
         // 统一入口: 根据 useFp16 选择实现路径
         // ====================================================================
-        static void ropeApplyFloatPair(
-                const float *q, const float *k,
-                float *qOut, float *kOut,
+        static void ropeApplyFloat(
+                const float *x, float *out,
                 const float *sin, const float *cos,
-                int B, int qNumHeads, int kNumHeads, int N, int headDim,
+                int B, int numHeads, int N, int headDim,
                 int sinB, int sinH, int hw, bool useFp16, bool interleaved = false) {
             if (interleaved) {
-                ropeApplyScalarPair(
-                    q, k, qOut, kOut, sin, cos,
-                    B, qNumHeads, kNumHeads, N, headDim,
-                    sinB, sinH, hw, true);
+                ropeApplyScalar(x, out, sin, cos, B, numHeads, N, headDim, sinB, sinH, hw, true);
                 return;
             }
 #if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
             if (useFp16) {
-                ropeApplyFp16NeonPair(
-                    q, k, qOut, kOut, sin, cos,
-                    B, qNumHeads, kNumHeads, N, headDim,
-                    sinB, sinH, hw);
+                ropeApplyFp16Neon(x, out, sin, cos, B, numHeads, N, headDim, sinB, sinH, hw);
             } else {
-                ropeApplyNeonPair(
-                    q, k, qOut, kOut, sin, cos,
-                    B, qNumHeads, kNumHeads, N, headDim,
-                    sinB, sinH, hw);
+                ropeApplyNeon(x, out, sin, cos, B, numHeads, N, headDim, sinB, sinH, hw);
             }
 #elif defined(__aarch64__)
             (void)useFp16;
-            ropeApplyNeonPair(
-                q, k, qOut, kOut, sin, cos,
-                B, qNumHeads, kNumHeads, N, headDim,
-                sinB, sinH, hw);
+            ropeApplyNeon(x, out, sin, cos, B, numHeads, N, headDim, sinB, sinH, hw);
 #else
             (void)useFp16;
-            ropeApplyScalarPair(
-                q, k, qOut, kOut, sin, cos,
-                B, qNumHeads, kNumHeads, N, headDim,
-                sinB, sinH, hw);
+            ropeApplyScalar(x, out, sin, cos, B, numHeads, N, headDim, sinB, sinH, hw);
 #endif
-        }
-
-        struct Uint8RopeQuant {
-            int inputZeroPoint;
-            int outputZeroPoint;
-            float inputToOutputScale;
-        };
-
-        static Uint8RopeQuant makeUint8RopeQuant(
-                Quantization inputQuant, Quantization outputQuant,
-                const string &inputName, const string &outputName) {
-            if (!inputQuant.IsValid() || !outputQuant.IsValid()) {
-                throw std::runtime_error(
-                    "ApplyRope UINT8 requires valid quantization for "
-                    + inputName + " and " + outputName);
-            }
-
-            const auto &inputScales = GetQuantizationScale(inputQuant);
-            const auto &inputZeros = GetQuantizationZeroPoint(inputQuant);
-            const auto &outputScales = GetQuantizationScale(outputQuant);
-            const auto &outputZeros = GetQuantizationZeroPoint(outputQuant);
-            if (inputScales.size() != 1 || inputZeros.size() != 1
-                    || outputScales.size() != 1 || outputZeros.size() != 1) {
-                throw std::runtime_error(
-                    "ApplyRope fused UINT8 only supports per-tensor "
-                    "activation quantization: input=" + inputName
-                    + ", output=" + outputName);
-            }
-            if (!(inputScales[0] > 0.f) || !(outputScales[0] > 0.f)
-                    || !std::isfinite(inputScales[0])
-                    || !std::isfinite(outputScales[0])) {
-                throw std::runtime_error(
-                    "ApplyRope UINT8 got invalid quantization scale: input="
-                    + inputName + ", output=" + outputName);
-            }
-            if (inputZeros[0] < 0 || inputZeros[0] > 255
-                    || outputZeros[0] < 0 || outputZeros[0] > 255) {
-                throw std::runtime_error(
-                    "ApplyRope UINT8 got zero-point outside [0, 255]: input="
-                    + inputName + ", output=" + outputName);
-            }
-
-            return {
-                inputZeros[0],
-                outputZeros[0],
-                inputScales[0] / outputScales[0]
-            };
-        }
-
-        static inline uint8_t quantizeCenteredScalar(
-                float centeredValue, const Uint8RopeQuant &quant) {
-            float encoded = std::nearbyint(
-                centeredValue * quant.inputToOutputScale
-                + (float)quant.outputZeroPoint);
-            if (encoded <= 0.f) return 0;
-            if (encoded >= 255.f) return 255;
-            return (uint8_t)encoded;
-        }
-
-        static void ropeApplyUint8ScalarRange(
-                const uint8_t *x, uint8_t *out,
-                const float *sin, const float *cos,
-                int numHeads, int N, int headDim,
-                int sinB, int sinH, int hw,
-                int headRow, int nBegin, int nEnd,
-                const Uint8RopeQuant &quant, bool interleaved) {
-            int half = headDim / 2;
-            int prefix = N - hw;
-            int b = headRow / numHeads;
-            int h = headRow % numHeads;
-            int sb = (sinB == 1) ? 0 : b;
-            int sh = (sinH == 1) ? 0 : h;
-            long long headOffset = (long long)headRow * N * headDim;
-
-            for (int n = nBegin; n < nEnd; n++) {
-                const uint8_t *xPtr =
-                    x + headOffset + (long long)n * headDim;
-                uint8_t *outPtr =
-                    out + headOffset + (long long)n * headDim;
-
-                if (n < prefix) {
-                    for (int d = 0; d < headDim; d++) {
-                        float centered =
-                            (float)((int)xPtr[d] - quant.inputZeroPoint);
-                        outPtr[d] = quantizeCenteredScalar(centered, quant);
-                    }
-                    continue;
-                }
-
-                int sn = n - prefix;
-                int scOffset = ((sb * sinH + sh) * hw + sn) * headDim;
-                const float *sinPtr = sin + scOffset;
-                const float *cosPtr = cos + scOffset;
-
-                if (interleaved) {
-                    for (int d = 0; d < headDim; d += 2) {
-                        float x0 =
-                            (float)((int)xPtr[d] - quant.inputZeroPoint);
-                        float x1 =
-                            (float)((int)xPtr[d + 1] - quant.inputZeroPoint);
-                        outPtr[d] = quantizeCenteredScalar(
-                            x0 * cosPtr[d] - x1 * sinPtr[d], quant);
-                        outPtr[d + 1] = quantizeCenteredScalar(
-                            x1 * cosPtr[d + 1]
-                            + x0 * sinPtr[d + 1],
-                            quant);
-                    }
-                } else {
-                    for (int d = 0; d < half; d++) {
-                        float xFront =
-                            (float)((int)xPtr[d] - quant.inputZeroPoint);
-                        float xBack =
-                            (float)((int)xPtr[d + half]
-                                    - quant.inputZeroPoint);
-                        outPtr[d] = quantizeCenteredScalar(
-                            xFront * cosPtr[d]
-                            - xBack * sinPtr[d],
-                            quant);
-                        outPtr[d + half] = quantizeCenteredScalar(
-                            xBack * cosPtr[d + half]
-                            + xFront * sinPtr[d + half],
-                            quant);
-                    }
-                }
-            }
-        }
-
-#ifdef __aarch64__
-        static inline void loadCenteredUint8x8(
-                const uint8_t *src, int zeroPoint,
-                float32x4_t &low, float32x4_t &high) {
-            uint16x8_t wide = vmovl_u8(vld1_u8(src));
-            int16x8_t centered = vsubq_s16(
-                vreinterpretq_s16_u16(wide),
-                vdupq_n_s16((int16_t)zeroPoint));
-            low = vcvtq_f32_s32(vmovl_s16(vget_low_s16(centered)));
-            high = vcvtq_f32_s32(vmovl_s16(vget_high_s16(centered)));
-        }
-
-        static inline uint8x8_t quantizeCenteredFloat32x8(
-                float32x4_t low, float32x4_t high,
-                const Uint8RopeQuant &quant) {
-            float32x4_t outputZero =
-                vdupq_n_f32((float)quant.outputZeroPoint);
-            int32x4_t lowInt = vcvtnq_s32_f32(
-                vmlaq_n_f32(
-                    outputZero, low, quant.inputToOutputScale));
-            int32x4_t highInt = vcvtnq_s32_f32(
-                vmlaq_n_f32(
-                    outputZero, high, quant.inputToOutputScale));
-            uint16x8_t narrowed16 = vcombine_u16(
-                vqmovun_s32(lowInt), vqmovun_s32(highInt));
-            return vqmovn_u16(narrowed16);
-        }
-
-        static inline void requantizeUint8Neon(
-                const uint8_t *src, uint8_t *dst, int count,
-                const Uint8RopeQuant &quant) {
-            int d = 0;
-            for (; d + 8 <= count; d += 8) {
-                float32x4_t low;
-                float32x4_t high;
-                loadCenteredUint8x8(
-                    src + d, quant.inputZeroPoint, low, high);
-                vst1_u8(
-                    dst + d,
-                    quantizeCenteredFloat32x8(low, high, quant));
-            }
-            for (; d < count; d++) {
-                float centered =
-                    (float)((int)src[d] - quant.inputZeroPoint);
-                dst[d] = quantizeCenteredScalar(centered, quant);
-            }
-        }
-
-        static void ropeApplyUint8NeonRange(
-                const uint8_t *x, uint8_t *out,
-                const float *sin, const float *cos,
-                int numHeads, int N, int headDim,
-                int sinB, int sinH, int hw,
-                int headRow, int nBegin, int nEnd,
-                const Uint8RopeQuant &quant, bool interleaved) {
-            int half = headDim / 2;
-            int prefix = N - hw;
-            int b = headRow / numHeads;
-            int h = headRow % numHeads;
-            int sb = (sinB == 1) ? 0 : b;
-            int sh = (sinH == 1) ? 0 : h;
-            long long headOffset = (long long)headRow * N * headDim;
-
-            for (int n = nBegin; n < nEnd; n++) {
-                const uint8_t *xPtr =
-                    x + headOffset + (long long)n * headDim;
-                uint8_t *outPtr =
-                    out + headOffset + (long long)n * headDim;
-
-                if (n < prefix) {
-                    requantizeUint8Neon(
-                        xPtr, outPtr, headDim, quant);
-                    continue;
-                }
-
-                int sn = n - prefix;
-                int scOffset = ((sb * sinH + sh) * hw + sn) * headDim;
-                const float *sinPtr = sin + scOffset;
-                const float *cosPtr = cos + scOffset;
-
-                if (interleaved) {
-                    int d = 0;
-                    for (; d + 16 <= headDim; d += 16) {
-                        uint8x8x2_t inputPair = vld2_u8(xPtr + d);
-                        float32x4_t xEvenLow;
-                        float32x4_t xEvenHigh;
-                        float32x4_t xOddLow;
-                        float32x4_t xOddHigh;
-                        uint16x8_t evenWide = vmovl_u8(inputPair.val[0]);
-                        uint16x8_t oddWide = vmovl_u8(inputPair.val[1]);
-                        int16x8_t evenCentered = vsubq_s16(
-                            vreinterpretq_s16_u16(evenWide),
-                            vdupq_n_s16(
-                                (int16_t)quant.inputZeroPoint));
-                        int16x8_t oddCentered = vsubq_s16(
-                            vreinterpretq_s16_u16(oddWide),
-                            vdupq_n_s16(
-                                (int16_t)quant.inputZeroPoint));
-                        xEvenLow = vcvtq_f32_s32(
-                            vmovl_s16(vget_low_s16(evenCentered)));
-                        xEvenHigh = vcvtq_f32_s32(
-                            vmovl_s16(vget_high_s16(evenCentered)));
-                        xOddLow = vcvtq_f32_s32(
-                            vmovl_s16(vget_low_s16(oddCentered)));
-                        xOddHigh = vcvtq_f32_s32(
-                            vmovl_s16(vget_high_s16(oddCentered)));
-
-                        float32x4x2_t sinLow = vld2q_f32(sinPtr + d);
-                        float32x4x2_t sinHigh =
-                            vld2q_f32(sinPtr + d + 8);
-                        float32x4x2_t cosLow = vld2q_f32(cosPtr + d);
-                        float32x4x2_t cosHigh =
-                            vld2q_f32(cosPtr + d + 8);
-
-                        float32x4_t outEvenLow =
-                            vmulq_f32(xEvenLow, cosLow.val[0]);
-                        outEvenLow = vmlsq_f32(
-                            outEvenLow, xOddLow, sinLow.val[0]);
-                        float32x4_t outEvenHigh =
-                            vmulq_f32(xEvenHigh, cosHigh.val[0]);
-                        outEvenHigh = vmlsq_f32(
-                            outEvenHigh, xOddHigh, sinHigh.val[0]);
-
-                        float32x4_t outOddLow =
-                            vmulq_f32(xOddLow, cosLow.val[1]);
-                        outOddLow = vmlaq_f32(
-                            outOddLow, xEvenLow, sinLow.val[1]);
-                        float32x4_t outOddHigh =
-                            vmulq_f32(xOddHigh, cosHigh.val[1]);
-                        outOddHigh = vmlaq_f32(
-                            outOddHigh, xEvenHigh, sinHigh.val[1]);
-
-                        uint8x8x2_t outputPair;
-                        outputPair.val[0] =
-                            quantizeCenteredFloat32x8(
-                                outEvenLow, outEvenHigh, quant);
-                        outputPair.val[1] =
-                            quantizeCenteredFloat32x8(
-                                outOddLow, outOddHigh, quant);
-                        vst2_u8(outPtr + d, outputPair);
-                    }
-
-                    for (; d < headDim; d += 2) {
-                        float x0 =
-                            (float)((int)xPtr[d] - quant.inputZeroPoint);
-                        float x1 =
-                            (float)((int)xPtr[d + 1]
-                                    - quant.inputZeroPoint);
-                        outPtr[d] = quantizeCenteredScalar(
-                            x0 * cosPtr[d] - x1 * sinPtr[d], quant);
-                        outPtr[d + 1] = quantizeCenteredScalar(
-                            x1 * cosPtr[d + 1]
-                            + x0 * sinPtr[d + 1],
-                            quant);
-                    }
-                } else {
-                    int d = 0;
-                    for (; d + 8 <= half; d += 8) {
-                        float32x4_t xFrontLow;
-                        float32x4_t xFrontHigh;
-                        float32x4_t xBackLow;
-                        float32x4_t xBackHigh;
-                        loadCenteredUint8x8(
-                            xPtr + d,
-                            quant.inputZeroPoint,
-                            xFrontLow,
-                            xFrontHigh);
-                        loadCenteredUint8x8(
-                            xPtr + half + d,
-                            quant.inputZeroPoint,
-                            xBackLow,
-                            xBackHigh);
-
-                        float32x4_t outFrontLow =
-                            vmulq_f32(
-                                xFrontLow, vld1q_f32(cosPtr + d));
-                        outFrontLow = vmlsq_f32(
-                            outFrontLow,
-                            xBackLow,
-                            vld1q_f32(sinPtr + d));
-                        float32x4_t outFrontHigh =
-                            vmulq_f32(
-                                xFrontHigh,
-                                vld1q_f32(cosPtr + d + 4));
-                        outFrontHigh = vmlsq_f32(
-                            outFrontHigh,
-                            xBackHigh,
-                            vld1q_f32(sinPtr + d + 4));
-
-                        float32x4_t outBackLow =
-                            vmulq_f32(
-                                xBackLow,
-                                vld1q_f32(cosPtr + half + d));
-                        outBackLow = vmlaq_f32(
-                            outBackLow,
-                            xFrontLow,
-                            vld1q_f32(sinPtr + half + d));
-                        float32x4_t outBackHigh =
-                            vmulq_f32(
-                                xBackHigh,
-                                vld1q_f32(cosPtr + half + d + 4));
-                        outBackHigh = vmlaq_f32(
-                            outBackHigh,
-                            xFrontHigh,
-                            vld1q_f32(sinPtr + half + d + 4));
-
-                        vst1_u8(
-                            outPtr + d,
-                            quantizeCenteredFloat32x8(
-                                outFrontLow, outFrontHigh, quant));
-                        vst1_u8(
-                            outPtr + half + d,
-                            quantizeCenteredFloat32x8(
-                                outBackLow, outBackHigh, quant));
-                    }
-
-                    for (; d < half; d++) {
-                        float xFront =
-                            (float)((int)xPtr[d] - quant.inputZeroPoint);
-                        float xBack =
-                            (float)((int)xPtr[d + half]
-                                    - quant.inputZeroPoint);
-                        outPtr[d] = quantizeCenteredScalar(
-                            xFront * cosPtr[d]
-                            - xBack * sinPtr[d],
-                            quant);
-                        outPtr[d + half] = quantizeCenteredScalar(
-                            xBack * cosPtr[d + half]
-                            + xFront * sinPtr[d + half],
-                            quant);
-                    }
-                }
-            }
-        }
-#endif
-
-        static void ropeApplyUint8Pair(
-                const uint8_t *q, const uint8_t *k,
-                uint8_t *qOut, uint8_t *kOut,
-                const float *sin, const float *cos,
-                int B, int qNumHeads, int kNumHeads, int N, int headDim,
-                int sinB, int sinH, int hw,
-                const Uint8RopeQuant &qQuant,
-                const Uint8RopeQuant &kQuant,
-                bool interleaved) {
-            const int tokensPerWork = 16;
-            int tokenChunks = (N + tokensPerWork - 1) / tokensPerWork;
-            int qItems = B * qNumHeads * tokenChunks;
-            int kItems = B * kNumHeads * tokenChunks;
-            int totalItems = qItems + kItems;
-            long long totalElements =
-                (long long)B * (qNumHeads + kNumHeads) * N * headDim;
-            bool shouldParallel = false;
-#ifdef _OPENMP
-            shouldParallel =
-                totalElements >= kMinParallelElements
-                && omp_get_max_threads() > 1;
-#endif
-
-            auto applyRange = [=](
-                    const uint8_t *x, uint8_t *out, int numHeads,
-                    int headRow, int nBegin, int nEnd,
-                    const Uint8RopeQuant &quant) {
-#ifdef __aarch64__
-                ropeApplyUint8NeonRange(
-                    x, out, sin, cos,
-                    numHeads, N, headDim, sinB, sinH, hw,
-                    headRow, nBegin, nEnd, quant, interleaved);
-#else
-                ropeApplyUint8ScalarRange(
-                    x, out, sin, cos,
-                    numHeads, N, headDim, sinB, sinH, hw,
-                    headRow, nBegin, nEnd, quant, interleaved);
-#endif
-            };
-
-            if (!shouldParallel) {
-                for (int headRow = 0; headRow < B * qNumHeads; headRow++) {
-                    applyRange(
-                        q, qOut, qNumHeads, headRow, 0, N, qQuant);
-                }
-                for (int headRow = 0; headRow < B * kNumHeads; headRow++) {
-                    applyRange(
-                        k, kOut, kNumHeads, headRow, 0, N, kQuant);
-                }
-                return;
-            }
-
-            #pragma omp parallel for schedule(static)
-            for (int item = 0; item < totalItems; item++) {
-                bool isQ = item < qItems;
-                int localItem = isQ ? item : item - qItems;
-                int numHeads = isQ ? qNumHeads : kNumHeads;
-                int tokenChunk = localItem % tokenChunks;
-                int headRow = localItem / tokenChunks;
-                int nBegin = tokenChunk * tokensPerWork;
-                int nEnd = nBegin + tokensPerWork;
-                if (nEnd > N) nEnd = N;
-                applyRange(
-                    isQ ? q : k,
-                    isQ ? qOut : kOut,
-                    numHeads,
-                    headRow,
-                    nBegin,
-                    nEnd,
-                    isQ ? qQuant : kQuant);
-            }
         }
 
         void Eval(TFContext tfContext, TFNode node) {
@@ -1022,36 +448,38 @@ namespace TFDLOP {
                 float *qOutPtr = (float *) GetTensordata(qOutData);
                 float *kOutPtr = (float *) GetTensordata(kOutData);
 
-                ropeApplyFloatPair(
-                    qPtr, kPtr, qOutPtr, kOutPtr, sinPtr, cosPtr,
-                    B, qNumHeads, kNumHeads, N, headDim,
-                    sinB, sinH, hw, param->useFp16, param->interleaved);
+                ropeApplyFloat(qPtr, qOutPtr, sinPtr, cosPtr, B, qNumHeads, N, headDim, sinB, sinH, hw, param->useFp16, param->interleaved);
+                ropeApplyFloat(kPtr, kOutPtr, sinPtr, cosPtr, B, kNumHeads, N, headDim, sinB, sinH, hw, param->useFp16, param->interleaved);
 
             } else if (GetTensorType(qData) == TFCAPI_UINT8 && GetTensorType(kData) == TFCAPI_UINT8) {
+                // Uint8 path: dequantize -> float RoPE -> requantize
+                int qTotalElements = B * qNumHeads * N * headDim;
+                int kTotalElements = B * kNumHeads * N * headDim;
                 auto qQuant = GetTensorQuantizeInfo(tfContext, info.InputNames[0]);
                 auto kQuant = GetTensorQuantizeInfo(tfContext, info.InputNames[1]);
-                auto qOutQuant =
-                    GetTensorQuantizeInfo(tfContext, info.OutputNames[0]);
-                auto kOutQuant =
-                    GetTensorQuantizeInfo(tfContext, info.OutputNames[1]);
-                auto qRopeQuant = makeUint8RopeQuant(
-                    qQuant, qOutQuant,
-                    info.InputNames[0], info.OutputNames[0]);
-                auto kRopeQuant = makeUint8RopeQuant(
-                    kQuant, kOutQuant,
-                    info.InputNames[1], info.OutputNames[1]);
 
-                auto qUint8 = (uint8_t *)GetTensordata(qData);
-                auto kUint8 = (uint8_t *)GetTensordata(kData);
-                auto qOutUint8 = (uint8_t *)GetTensordata(qOutData);
-                auto kOutUint8 = (uint8_t *)GetTensordata(kOutData);
+                // Dequantize q and k to float
+                float *qFloat = new float[qTotalElements];
+                float *kFloat = new float[kTotalElements];
+                DeQuantizeTensorData(qFloat, (uint8_t *) GetTensordata(qData), qTotalElements, qQuant);
+                DeQuantizeTensorData(kFloat, (uint8_t *) GetTensordata(kData), kTotalElements, kQuant);
 
-                ropeApplyUint8Pair(
-                    qUint8, kUint8, qOutUint8, kOutUint8,
-                    sinPtr, cosPtr,
-                    B, qNumHeads, kNumHeads, N, headDim,
-                    sinB, sinH, hw,
-                    qRopeQuant, kRopeQuant, param->interleaved);
+                // Apply RoPE in float
+                float *qOutFloat = new float[qTotalElements];
+                float *kOutFloat = new float[kTotalElements];
+                ropeApplyFloat(qFloat, qOutFloat, sinPtr, cosPtr, B, qNumHeads, N, headDim, sinB, sinH, hw, param->useFp16, param->interleaved);
+                ropeApplyFloat(kFloat, kOutFloat, sinPtr, cosPtr, B, kNumHeads, N, headDim, sinB, sinH, hw, param->useFp16, param->interleaved);
+
+                // Requantize back to uint8
+                auto qOutQuant = GetTensorQuantizeInfo(tfContext, info.OutputNames[0]);
+                auto kOutQuant = GetTensorQuantizeInfo(tfContext, info.OutputNames[1]);
+                QuantizeTensorData((uint8_t *) GetTensordata(qOutData), qOutFloat, qTotalElements, qOutQuant);
+                QuantizeTensorData((uint8_t *) GetTensordata(kOutData), kOutFloat, kTotalElements, kOutQuant);
+
+                delete[] qFloat;
+                delete[] kFloat;
+                delete[] qOutFloat;
+                delete[] kOutFloat;
             }
         }
 

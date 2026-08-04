@@ -837,6 +837,10 @@ class MathOpParser(OnnxParser):
             # integer division is truncating for these non-negative values.
             assert len(args) == 2
             return args[0] - (args[0] / args[1]) * args[1]
+        elif node.op == "Cos":
+            return MathOp(args[0],MathOpType.MathCos)
+        elif node.op == "Sin":
+            return MathOp(args[0],MathOpType.MathSin)
         else:
             raise NotImplementedError("{} not implemented".format(node.op))
 
@@ -953,6 +957,8 @@ def _get_convert_map(opset):
         "Floor":MathOpParser.get_converter(opset),
         "Equal":MathOpParser.get_converter(opset),
         "Mod":MathOpParser.get_converter(opset),
+        "Cos":MathOpParser.get_converter(opset),
+        "Sin":MathOpParser.get_converter(opset),
         "Split":SplitParser.get_converter(opset),
         "InstanceNormalization":LayerNormalParser.get_converter(opset),
         "LayerNorm":LayerNormalParser.get_converter(opset),

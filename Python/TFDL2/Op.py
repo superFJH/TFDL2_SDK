@@ -2,6 +2,23 @@ from . import TFDL2
 from .TFDL2 import TFSymbol
 from .Common import TFDataType,DECODER_FLAGS
 import numpy as np 
+from enum import IntEnum
+
+class MathOpType(IntEnum):
+    MathCeil = 0,
+    MathFloor = 1,
+    MathSqrt = 2,
+    MathLog2 = 3,
+    MathPow = 4,
+    MathSoftplus = 5,
+    MathAbs = 6,
+    MathCos = 7,
+    MathSin = 8,
+    MathNeg = 9,
+    MathErf = 10,
+    MathSinh = 11,
+    MathCosh = 12,
+    MathLog = 13
 
 def Add(InputA ,InputB ,dtype=TFDataType.TFDL_FLOAT.value)->TFSymbol:
     if type(InputA) == tuple:
@@ -1079,6 +1096,9 @@ def Floor(Input:TFSymbol)->TFSymbol:
 
 def Pow(Input:TFSymbol,power:int)->TFSymbol:
     return TFDL2.Pow(Input,power)
+
+def MathOp(Input:TFSymbol,type:MathOpType)->TFSymbol:
+    return TFDL2.MathOp(Input,type.value)
 
 def Sqrt(Input:TFSymbol)->TFSymbol:
     return TFDL2.Sqrt(Input)
