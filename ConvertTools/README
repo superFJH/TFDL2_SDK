@@ -1,4 +1,401 @@
- ## 本文件夹主要负责模型的转换任务
+# ConvertTools 模型转换工具
 
-> 项目中一共两个文件夹，exe和python，其中exe文件夹中是准备好的已经编译完成的二进制程序，能快速实现对于一些简单模型的模型转化与量化任务。而python文件夹是使用onnx与onnxruntime与本SDK包python库的TFDL2，一起实现的基于python的模型转化与量化工具链。
+本目录负责将 ONNX 等模型转换为 TFDL2 模型，并支持浮点、FP16 和量化模型导出。
 
+- `exe/`：已经编译好的二进制转换程序，适合快速转换结构较简单的模型。
+- `python/`：基于 ONNX、onnxruntime 和 SDK Python 包 `TFDL2` 的模型转换与量化工具链。对于 YOLO、Transformer、timm 等需要图优化的模型，建议优先使用 Python 工具链。
+
+以下命令默认在 `TFDL2_SDK` 根目录执行。请先在用户自己的 Python 环境中正确安装或配置 TFDL2 SDK Python 包，以及 ONNX、PyTorch、timm、onnxslim 等对应工具所需的依赖。
+
+## 已实现的模型转换入口
+
+| 模型或模型族 | 来源/参考框架 | 输入模型或权重格式 | 推荐转换入口 | 当前输出与说明 |
+| --- | --- | --- | --- | --- |
+| 通用 ONNX | PyTorch、TensorFlow、Paddle 等能够导出 ONNX 的框架 | `.onnx` | `ConvertTools/python/onnx2tfdl.py` | `.fb`、FP16、`.quant.fb`；算子支持情况以实际 ONNX 图为准 |
+| YOLOv5、YOLOv8、YOLO11、YOLO26 | Ultralytics/PyTorch YOLO 系列 | 导出的 ONNX | `ConvertTools/python/example/yolov*_tfdl.py` | `.fb`、`.quant.fb`；包含各版本检测头和量化 stop/avoid tensor 处理 |
+| ViT、DeiT、Swin、PiT、CaiT、LeViT、MobileViT | timm / PyTorch | timm 模型名、timm 随机或预训练权重 | `ConvertTools/python/example/timm2tfdl.py` | 自动导出 ONNX、执行 onnxslim、生成 `.fb`/`.quant.fb`，并默认执行逐级数值验证 |
+| 通用 ViT | Hugging Face Transformers 风格实现 | 本地 `config.json`、`safetensors` | `ConvertTools/python/example/Vit.py` | 直接构建 TFDL Op 图；带权重 Linear 使用 1x1 Conv；支持浮点和基于 range JSON 的量化 |
+| DINOv2 | Hugging Face Transformers / Meta DINOv2 权重结构 | 本地 `config.json`、`safetensors` | `ConvertTools/python/example/Dinov2.py` | 直接构图；支持绝对位置编码插值、`.fb` 和 `.quant.fb` |
+| DINOv3 | Hugging Face Transformers / Meta DINOv3 权重结构 | 本地 `config.json`、`safetensors` | `ConvertTools/python/example/Dinov3.py` | 直接构图；使用 2D RoPE 和 `ApplyRope` 自定义算子；支持 `.fb` 和 `.quant.fb` |
+
+表中的“已实现”表示仓库中已经提供了对应转换入口或直接构图实现，不代表任意版本、任意输入尺寸和任意导出图都无需适配。模型版本升级后，应重新执行数值验证和性能检查。
+
+## 1. 转换用户自己的 ONNX 模型
+
+### 1.1 建议先简化 ONNX
+
+建议先使用 onnxslim 处理原始模型。onnxslim 会执行常量折叠、删除冗余节点，并可能融合 Conv/BatchNormalization 或将 MatMul + Add 改写为 Gemm。
+
+```bash
+onnxslim model.onnx model.slim.onnx
+```
+
+转换前建议确认：
+
+- 模型已经切换到推理模式，训练用 Dropout 等节点已经移除。
+- 尽量使用固定输入尺寸；动态 shape 会降低图优化器识别成功率。
+- 推荐使用 ONNX opset 17。
+- 使用 Netron 或 ONNX 工具确认真实输入 tensor 名称，例如 `input`、`images`。
+
+### 1.2 导出浮点 `.fb`
+
+```bash
+python ConvertTools/python/onnx2tfdl.py \
+  --onnxpath model.slim.onnx \
+  --output_name model
+```
+
+成功后生成：
+
+```text
+model.fb
+```
+
+对于动态输入模型，可以手动指定每个 ONNX 输入的固定形状：
+
+```bash
+python ConvertTools/python/onnx2tfdl.py \
+  --onnxpath model.slim.onnx \
+  --output_name model \
+  --input_shapes input:1,3,224,224
+```
+
+多输入模型可继续追加：
+
+```text
+--input_shapes image:1,3,224,224 mask:1,1,224,224
+```
+
+其他常用参数：
+
+- `--fp16`：将模型转换为 FP16。
+- `--mean`、`--std`：在 TFDL 输入节点中加入预处理参数。
+- `--stoptensor tensor_name`：转换到指定 ONNX tensor 后停止，适合去掉不适合上 NPU 的后处理图。
+- `--check`：使用 onnxruntime 与 TFDL 软件执行结果进行比较。
+- `--testonnxpath`：转换图经过修改、无法直接作为对拍模型时，指定原始 ONNX。
+
+### 1.3 导出量化 `.quant.fb`
+
+当前通用 `onnx2tfdl.py` 在 `--check` 成功后执行量化。使用图片校准集的示例：
+
+```bash
+python ConvertTools/python/onnx2tfdl.py \
+  --onnxpath model.slim.onnx \
+  --output_name model \
+  --check \
+  --quantimgDir ./calibration_images \
+  --cvtype 1
+```
+
+输出为：
+
+```text
+model.fb
+model.quant.fb
+```
+
+其中 `--cvtype` 的含义为：
+
+- `0`：BGR
+- `1`：RGB
+- `2`：灰度图
+
+未提供 `--quantimgDir` 时，工具会使用随机输入完成量化流程。正式部署模型建议使用与真实业务分布一致的代表性图片进行校准。
+
+`--check` 依赖可正常工作的 onnxruntime。如果 onnxruntime 与 NumPy ABI 不兼容，应先修复 Python 环境；不能把 import 崩溃或退出码 139 当作模型转换问题。
+
+## 2. YOLO 模型转换
+
+YOLO 的检测头、DFL 和 NMS 后处理具有版本差异。建议使用对应的专用脚本，而不是直接调用通用转换器：
+
+```text
+ConvertTools/python/example/yolov5_tfdl.py
+ConvertTools/python/example/yolov8_tfdl.py
+ConvertTools/python/example/yolo11_tfdl.py
+ConvertTools/python/example/yolo26_tfdl.py
+```
+
+以 YOLOv8 为例，导出浮点模型：
+
+```bash
+python ConvertTools/python/example/yolov8_tfdl.py \
+  --onnxpath yolov8n.slim.onnx \
+  --output_name yolov8n \
+  --input_shapes images:1,3,640,640 \
+  --detectOnly
+```
+
+导出量化模型：
+
+```bash
+python ConvertTools/python/example/yolov8_tfdl.py \
+  --onnxpath yolov8n.slim.onnx \
+  --output_name yolov8n \
+  --input_shapes images:1,3,640,640 \
+  --detectOnly \
+  --check \
+  --quantimgDir ./calibration_images \
+  --cvtype 1
+```
+
+注意：
+
+- `--detectOnly` 用于普通检测模型；pose、segment 等多输出模型不要照搬检测模型的 stop/avoid tensor 配置。
+- 专用脚本中已经根据不同 YOLO 版本配置了 `stoptensor`、`avoidtensors` 或 `stopquanttensors`。这些 tensor 名称依赖具体导出图，模型版本变化后需要重新核对。
+- 一些 NMS、解码或 DFL 后处理在 ONNX 中较慢，也不适合放到 NPU。可以只转换主干和检测头，在 C++ 侧完成后处理。
+- 如果 ONNX 节点名称与脚本内预设名称不同，应先通过 Netron 查看输出节点，再调整对应 YOLO 脚本。
+
+## 3. Transformer 和 timm 预训练模型转换
+
+### 3.1 timm 一键转换
+
+`timm2tfdl.py` 会自动完成以下流程：
+
+```text
+timm 建模/加载权重 → ONNX → onnxslim → Transformer 图优化 → .fb/.quant.fb → 输出数值验证
+```
+
+查看已经回归过的模型：
+
+```bash
+python ConvertTools/python/example/timm2tfdl.py --list-models
+```
+
+使用 timm 随机初始化权重，并同时生成浮点和量化模型：
+
+```bash
+python ConvertTools/python/example/timm2tfdl.py \
+  --model vit_tiny_patch16_224 \
+  --pretrain=false \
+  --input-shape 1,3,224,224 \
+  --format both \
+  --output-dir /tmp/vit_tfdl
+```
+
+使用 timm 预训练权重：
+
+```bash
+python ConvertTools/python/example/timm2tfdl.py \
+  --model swin_tiny_patch4_window7_224 \
+  --pretrain \
+  --input-shape 1 3 224 224 \
+  --format both \
+  --calib-dir ./calibration_images \
+  --output-dir /tmp/swin_tfdl
+```
+
+`--pretrain` 会通过 timm 下载预训练权重；离线环境应提前准备对应缓存，或者使用 `--pretrain=false`。
+
+`--format` 支持：
+
+- `fb`：只生成浮点 `.fb`。
+- `quant`：只生成 `.quant.fb`。
+- `both`：同时生成两种模型，默认值。
+
+脚本默认把 timm 的 mean/std 预处理嵌入 TFDL 输入节点，使模型接收 `[0,255]` 范围的原始图像输入。使用 `--no-embed-preprocess` 可以关闭该行为。
+
+数值验证默认开启，并使用固定 seed 的两组输入依次比较：
+
+```text
+timm ↔ raw ONNX ↔ slim ONNX ↔ FP32 TFDL
+                              ↘ INT8 TFDL
+```
+
+FP32 默认要求余弦相似度不低于 `0.9999`，并同时检查 shape、NaN/Inf 和绝对/相对误差；INT8 默认要求余弦相似度不低于 `0.9`。随机权重且没有 `--calib-dir` 时，脚本使用 8 组独立确定性输入校准，并自动尝试经过验证的量化配置。真实模型应通过 `--calib-dir` 提供有代表性的图片，随机校准结果不能代替业务数据集精度评估。
+
+可使用 `--verify-samples`、`--min-cosine` 和 `--min-quant-cosine` 调整验证配置；只有调试时才建议使用 `--no-verify`。任何阶段未达到门槛时，脚本返回非零状态，并在 report 中保留失败指标。
+
+每次转换会保留：
+
+```text
+*.raw.onnx
+*.slim.onnx
+*.fb
+*.quant.fb
+*.verification.npz
+*.verification.json
+onnx2tfdl.*.log
+*.report.json
+```
+
+`*.report.json` 包含每个阶段的余弦相似度、余弦距离、最大/平均绝对误差、RMSE、实际选中的量化校准模式以及所有自动回退尝试。最终验证会重新加载已经 dump 的 `.fb` 文件，因此同时覆盖建图、序列化、反序列化和软件执行，不是只比较转换过程中的内存图。
+
+### 3.2 用户自己的 Transformer ONNX
+
+非 timm Transformer 可以使用第 1 节的通用 ONNX 流程，但必须检查 Transformer 优化是否成功命中。转换日志中正常情况下会出现类似输出：
+
+```text
+[TransformerNPUOptimize] fuse 24 packed QKV and 0 QKV groups, 12 attention output projections, 12 MLP chains, convert 15 standalone MatMul/Gemm linear ops to 1x1 Conv
+```
+
+日志中的含义：
+
+- `packed QKV` / `QKV groups`：Q、K、V 权重投影被转换为三路 1x1 Conv。
+- `attention output projections`：Attention 输出投影被转换为 1x1 Conv。
+- `MLP chains`：fc1、激活、fc2 被合并为两层 1x1 Conv 链。
+- `standalone MatMul/Gemm`：其他带权重的线性层被转换为 1x1 Conv。
+
+Attention 中的 Q×K 和 AttentionWeight×V 是 activation×activation MatMul，必须保留为 MatMul。优化目标不是删除模型中的全部 MatMul，而是将权重为 initializer 的 Linear/MatMul/Gemm 投影转换为 1x1 Conv。
+
+### 3.3 DINOv2 和 DINOv3 直接转换
+
+DINOv2/DINOv3 使用专用的 TFDL Op 直接构图流程，不需要先导出 ONNX。两个入口共用 `Vit.py` 的权重映射、1x1 Conv Transformer、校准范围收集和量化实现：
+
+实现原理和扩展类似 Transformer 的步骤见 [`Doc/ViT_TFDL_Dual_Graph_Quantization.md`](../Doc/ViT_TFDL_Dual_Graph_Quantization.md)。
+
+```text
+ConvertTools/python/example/Dinov2.py
+ConvertTools/python/example/Dinov3.py
+```
+
+`--model-path` 指向本地 Hugging Face 风格模型目录。目录至少需要包含：
+
+```text
+config.json
+model.safetensors
+```
+
+分片模型也可以使用：
+
+```text
+model.safetensors.index.json
+model-00001-of-000xx.safetensors
+...
+```
+
+如果目录中存在 `preprocessor_config.json`，工具会读取其中的 image mean、std 和 rescale 配置。
+
+#### DINOv2 浮点模型
+
+```bash
+python ConvertTools/python/example/Dinov2.py \
+  --model-path /path/to/dinov2-model \
+  --image-size 518 \
+  --dump-fb /tmp/dinov2.fb \
+  --dump-symbol-map /tmp/dinov2_symbol_map.json
+```
+
+DINOv2 的绝对位置编码会根据 `--image-size` 在 Python 侧执行 bicubic 插值。输入高度和宽度必须能够被模型 patch size 整除。
+
+#### DINOv3 浮点模型
+
+```bash
+python ConvertTools/python/example/Dinov3.py \
+  --model-path /path/to/dinov3-model \
+  --image-size 224 \
+  --addon-path AddonOps/build/libTFDLAddOn.so \
+  --dump-fb /tmp/dinov3.fb \
+  --dump-symbol-map /tmp/dinov3_symbol_map.json
+```
+
+DINOv3 使用 2D RoPE，不使用 DINOv2 风格的绝对位置编码。构图、dump 和运行前必须保证 `--addon-path` 指向包含 `ApplyRope` 实现的有效 TFDL AddOn 动态库。
+
+#### DINOv2/DINOv3 量化模型
+
+量化前需要先通过等价 PyTorch 图收集中间 tensor 的 min/max，并把 range 映射到 TFDL symbol。下面以 DINOv2 为例，一次生成浮点和量化产物：
+
+```bash
+python ConvertTools/python/example/Dinov2.py \
+  --model-path /path/to/dinov2-model \
+  --image-size 518 \
+  --calib-dir ./calibration_images \
+  --num-calib 32 \
+  --device cuda \
+  --dump-minmax-json /tmp/dinov2_ranges.json \
+  --dump-symbol-map /tmp/dinov2_symbol_map.json \
+  --dump-fb /tmp/dinov2.fb \
+  --dump-quant-fb /tmp/dinov2.quant.fb
+```
+
+DINOv3 使用相同参数，并额外指定 AddOn：
+
+```bash
+python ConvertTools/python/example/Dinov3.py \
+  --model-path /path/to/dinov3-model \
+  --image-size 224 \
+  --calib-dir ./calibration_images \
+  --num-calib 32 \
+  --device cuda \
+  --addon-path AddonOps/build/libTFDLAddOn.so \
+  --dump-minmax-json /tmp/dinov3_ranges.json \
+  --dump-fb /tmp/dinov3.fb \
+  --dump-quant-fb /tmp/dinov3.quant.fb
+```
+
+如果已经生成 range JSON，可以跳过范围收集并直接使用：
+
+```text
+--range-json /tmp/dinov2_ranges.json --dump-quant-fb /tmp/dinov2.quant.fb
+```
+
+单独使用 `--dump-quant-fb` 但没有提供 `--range-json` 或 `--dump-minmax-json` 会直接报错，避免用无效范围生成量化模型。
+
+#### DINO 数值验证
+
+可以在 dump 前比较参考 PyTorch 模型、等价 PyTorch Op 图和 TFDL 浮点执行结果：
+
+```bash
+python ConvertTools/python/example/Dinov2.py \
+  --model-path /path/to/dinov2-model \
+  --image-size 518 \
+  --calib-dir ./calibration_images \
+  --num-calib 4 \
+  --compare-reference \
+  --compare-tfdl-fp \
+  --compare-json /tmp/dinov2_compare.json
+```
+
+DINO 转换默认输出 CLS token 和完整 hidden token 序列。部署侧应根据实际下游任务选择需要消费的输出。
+
+## 4. Transformer 转换错误或性能不佳的排查
+
+Transformer 模型虽然能够生成 `.fb`，仍可能因为优化器没有识别出结构而性能较差。常见表现包括：
+
+- 日志中完全没有 `[TransformerNPUOptimize]`。
+- 模型明显包含多层 Transformer，但所有融合和转换统计均为 0 或远小于层数。
+- 带权重的 MatMul/Gemm 仍被转换为大量 `InnerProduct`，没有出现 `LinearConv`、`QKVLinearConv`、`MLPLinearConv` 或 `AttentionOutLinearConv`。
+- 每个 Linear 周围重复出现多组 `Reshape → Transpose → Reshape`，token layout 与 NCHW layout 被频繁来回转换。
+- QKV、Attention 输出和 MLP 没有形成融合链，导致额外内存搬运和中间 tensor。
+
+可以先保存完整日志：
+
+```bash
+python ConvertTools/python/onnx2tfdl.py \
+  --onnxpath transformer.slim.onnx \
+  --output_name transformer 2>&1 | tee transformer_convert.log
+```
+
+再检查关键节点：
+
+```bash
+rg "TransformerNPUOptimize|QKVLinearConv|AttentionOutLinearConv|MLPLinearConv|LinearConv|InnerProduct|Reshape|Transpose|<Fatal>" transformer_convert.log
+```
+
+优化器未命中的常见原因：
+
+1. ONNX 使用动态 batch、动态序列长度或动态图像尺寸，shape inference 无法恢复确定的 token/channel 维度。
+2. 导出器改变了 Attention 拓扑，例如在 QKV 之间插入额外 Cast、Gather、Identity、Slice 或自定义算子。
+3. onnxslim 将 MatMul + Add 改写为 rank-2 Gemm，或者共享了多个内容相同的 zero bias、LayerNorm/BatchNorm 参数；工具版本过旧时可能无法识别。
+4. Linear 权重不是 initializer，而是由运行时节点计算得到，优化器无法证明它是固定权重。
+5. QKV 是特殊的 packed、cross-attention、GQA/MQA 或 class-attention 结构，与现有拓扑 matcher 不一致。
+6. 模型在进入 Transformer 优化器前被错误的通用融合 pass 改写，导致原始结构断开。
+
+建议按以下顺序处理：
+
+1. 固定输入 shape，使用 `model.eval()`，重新以 opset 17 导出 ONNX。
+2. 对 ONNX 执行 onnxslim，然后重新转换。
+3. 确认日志中带权重投影的转换数量与模型层数基本匹配。
+4. 使用 Netron 检查第一个未转换的 QKV、proj 或 MLP 节点，确认权重输入是否为 initializer。
+5. 对照 `ConvertTools/python/example/Vit.py` 中的 1x1 Conv 结构，以及 `ConvertTools/python/TFConvertor/Optimize/TransformerNPU.py` 中的拓扑识别逻辑补充 matcher 和 shape 传播。
+6. 不要把 activation×activation MatMul 错误替换成 Conv；修改优化器后应重新进行 ONNX/TFDL 数值对拍。
+
+如果模型转换日志出现 `<Fatal>`，即使进程退出码为 0、目录中也留下了 `.fb`，仍应视为转换失败；该文件可能是不完整产物。
+
+## 5. 转换结果验证建议
+
+- `.fb` 成功落盘只代表完成建图和序列化，不代表数值正确。
+- `timm2tfdl.py` 默认自动比较 timm、raw ONNX、slim ONNX、FP32 TFDL 和 INT8 TFDL；应以 `*.report.json` 中所有阶段的 `passed` 为准。
+- 环境允许时使用 `--check` 对比 ONNX 与 TFDL 软件执行结果。
+- 对 Transformer 应同时检查最终输出、Attention 前后和 MLP 前后的关键 tensor。
+- 对量化模型应使用代表性校准数据，并单独评估精度下降。
+- 性能测试前先确认 Transformer 优化统计符合预期，再分析算子耗时和内存搬运。

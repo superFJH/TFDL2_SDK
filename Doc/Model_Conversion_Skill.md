@@ -2,6 +2,8 @@
 
 基于 DINOv3 ViT 模型转化实践总结的完整工作流与注意事项，适用于 ViT / LLM / 多模态等 Transformer 架构模型的 NPU 部署。
 
+> 当前 `Vit.py` 使用“TFDL 直接构图 + PyTorch 等效图收集 range JSON + SDK Quantize”的快速量化方案。完整实现和扩展方法见 [`ViT_TFDL_Dual_Graph_Quantization.md`](ViT_TFDL_Dual_Graph_Quantization.md)；本文保留通用直接构图、自定义算子和基础 Calibration API 说明。
+
 ---
 
 ## 目录
