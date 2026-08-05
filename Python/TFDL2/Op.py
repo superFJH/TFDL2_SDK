@@ -1126,14 +1126,14 @@ def ExpandDims(Input:TFSymbol,dims:tuple)->TFSymbol:
 def GreedyCTC(Input:TFSymbol)->TFSymbol:
     return TFDL2.GreedyCTC(Input)
 
-def LayerNorm(Input:TFSymbol,axis:int=-1)->TFSymbol:
-    return TFDL2.LayerNorm(Input,axis)
+def LayerNorm(Input:TFSymbol,axis:int=-1,eps:float=1e-5)->TFSymbol:
+    return TFDL2.LayerNorm(Input,axis,eps)
 
-def LayerNorm2(Input:TFSymbol,scale:TFSymbol,bias:TFSymbol,axis:int=-1)->TFSymbol:
+def LayerNorm2(Input:TFSymbol,scale:TFSymbol,bias:TFSymbol,axis:int=-1,eps:float=1e-5)->TFSymbol:
     assert scale is not None
     assert bias is not None
 
-    return TFDL2.LayerNorm2(Input,axis,scale,bias)
+    return TFDL2.LayerNorm2(Input,axis,eps,scale,bias)
 
 def ConstantOfShape(Input:TFSymbol,dtype:TFDataType,value:np.ndarray)->TFSymbol:
     assert value.size == 1

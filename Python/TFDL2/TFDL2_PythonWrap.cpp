@@ -1528,13 +1528,13 @@ namespace PythonInter {
         TFContext tfContext = input.GetContext();
         return TFSymbol(tfContext,TFFunc::Scale(tfContext,input.getName(),weight.getName(),bias.getName()));
     }
-    TFSymbol LayerNorm(TFSymbol input,int axis){
+    TFSymbol LayerNorm(TFSymbol input,int axis,float eps){
         TFContext tfContext = input.GetContext();
-        return TFSymbol(tfContext,TFFunc::LayerNorm(tfContext,input.getName(),axis));
+        return TFSymbol(tfContext,TFFunc::LayerNorm(tfContext,input.getName(),axis,eps));
     }
-    TFSymbol LayerNorm2(TFSymbol input,int axis,TFSymbol scale,TFSymbol bias){
+    TFSymbol LayerNorm2(TFSymbol input,int axis,float eps,TFSymbol scale,TFSymbol bias){
         TFContext tfContext = input.GetContext();
-        return TFSymbol(tfContext,TFFunc::LayerNorm(tfContext,input.getName(),axis,scale.getName(),bias.getName()));
+        return TFSymbol(tfContext,TFFunc::LayerNorm(tfContext,input.getName(),axis,eps,scale.getName(),bias.getName()));
     }
     TFSymbol ConstantOfShape(TFSymbol input,TFCAPI_DATATYPE dtype,py::array value){
         TFContext tfContext = input.GetContext();

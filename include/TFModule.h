@@ -171,9 +171,9 @@ namespace TFDL_CAPI {
 
         TFDL2_CAPI_EXPORT  string ELU(TFContext &, string input, float alpha);
 
-        TFDL2_CAPI_EXPORT  string LayerNorm(TFContext &, string input,int axis);
+        TFDL2_CAPI_EXPORT  string LayerNorm(TFContext &, string input,int axis,float eps);
 
-        TFDL2_CAPI_EXPORT  string LayerNorm(TFContext &, string input,int axis,string scale,string bias);
+        TFDL2_CAPI_EXPORT  string LayerNorm(TFContext &, string input,int axis,float eps,string scale,string bias);
 
         // shape change op
         TFDL2_CAPI_EXPORT  string Reshape(TFContext &, string input, vector<int> shape);
