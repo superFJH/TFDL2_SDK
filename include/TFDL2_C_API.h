@@ -156,6 +156,11 @@ namespace TFDL_CAPI {
  */
     TFDL2_CAPI_EXPORT extern TFTensor GetParam(TFContext, string paramname);
 /*!
+ *  @brief: Get All Nodes out Tensor names from Context,
+ *  @param: target context
+ */
+    TFDL2_CAPI_EXPORT extern std::set<std::string> GetAllTensorNames(TFContext);
+/*!
  *  @brief: Register a Tensor's Quantization, the tensor only support 1 q-info
  *          if fail, return false
  *  @param: target context

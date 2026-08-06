@@ -671,6 +671,10 @@ namespace PythonInter {
         string cparamName = string(paramName);
         return GetNodeAttrJsonByName(self.self, cparamName);
     }
+    vector<string> pyGetAllTensorNames(pyTFContext& self){
+        auto names = GetAllTensorNames(self.self);
+        return vector<string>(names.begin(), names.end());
+    }
     TFSymbol GetParamSymbol(pyTFContext& self,py::str paramName){
         string cparamName = string(paramName);
         auto param = GetParam(self.self,cparamName);
@@ -2686,6 +2690,7 @@ PYBIND11_MODULE(TFDL2,m) {
             .def("_GetParam", PythonInter::GetParam)
             .def("_RegistorInt8config", PythonInter::RegistorInt8config)
             .def("_GetAttr", PythonInter::GetAttr)
+            .def("_GetAllTensorNames", PythonInter::pyGetAllTensorNames)
             .def("_DumpToFile", PythonInter::DumpContext)
             .def("_Close", PythonInter::pycloseContext)
             .def("_ReplaceOp", PythonInter::ReplaceOp)

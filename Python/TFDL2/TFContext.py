@@ -43,6 +43,9 @@ class TFContext(_TFContext):
 
     def GetOutSymbols(self)->list:
         return super(TFContext,self)._GetOutSymbols()
+
+    def GetAllTensorNames(self)->list:
+        return super(TFContext,self)._GetAllTensorNames()
     
     def GetInputSymbols(self)->list:
         return super(TFContext,self)._GetInputSymbols()
