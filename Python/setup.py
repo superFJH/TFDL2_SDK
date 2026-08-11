@@ -100,7 +100,10 @@ class CustomInstall(_install):
             os.remove(stale)
         copied = []
         for name in RUNTIME_LIBS:
-            src = os.path.join(LIB, name)
+            if CHIP == "NPU10T":
+                src = os.path.join(LIB, CHIP, name)
+            else:
+                src = os.path.join(LIB, name)
             if os.path.isfile(src):
                 shutil.copy2(src, dest)
                 copied.append(name)
