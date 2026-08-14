@@ -657,6 +657,33 @@ namespace PythonInter {
 
     }
 
+    bool RegisterQuantizedParamToContext(pyTFContext &self,py::str paramName,py::array inputData,py::list max,py::list min) {
+        if(!inputData.dtype().equal(py::dtype::of<uint8_t>())){
+            throw py::type_error("quantized parameter data must be uint8");
+        }
+        vector<float> max_ = py::cast<vector<float>>(max);
+        vector<float> min_ = py::cast<vector<float>>(min);
+        if(max_.size() != min_.size() || max_.empty()){
+            throw py::value_error("quantized parameter max/min must have the same non-zero length");
+        }
+        vector<int> shape;
+        size_t len = inputData.dtype().itemsize();
+        for(int index = 0; index < inputData.ndim(); ++index){
+            shape.push_back((int)inputData.shape(index));
+            len *= (size_t)inputData.shape(index);
+        }
+        if(max_.size() != 1 && (shape.empty() || max_.size() != (size_t)shape[0])){
+            throw py::value_error("quantized parameter range count must be 1 or shape[0]");
+        }
+        vector<pair<float,float>> min_max;
+        min_max.reserve(max_.size());
+        for(size_t index = 0; index < max_.size(); ++index){
+            min_max.emplace_back(min_[index],max_[index]);
+        }
+        return RegisterParamTensor(
+            self.self,string(paramName),shape,TFCAPI_UINT8,inputData.data(),len,min_max);
+    }
+
     pyTFTensor GetParam(pyTFContext& self,py::str paramName){
         string cparamName = string(paramName);
         auto param = GetParam(self.self,cparamName);
@@ -665,6 +692,15 @@ namespace PythonInter {
 
     bool RegistorInt8config(pyTFContext& self,py::str paramName,float max, float min){
         return RegisterQuantInfo(self.self,paramName,max,min);
+    }
+
+    bool RegistorInt8configPerChannel(pyTFContext& self,py::str paramName,py::list max,py::list min){
+        vector<float> max_ = py::cast<vector<float>>(max);
+        vector<float> min_ = py::cast<vector<float>>(min);
+        if(max_.size() != min_.size() || max_.empty()){
+            throw py::value_error("per-channel max/min must have the same non-zero length");
+        }
+        return RegisterQuantInfo(self.self,paramName,max_,min_);
     }
 
     string GetAttr(pyTFContext& self,py::str paramName) {
@@ -1901,9 +1937,9 @@ namespace PythonInter {
         TFContext tfContext = input.GetContext();
         return TFSymbol(tfContext,TFFunc::Quantize(tfContext,input.getName()));
     }
-    TFSymbol DeQuantize(TFSymbol input){
+    TFSymbol DeQuantize(TFSymbol input,TFCAPI_DATATYPE dst_dtype){
         TFContext tfContext = input.GetContext();
-        return TFSymbol(tfContext,TFFunc::DeQuantize(tfContext,input.getName()));
+        return TFSymbol(tfContext,TFFunc::DeQuantize(tfContext,input.getName(),dst_dtype));
     }
     TFSymbol GreedyCTC(TFSymbol input){
         TFContext tfContext = input.GetContext();
@@ -2216,6 +2252,25 @@ namespace PythonInter {
             stopquantnodes_.insert(py::cast<string>(stopquantnodes[i]));
         }
         Quantize(self.self,inputtype_,avoidnodes_,stopquantnodes_,mergeeltwise,mergeconcat,perchannel);
+    }
+
+    void QuantizeLiteCalibration(pyTFCalibration& self,py::dict inputtype,py::tuple avoidnodes,py::tuple stopquantnodes,bool mergeeltwise,bool mergeconcat,bool perchannel){
+
+        map<string,TFCAPI_DATATYPE> inputtype_;
+        std::set<string> avoidnodes_;
+        std::set<string> stopquantnodes_;
+        for(auto ob: inputtype){
+            string key = py::cast<string>(ob.first);
+            TFCAPI_DATATYPE dtype = py::cast<TFCAPI_DATATYPE>(ob.second);
+            inputtype_[key] = dtype;
+        }
+        for(int i=0;i<py::len(avoidnodes);i++){
+            avoidnodes_.insert(py::cast<string>(avoidnodes[i]));
+        }
+        for(int i=0;i<py::len(stopquantnodes);i++){
+            stopquantnodes_.insert(py::cast<string>(stopquantnodes[i]));
+        }
+        QuantizeLite(self.self,inputtype_,avoidnodes_,stopquantnodes_,mergeeltwise,mergeconcat,perchannel);
     }
 
     void LoadCustomOp(py::str path){
@@ -2686,9 +2741,11 @@ PYBIND11_MODULE(TFDL2,m) {
             .def(py::init<py::tuple>())
             .def(py::init<py::str>())
             .def("_RegisterParamToContext", PythonInter::RegisterParamToContext)
+            .def("_RegisterQuantizedParamToContext", PythonInter::RegisterQuantizedParamToContext)
             .def("_GetParamSymbol", PythonInter::GetParamSymbol)
             .def("_GetParam", PythonInter::GetParam)
             .def("_RegistorInt8config", PythonInter::RegistorInt8config)
+            .def("_RegistorInt8configPerChannel", PythonInter::RegistorInt8configPerChannel)
             .def("_GetAttr", PythonInter::GetAttr)
             .def("_GetAllTensorNames", PythonInter::pyGetAllTensorNames)
             .def("_DumpToFile", PythonInter::DumpContext)
@@ -2716,6 +2773,7 @@ PYBIND11_MODULE(TFDL2,m) {
             .def("_Calibration", PythonInter::pyCalibration)
             .def("_Getinputs", PythonInter::GetInputTensorCalibration)
             .def("_Fp32ToFp16", PythonInter::pyConvertCalibrationFp32ToFp16)
+            .def("_QuantizeLite", PythonInter::QuantizeLiteCalibration)
             .def("_Quantize", PythonInter::QuantizeCalibration);
 /*
     py::class_<PythonInter::pyImgReader>(m, "_TFImgReader",

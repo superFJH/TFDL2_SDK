@@ -225,7 +225,7 @@ namespace TFDL_CAPI {
 
         TFDL2_CAPI_EXPORT  string Quantize(TFContext &, string input);
 
-        TFDL2_CAPI_EXPORT  string DeQuantize(TFContext &, string input);
+        TFDL2_CAPI_EXPORT  string DeQuantize(TFContext &, string input, TFCAPI_DATATYPE dst_dtype);
 
         /*!
         type:MathCeil = 0,

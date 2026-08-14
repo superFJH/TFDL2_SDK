@@ -28,6 +28,12 @@ class TFContext(_TFContext):
     def RegisterParamToContext(self,**kwargs):
         super(TFContext,self)._RegisterParamToContext(kwargs)
 
+    def RegisterQuantizedParamToContext(self,name,data,max,min):
+        """Atomically register UINT8 parameter data and per-channel ranges."""
+        return super(TFContext,self)._RegisterQuantizedParamToContext(
+            name,data,list(max),list(min)
+        )
+
     def GetParam(self,paramName:str):
         return TFTensor(super(TFContext,self)._GetParam(paramName))
 
@@ -66,3 +72,7 @@ class TFContext(_TFContext):
 
     def AddInt8Config(self,name:str,max:float,min:float)->bool:
         return super(TFContext,self)._RegistorInt8config(name,max,min)
+
+    def AddInt8ConfigPerChannel(self,name:str,max:list,min:list)->bool:
+        """Register per-channel UINT8 ranges in consumer channel order."""
+        return super(TFContext,self)._RegistorInt8configPerChannel(name,max,min)

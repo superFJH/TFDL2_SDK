@@ -596,6 +596,10 @@ namespace TFDL_CAPI {
 
     TFDL2_CAPI_EXPORT extern void Calibration(TFCalibration tfCalibration);
 
+    TFDL2_CAPI_EXPORT extern void QuantizeLite(TFCalibration tfCalibration, map<string, TFCAPI_DATATYPE> input_type,
+                                           const std::set<string> &avoidnodes = {},const std::set<string> &stopnodes = {}, bool mergeeltwise = false,
+                                           bool mergeconcat = true,bool perchannel=true,bool ignore_activation_finetune = false);
+
     TFDL2_CAPI_EXPORT extern void Quantize(TFCalibration tfCalibration, map<string, TFCAPI_DATATYPE> input_type,
                                            const std::set<string> &avoidnodes = {},const std::set<string> &stopnodes = {}, bool mergeeltwise = false,
                                            bool mergeconcat = true,bool perchannel=true,bool ignore_activation_finetune = false);

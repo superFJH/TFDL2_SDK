@@ -23,6 +23,14 @@ class TFCalibration(_TFCalibration):
                 inputtype[k] = inputtype[k].value
         self._Quantize(inputtype,avoidtensors,stopquanttensors,MergeEltwise,MergeConcate,Perchannel)
 
+    def QuantizeLite(self,inputtype:dict,avoidtensors:tuple=(),stopquanttensors:tuple=(),MergeEltwise:bool=False,MergeConcate:bool=True,Perchannel:bool=True):
+        """Quantize weights/ranges without running graph optimization."""
+        normalized = {
+            name: dtype.value if isinstance(dtype, TFDataType) else dtype
+            for name, dtype in inputtype.items()
+        }
+        self._QuantizeLite(normalized,avoidtensors,stopquanttensors,MergeEltwise,MergeConcate,Perchannel)
+
     def GetInputs(self):
         inputs =  self._Getinputs()
         newinputs = []

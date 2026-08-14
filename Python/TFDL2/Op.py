@@ -880,11 +880,13 @@ def Quantize(Input:TFSymbol)->TFSymbol:
         Input = Input[0]
     return TFDL2.Quantize(Input)
 
-def DeQuantize(Input:TFSymbol)->TFSymbol:
+def DeQuantize(Input:TFSymbol,dstType:TFDataType=TFDataType.TFDL_FLOAT)->TFSymbol:
     if type(Input) == tuple:
         assert(len(Input)==1)
         Input = Input[0]
-    return TFDL2.DeQuantize(Input)
+    if not isinstance(dstType, TFDataType):
+        raise TypeError("dstType must be a TFDataType")
+    return TFDL2.DeQuantize(Input,dstType.value)
 
 def ReadImg(Context,imgLen:int,scale:tuple, mean:tuple,shape:tuple,outDatatype:TFDataType,decoderFlags:DECODER_FLAGS)->TFSymbol:
     return TFDL2.ReadImg(Context,imgLen,scale,mean,shape,outDatatype.value,decoderFlags)
@@ -1224,4 +1226,3 @@ def LSTM2(x:TFSymbol,w:TFSymbol,r:TFSymbol,b:TFSymbol,hidden_size:int,direction:
     :return:
     '''
     return TFDL2.LSTM2(x,w,r,b,hidden_size,direction)
-
