@@ -307,22 +307,54 @@ python ConvertTools/python/example/Dinov2.py \
   --dump-quant-fb /tmp/dinov2.quant.fb
 ```
 
-DINOv3 使用相同参数，并额外指定 AddOn：
+DINOv3 推荐使用已经在 NPU 上验证的 Conv-native 高精度默认配置。下面的
+命令会在一次运行中完成 512×512、8 张图片校准和量化模型导出：
 
 ```bash
 python ConvertTools/python/example/Dinov3.py \
   --model-path /path/to/dinov3-model \
-  --image-size 224 \
+  --image-size 512 \
   --calib-dir ./calibration_images \
-  --num-calib 32 \
+  --num-calib 8 \
   --device cuda \
   --addon-path AddonOps/build/libTFDLAddOn.so \
-  --dump-minmax-json /tmp/dinov3_ranges.json \
-  --dump-fb /tmp/dinov3.fb \
-  --dump-quant-fb /tmp/dinov3.quant.fb
+  --dump-minmax-json /tmp/dinov3L_512.minmax.json \
+  --dump-symbol-map /tmp/dinov3L_512.symbols.json \
+  --dump-bypass-report-json /tmp/dinov3L_512.report.json \
+  --dump-quant-fb /tmp/dinov3L_512.quant.fb
 ```
 
-如果已经生成 range JSON，可以跳过范围收集并直接使用：
+指定 `--dump-quant-fb` 后，DINOv3 当前默认采用以下已验证配置，因此上面的
+命令不需要重复写出对应开关：
+
+- Transformer 残差流保持 `[B,C,N]`，使用 `LayerNorm2(axis=1)`。
+- Q/K/V 保持 Conv-native 布局；`ApplyRope` 接收 `[B,H,D,N]`，输出
+  `Q=[B,H,N,D]`、`K=[B,H,D,N]`。
+- QK 和 AV MatMul 均不使用 MatMul 的 trans 参数；AV 保持 `prob @ V`。
+- 使用 `QuantizeLite`、FP16 residual/DeQuant 和 Top-1 浮点旁路；带 register
+  token 的 DINOv3 默认 `fp16_residual_scale=0.25`。
+- QK 输出按 `N×H` 个 Softmax row 做行多通道量化，并把
+  `Q_scale*K_scale/QK_row_scale` 的最大值限制为 `0.99`。
+
+如果已经生成匹配相同模型和输入尺寸的 range JSON，可以跳过范围收集并直接
+导出。当前默认配置下的命令为：
+
+```bash
+python ConvertTools/python/example/Dinov3.py \
+  --model-path /path/to/dinov3-model \
+  --image-size 512 \
+  --range-json /tmp/dinov3L_512.minmax.json \
+  --addon-path AddonOps/build/libTFDLAddOn.so \
+  --dump-symbol-map /tmp/dinov3L_512.symbols.json \
+  --dump-bypass-report-json /tmp/dinov3L_512.report.json \
+  --dump-quant-fb /tmp/dinov3L_512.quant.fb
+```
+
+如果需要把校准和导出拆成两个进程，校准命令必须显式加入
+`--fp16-residual-scale 0.25`，保证收集 range 时的残差重参数化与默认量化模型
+一致。输入尺寸、模型权重或残差 scale 改变后必须重新生成 range JSON。
+
+DINOv2 已经生成 range JSON 时，也可以跳过范围收集并直接使用：
 
 ```text
 --range-json /tmp/dinov2_ranges.json --dump-quant-fb /tmp/dinov2.quant.fb

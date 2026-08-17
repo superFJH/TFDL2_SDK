@@ -6,6 +6,19 @@ aux_source_directory(./ addon)
 add_library(TFDLAddOn SHARED ${addon} json11.cpp)
 target_include_directories(TFDLAddOn PRIVATE ${CMAKE_SOURCE_DIR}/../include)
 
+# These CPU fallback kernels are latency-critical. Keep
+# their release optimization independent of the caller's global CMake build
+# type; the SDK's historical addon build directory is often configured with
+# an empty CMAKE_BUILD_TYPE.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    set_source_files_properties(
+        "${CMAKE_CURRENT_SOURCE_DIR}/ArmCausalMaskSoftmax.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/ApplyRope.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/RMSNorm.cpp"
+        PROPERTIES COMPILE_OPTIONS "-O3;-fno-math-errno"
+    )
+endif()
+
 if(APPLE)
     # Developer-only build on macOS. The SDK ships Linux .so files, so do not
     # try to link them here; leave TFDL2 symbols to be resolved by the loader.

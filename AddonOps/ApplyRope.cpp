@@ -17,6 +17,7 @@
 #include "CustomCommon.h"
 #include "json11.hpp"
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <cassert>
 #include <stdexcept>
@@ -32,24 +33,53 @@
 using namespace TFDL_CAPI;
 namespace TFDLOP {
     namespace ApplyRope {
+        enum class RopeLayout {
+            BHND,
+            BHDN,
+        };
+
         struct ApplyRopeParam {
             bool useFp16 = false;  // 使用 FP16 NEON 加速 (精度略降, 速度更快)
             bool interleaved = false;  // Adjacent complex pairs, used by MoonViT.
+            RopeLayout inputLayout = RopeLayout::BHND;
+            RopeLayout qOutputLayout = RopeLayout::BHND;
+            RopeLayout kOutputLayout = RopeLayout::BHND;
         };
+
+        static RopeLayout parseLayout(
+                const string &layout, RopeLayout fallback) {
+            if (layout.empty()) return fallback;
+            if (layout == "BHND") return RopeLayout::BHND;
+            if (layout == "BHDN") return RopeLayout::BHDN;
+            throw std::runtime_error(
+                "ApplyRope layout must be BHND or BHDN, got " + layout);
+        }
+
+        static void parseParamJson(
+                const string &jsonText, ApplyRopeParam *paramOut) {
+            string err;
+            const json11::Json param = json11::Json::parse(jsonText, err);
+            if (!err.empty()) return;
+            paramOut->useFp16 = param["useFp16"].bool_value();
+            paramOut->interleaved = param["interleaved"].bool_value();
+            const RopeLayout common = parseLayout(
+                param["layout"].string_value(), RopeLayout::BHND);
+            paramOut->inputLayout = parseLayout(
+                param["inputLayout"].string_value(), common);
+            paramOut->qOutputLayout = parseLayout(
+                param["qOutputLayout"].string_value(),
+                paramOut->inputLayout);
+            paramOut->kOutputLayout = parseLayout(
+                param["kOutputLayout"].string_value(),
+                paramOut->inputLayout);
+        }
 
         // 小工作量直接串行执行，避免 OpenMP 线程唤醒成本高于计算本身。
         static constexpr long long kMinParallelElements = 16 * 1024;
 
         void Prepare(TFContext tfContext, TFNode node) {
-            json11::Json param;
-            string err;
-            param = json11::Json::parse(GetNodeCustomJsonStr(node), err);
-
             ApplyRopeParam *p = new ApplyRopeParam();
-            if (err.empty()) {
-                p->useFp16 = param["useFp16"].bool_value();
-                p->interleaved = param["interleaved"].bool_value();
-            }
+            parseParamJson(GetNodeCustomJsonStr(node), p);
 
             FreeNodeCustomParam(node, [](void *customparam) {
                 delete (ApplyRopeParam *) customparam;
@@ -81,36 +111,64 @@ namespace TFDLOP {
             auto kShape = GetTensorShape(kData);
             auto sinShape = GetTensorShape(sinData);
             auto cosShape = GetTensorShape(cosData);
+            ApplyRopeParam reshapeParam;
+            parseParamJson(GetNodeCustomJsonStr(node), &reshapeParam);
+            auto param = &reshapeParam;
+            const bool inputSequenceLast =
+                param->inputLayout == RopeLayout::BHDN;
+            const int tokenAxis = inputSequenceLast ? 3 : 2;
+            const int dimAxis = inputSequenceLast ? 2 : 3;
 
-            // q/k are [B, heads, N, head_dim].  ViT uses equal head counts,
-            // while Qwen-style GQA uses more query heads than KV heads.
+            // q/k are [B,H,N,D] by default or [B,H,D,N] in Conv-native mode.
+            // ViT uses equal head counts, while Qwen-style GQA uses more
+            // query heads than KV heads.
             TFCHECK_EQ(qShape.size(), 4);
             TFCHECK_EQ(kShape.size(), 4);
             TFCHECK_EQ(qShape[0], kShape[0]);
-            TFCHECK_EQ(qShape[2], kShape[2]);
-            TFCHECK_EQ(qShape[3], kShape[3]);
+            TFCHECK_EQ(qShape[tokenAxis], kShape[tokenAxis]);
+            TFCHECK_EQ(qShape[dimAxis], kShape[dimAxis]);
 
-            // sin and cos must have same shape: [broadcast..., hw, head_dim]
+            // Tables follow the selected layout as well: [...,hw,D] for
+            // BHND and [...,D,hw] for BHDN.
             TFCHECK_EQ(sinShape.size(), cosShape.size());
             for (size_t i = 0; i < sinShape.size(); i++) {
                 TFCHECK_EQ(sinShape[i], cosShape[i]);
             }
 
             // head_dim must match
-            int headDim = qShape[3];
+            int headDim = qShape[dimAxis];
             TFCHECK_EQ(headDim % 2, 0);
-            TFCHECK_EQ(sinShape[sinShape.size() - 1], headDim);
-            TFCHECK_EQ(cosShape[cosShape.size() - 1], headDim);
+            const int tableDimAxis = inputSequenceLast
+                ? (int)sinShape.size() - 2
+                : (int)sinShape.size() - 1;
+            const int tableTokenAxis = inputSequenceLast
+                ? (int)sinShape.size() - 1
+                : (int)sinShape.size() - 2;
+            TFCHECK_EQ(sinShape[tableDimAxis], headDim);
+            TFCHECK_EQ(cosShape[tableDimAxis], headDim);
 
             // hw (sin's seq dimension) must be <= N (q's seq dimension)
-            int N = qShape[2];
-            int hw = sinShape[sinShape.size() - 2];
+            int N = qShape[tokenAxis];
+            int hw = sinShape[tableTokenAxis];
             TFCHECK_GE(N, hw);
 
-            // Output shapes follow each input independently.
-            ReSizeTensor(qOutData, qShape);
+            auto outputShape = [](int batch, int heads, int tokens, int dim,
+                                  RopeLayout layout) {
+                return layout == RopeLayout::BHND
+                    ? vector<int>{batch, heads, tokens, dim}
+                    : vector<int>{batch, heads, dim, tokens};
+            };
+            ReSizeTensor(
+                qOutData,
+                outputShape(
+                    qShape[0], qShape[1], N, headDim,
+                    param->qOutputLayout));
             SetTensorType(qOutData, GetTensorType(qData));
-            ReSizeTensor(kOutData, kShape);
+            ReSizeTensor(
+                kOutData,
+                outputShape(
+                    kShape[0], kShape[1], N, headDim,
+                    param->kOutputLayout));
             SetTensorType(kOutData, GetTensorType(kData));
         }
 
@@ -503,6 +561,137 @@ namespace TFDLOP {
             delete[] cosFp16;
         }
 #endif // __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+
+        // Native FP16 tensor path.  The older useFp16 implementation above
+        // deliberately keeps FP32 input/output and only performs its inner
+        // arithmetic in FP16.  Qwen-prefill has real FLOAT16 tensors, so it
+        // needs a separate dispatcher and must never reinterpret their
+        // storage as float pointers.
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+        static void ropeApplyNativeFp16Pair(
+                const uint16_t *qStorage, const uint16_t *kStorage,
+                uint16_t *qOutStorage, uint16_t *kOutStorage,
+                const float *sin, const float *cos,
+                int B, int qNumHeads, int kNumHeads, int N, int headDim,
+                int sinB, int sinH, int hw, bool interleaved) {
+            const __fp16 *q = reinterpret_cast<const __fp16 *>(qStorage);
+            const __fp16 *k = reinterpret_cast<const __fp16 *>(kStorage);
+            __fp16 *qOut = reinterpret_cast<__fp16 *>(qOutStorage);
+            __fp16 *kOut = reinterpret_cast<__fp16 *>(kOutStorage);
+            const int half = headDim / 2;
+            const int prefix = N - hw;
+            const int tokensPerWork = 16;
+            const int tokenChunks = (N + tokensPerWork - 1) / tokensPerWork;
+            const int qItems = B * qNumHeads * tokenChunks;
+            const int kItems = B * kNumHeads * tokenChunks;
+            const int totalItems = qItems + kItems;
+            const long long totalElements =
+                (long long)B * (qNumHeads + kNumHeads) * N * headDim;
+
+            // Q and K share the same RoPE tables.  Convert the tables once
+            // instead of paying FP32->FP16 conversion in every head.
+            const int tableElements = sinB * sinH * hw * headDim;
+            __fp16 *sinFp16 = new __fp16[tableElements];
+            __fp16 *cosFp16 = new __fp16[tableElements];
+            const int vectorized = (tableElements / 8) * 8;
+            for (int index = vectorized; index < tableElements; ++index) {
+                sinFp16[index] = (__fp16)sin[index];
+                cosFp16[index] = (__fp16)cos[index];
+            }
+
+            #pragma omp parallel if(totalElements >= kMinParallelElements)
+            {
+                #pragma omp for schedule(static)
+                for (int index = 0; index < vectorized; index += 8) {
+                    vst1q_f16(
+                        sinFp16 + index,
+                        vcombine_f16(
+                            vcvt_f16_f32(vld1q_f32(sin + index)),
+                            vcvt_f16_f32(vld1q_f32(sin + index + 4))));
+                    vst1q_f16(
+                        cosFp16 + index,
+                        vcombine_f16(
+                            vcvt_f16_f32(vld1q_f32(cos + index)),
+                            vcvt_f16_f32(vld1q_f32(cos + index + 4))));
+                }
+
+                #pragma omp for schedule(static)
+                for (int item = 0; item < totalItems; ++item) {
+                    const bool isQ = item < qItems;
+                    const int localItem = isQ ? item : item - qItems;
+                    const int numHeads = isQ ? qNumHeads : kNumHeads;
+                    const __fp16 *input = isQ ? q : k;
+                    __fp16 *output = isQ ? qOut : kOut;
+                    const int tokenChunk = localItem % tokenChunks;
+                    const int headRow = localItem / tokenChunks;
+                    const int batch = headRow / numHeads;
+                    const int head = headRow % numHeads;
+                    const int sinBatch = sinB == 1 ? 0 : batch;
+                    const int sinHead = sinH == 1 ? 0 : head;
+                    const int begin = tokenChunk * tokensPerWork;
+                    const int end = std::min(N, begin + tokensPerWork);
+                    const long long headOffset =
+                        (long long)headRow * N * headDim;
+
+                    for (int token = begin; token < end; ++token) {
+                        const __fp16 *x = input + headOffset
+                            + (long long)token * headDim;
+                        __fp16 *y = output + headOffset
+                            + (long long)token * headDim;
+                        if (token < prefix) {
+                            memcpy(y, x, headDim * sizeof(__fp16));
+                            continue;
+                        }
+                        const int ropeToken = token - prefix;
+                        const int tableOffset =
+                            ((sinBatch * sinH + sinHead) * hw + ropeToken)
+                            * headDim;
+                        const __fp16 *sinRow = sinFp16 + tableOffset;
+                        const __fp16 *cosRow = cosFp16 + tableOffset;
+
+                        if (interleaved) {
+                            for (int dim = 0; dim < headDim; dim += 2) {
+                                const __fp16 x0 = x[dim];
+                                const __fp16 x1 = x[dim + 1];
+                                y[dim] = x0 * cosRow[dim]
+                                    - x1 * sinRow[dim];
+                                y[dim + 1] = x1 * cosRow[dim + 1]
+                                    + x0 * sinRow[dim + 1];
+                            }
+                            continue;
+                        }
+
+                        int dim = 0;
+                        for (; dim + 8 <= half; dim += 8) {
+                            const float16x8_t front = vld1q_f16(x + dim);
+                            const float16x8_t back = vld1q_f16(x + half + dim);
+                            float16x8_t outFront = vmulq_f16(
+                                front, vld1q_f16(cosRow + dim));
+                            outFront = vfmsq_f16(
+                                outFront, back, vld1q_f16(sinRow + dim));
+                            float16x8_t outBack = vmulq_f16(
+                                back, vld1q_f16(cosRow + half + dim));
+                            outBack = vfmaq_f16(
+                                outBack, front,
+                                vld1q_f16(sinRow + half + dim));
+                            vst1q_f16(y + dim, outFront);
+                            vst1q_f16(y + half + dim, outBack);
+                        }
+                        for (; dim < half; ++dim) {
+                            const __fp16 front = x[dim];
+                            const __fp16 back = x[half + dim];
+                            y[dim] = front * cosRow[dim]
+                                - back * sinRow[dim];
+                            y[half + dim] = back * cosRow[half + dim]
+                                + front * sinRow[half + dim];
+                        }
+                    }
+                }
+            }
+            delete[] sinFp16;
+            delete[] cosFp16;
+        }
+#endif
 #endif // __aarch64__
 
         // ====================================================================
@@ -547,6 +736,210 @@ namespace TFDLOP {
                 sinB, sinH, hw);
 #endif
         }
+
+        static inline long long ropeTensorOffset(
+                RopeLayout layout, int headRow, int token, int dim,
+                int N, int headDim) {
+            if (layout == RopeLayout::BHND) {
+                return ((long long)headRow * N + token) * headDim + dim;
+            }
+            return ((long long)headRow * headDim + dim) * N + token;
+        }
+
+        static inline long long ropeTableOffset(
+                RopeLayout layout, int tableHead, int token, int dim,
+                int hw, int headDim) {
+            if (layout == RopeLayout::BHND) {
+                return ((long long)tableHead * hw + token) * headDim + dim;
+            }
+            return ((long long)tableHead * headDim + dim) * hw + token;
+        }
+
+        // General layout path.  The established BHND->BHND fast kernels above
+        // remain unchanged.  This path is used by Conv-native ViT, where the
+        // input/table are BHDN and Q/K intentionally have different output
+        // layouts so the following MatMuls need no trans flags.
+        static void ropeApplyFloatPairLayouts(
+                const float *q, const float *k,
+                float *qOut, float *kOut,
+                const float *sin, const float *cos,
+                int B, int qNumHeads, int kNumHeads, int N, int headDim,
+                int sinB, int sinH, int hw, bool interleaved,
+                RopeLayout inputLayout,
+                RopeLayout qOutputLayout,
+                RopeLayout kOutputLayout) {
+            const int half = headDim / 2;
+            const int prefix = N - hw;
+            const int qRows = B * qNumHeads;
+            const int kRows = B * kNumHeads;
+            const int totalRows = qRows + kRows;
+            const long long totalElements =
+                (long long)totalRows * N * headDim;
+            bool shouldParallel = false;
+#ifdef _OPENMP
+            shouldParallel = totalElements >= kMinParallelElements
+                && omp_get_max_threads() > 1;
+#endif
+
+            auto applyHead = [=](
+                    const float *input, float *output, int numHeads,
+                    int headRow, RopeLayout outputLayout) {
+                const int batch = headRow / numHeads;
+                const int head = headRow % numHeads;
+                const int sinBatch = sinB == 1 ? 0 : batch;
+                const int sinHead = sinH == 1 ? 0 : head;
+                const int tableHead = sinBatch * sinH + sinHead;
+                for (int token = 0; token < N; ++token) {
+                    if (token < prefix) {
+                        for (int dim = 0; dim < headDim; ++dim) {
+                            output[ropeTensorOffset(
+                                outputLayout, headRow, token, dim,
+                                N, headDim)] = input[ropeTensorOffset(
+                                inputLayout, headRow, token, dim,
+                                N, headDim)];
+                        }
+                        continue;
+                    }
+                    const int ropeToken = token - prefix;
+                    if (interleaved) {
+                        for (int dim = 0; dim < headDim; dim += 2) {
+                            const float x0 = input[ropeTensorOffset(
+                                inputLayout, headRow, token, dim,
+                                N, headDim)];
+                            const float x1 = input[ropeTensorOffset(
+                                inputLayout, headRow, token, dim + 1,
+                                N, headDim)];
+                            const long long table0 = ropeTableOffset(
+                                inputLayout, tableHead, ropeToken, dim,
+                                hw, headDim);
+                            const long long table1 = ropeTableOffset(
+                                inputLayout, tableHead, ropeToken, dim + 1,
+                                hw, headDim);
+                            output[ropeTensorOffset(
+                                outputLayout, headRow, token, dim,
+                                N, headDim)] =
+                                x0 * cos[table0] - x1 * sin[table0];
+                            output[ropeTensorOffset(
+                                outputLayout, headRow, token, dim + 1,
+                                N, headDim)] =
+                                x1 * cos[table1] + x0 * sin[table1];
+                        }
+                    } else {
+                        for (int dim = 0; dim < half; ++dim) {
+                            const float front = input[ropeTensorOffset(
+                                inputLayout, headRow, token, dim,
+                                N, headDim)];
+                            const float back = input[ropeTensorOffset(
+                                inputLayout, headRow, token, dim + half,
+                                N, headDim)];
+                            const long long tableFront = ropeTableOffset(
+                                inputLayout, tableHead, ropeToken, dim,
+                                hw, headDim);
+                            const long long tableBack = ropeTableOffset(
+                                inputLayout, tableHead, ropeToken, dim + half,
+                                hw, headDim);
+                            output[ropeTensorOffset(
+                                outputLayout, headRow, token, dim,
+                                N, headDim)] = front * cos[tableFront]
+                                - back * sin[tableFront];
+                            output[ropeTensorOffset(
+                                outputLayout, headRow, token, dim + half,
+                                N, headDim)] = back * cos[tableBack]
+                                + front * sin[tableBack];
+                        }
+                    }
+                }
+            };
+
+            #pragma omp parallel for if(shouldParallel) schedule(static)
+            for (int row = 0; row < totalRows; ++row) {
+                const bool isQ = row < qRows;
+                const int localRow = isQ ? row : row - qRows;
+                applyHead(
+                    isQ ? q : k,
+                    isQ ? qOut : kOut,
+                    isQ ? qNumHeads : kNumHeads,
+                    localRow,
+                    isQ ? qOutputLayout : kOutputLayout);
+            }
+        }
+
+#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+        static void ropeApplyNativeFp16PairLayouts(
+                const uint16_t *qStorage, const uint16_t *kStorage,
+                uint16_t *qOutStorage, uint16_t *kOutStorage,
+                const float *sin, const float *cos,
+                int B, int qNumHeads, int kNumHeads, int N, int headDim,
+                int sinB, int sinH, int hw, bool interleaved,
+                RopeLayout inputLayout,
+                RopeLayout qOutputLayout,
+                RopeLayout kOutputLayout) {
+            const __fp16 *q = reinterpret_cast<const __fp16 *>(qStorage);
+            const __fp16 *k = reinterpret_cast<const __fp16 *>(kStorage);
+            __fp16 *qOut = reinterpret_cast<__fp16 *>(qOutStorage);
+            __fp16 *kOut = reinterpret_cast<__fp16 *>(kOutStorage);
+            const int half = headDim / 2;
+            const int prefix = N - hw;
+            const int qRows = B * qNumHeads;
+            const int totalRows = qRows + B * kNumHeads;
+            const long long totalElements =
+                (long long)totalRows * N * headDim;
+
+            #pragma omp parallel for if(totalElements >= kMinParallelElements) schedule(static)
+            for (int row = 0; row < totalRows; ++row) {
+                const bool isQ = row < qRows;
+                const int headRow = isQ ? row : row - qRows;
+                const int numHeads = isQ ? qNumHeads : kNumHeads;
+                const __fp16 *input = isQ ? q : k;
+                __fp16 *output = isQ ? qOut : kOut;
+                const RopeLayout outputLayout =
+                    isQ ? qOutputLayout : kOutputLayout;
+                const int batch = headRow / numHeads;
+                const int head = headRow % numHeads;
+                const int tableHead =
+                    (sinB == 1 ? 0 : batch) * sinH
+                    + (sinH == 1 ? 0 : head);
+                for (int token = 0; token < N; ++token) {
+                    if (token < prefix) {
+                        for (int dim = 0; dim < headDim; ++dim) {
+                            output[ropeTensorOffset(
+                                outputLayout, headRow, token, dim,
+                                N, headDim)] = input[ropeTensorOffset(
+                                inputLayout, headRow, token, dim,
+                                N, headDim)];
+                        }
+                        continue;
+                    }
+                    const int ropeToken = token - prefix;
+                    const int pairCount = interleaved ? headDim / 2 : half;
+                    for (int pair = 0; pair < pairCount; ++pair) {
+                        const int dim0 = interleaved ? pair * 2 : pair;
+                        const int dim1 = interleaved ? dim0 + 1 : pair + half;
+                        const __fp16 x0 = input[ropeTensorOffset(
+                            inputLayout, headRow, token, dim0,
+                            N, headDim)];
+                        const __fp16 x1 = input[ropeTensorOffset(
+                            inputLayout, headRow, token, dim1,
+                            N, headDim)];
+                        const long long table0 = ropeTableOffset(
+                            inputLayout, tableHead, ropeToken, dim0,
+                            hw, headDim);
+                        const long long table1 = ropeTableOffset(
+                            inputLayout, tableHead, ropeToken, dim1,
+                            hw, headDim);
+                        output[ropeTensorOffset(
+                            outputLayout, headRow, token, dim0,
+                            N, headDim)] = x0 * (__fp16)cos[table0]
+                            - x1 * (__fp16)sin[table0];
+                        output[ropeTensorOffset(
+                            outputLayout, headRow, token, dim1,
+                            N, headDim)] = x1 * (__fp16)cos[table1]
+                            + x0 * (__fp16)sin[table1];
+                    }
+                }
+            }
+        }
+#endif
 
         struct Uint8RopeQuant {
             int inputZeroPoint;
@@ -603,6 +996,87 @@ namespace TFDLOP {
             if (encoded <= 0.f) return 0;
             if (encoded >= 255.f) return 255;
             return (uint8_t)encoded;
+        }
+
+        static void ropeApplyUint8PairLayouts(
+                const uint8_t *q, const uint8_t *k,
+                uint8_t *qOut, uint8_t *kOut,
+                const float *sin, const float *cos,
+                int B, int qNumHeads, int kNumHeads, int N, int headDim,
+                int sinB, int sinH, int hw,
+                const Uint8RopeQuant &qQuant,
+                const Uint8RopeQuant &kQuant,
+                bool interleaved,
+                RopeLayout inputLayout,
+                RopeLayout qOutputLayout,
+                RopeLayout kOutputLayout) {
+            const int half = headDim / 2;
+            const int prefix = N - hw;
+            const int qRows = B * qNumHeads;
+            const int totalRows = qRows + B * kNumHeads;
+            const long long totalElements =
+                (long long)totalRows * N * headDim;
+
+            #pragma omp parallel for if(totalElements >= kMinParallelElements) schedule(static)
+            for (int row = 0; row < totalRows; ++row) {
+                const bool isQ = row < qRows;
+                const int headRow = isQ ? row : row - qRows;
+                const int numHeads = isQ ? qNumHeads : kNumHeads;
+                const uint8_t *input = isQ ? q : k;
+                uint8_t *output = isQ ? qOut : kOut;
+                const Uint8RopeQuant &quant = isQ ? qQuant : kQuant;
+                const RopeLayout outputLayout =
+                    isQ ? qOutputLayout : kOutputLayout;
+                const int batch = headRow / numHeads;
+                const int head = headRow % numHeads;
+                const int tableHead =
+                    (sinB == 1 ? 0 : batch) * sinH
+                    + (sinH == 1 ? 0 : head);
+                for (int token = 0; token < N; ++token) {
+                    if (token < prefix) {
+                        for (int dim = 0; dim < headDim; ++dim) {
+                            const int centered =
+                                (int)input[ropeTensorOffset(
+                                    inputLayout, headRow, token, dim,
+                                    N, headDim)]
+                                - quant.inputZeroPoint;
+                            output[ropeTensorOffset(
+                                outputLayout, headRow, token, dim,
+                                N, headDim)] = quantizeCenteredScalar(
+                                    (float)centered, quant);
+                        }
+                        continue;
+                    }
+                    const int ropeToken = token - prefix;
+                    const int pairCount = interleaved ? headDim / 2 : half;
+                    for (int pair = 0; pair < pairCount; ++pair) {
+                        const int dim0 = interleaved ? pair * 2 : pair;
+                        const int dim1 = interleaved ? dim0 + 1 : pair + half;
+                        const float x0 = (float)(
+                            (int)input[ropeTensorOffset(
+                                inputLayout, headRow, token, dim0,
+                                N, headDim)] - quant.inputZeroPoint);
+                        const float x1 = (float)(
+                            (int)input[ropeTensorOffset(
+                                inputLayout, headRow, token, dim1,
+                                N, headDim)] - quant.inputZeroPoint);
+                        const long long table0 = ropeTableOffset(
+                            inputLayout, tableHead, ropeToken, dim0,
+                            hw, headDim);
+                        const long long table1 = ropeTableOffset(
+                            inputLayout, tableHead, ropeToken, dim1,
+                            hw, headDim);
+                        output[ropeTensorOffset(
+                            outputLayout, headRow, token, dim0,
+                            N, headDim)] = quantizeCenteredScalar(
+                                x0 * cos[table0] - x1 * sin[table0], quant);
+                        output[ropeTensorOffset(
+                            outputLayout, headRow, token, dim1,
+                            N, headDim)] = quantizeCenteredScalar(
+                                x1 * cos[table1] + x0 * sin[table1], quant);
+                    }
+                }
+            }
         }
 
         static void ropeApplyUint8ScalarRange(
@@ -1001,15 +1475,24 @@ namespace TFDLOP {
             auto qShape = GetTensorShape(qData);
             auto kShape = GetTensorShape(kData);
             auto sinShape = GetTensorShape(sinData);
+            const bool inputSequenceLast =
+                param->inputLayout == RopeLayout::BHDN;
 
             int B = qShape[0];
             int qNumHeads = qShape[1];
             int kNumHeads = kShape[1];
-            int N = qShape[2];
-            int headDim = qShape[3];
-            int hw = sinShape[sinShape.size() - 2];
+            int N = qShape[inputSequenceLast ? 3 : 2];
+            int headDim = qShape[inputSequenceLast ? 2 : 3];
+            int hw = sinShape[
+                inputSequenceLast
+                    ? sinShape.size() - 1
+                    : sinShape.size() - 2];
             int sinB = sinShape[0];
             int sinH = sinShape[1];
+            const bool defaultFastLayout =
+                param->inputLayout == RopeLayout::BHND
+                && param->qOutputLayout == RopeLayout::BHND
+                && param->kOutputLayout == RopeLayout::BHND;
 
             // sin and cos are always float
             const float *sinPtr = (const float *) GetTensordata(sinData);
@@ -1022,11 +1505,51 @@ namespace TFDLOP {
                 float *qOutPtr = (float *) GetTensordata(qOutData);
                 float *kOutPtr = (float *) GetTensordata(kOutData);
 
-                ropeApplyFloatPair(
-                    qPtr, kPtr, qOutPtr, kOutPtr, sinPtr, cosPtr,
-                    B, qNumHeads, kNumHeads, N, headDim,
-                    sinB, sinH, hw, param->useFp16, param->interleaved);
+                if (defaultFastLayout) {
+                    ropeApplyFloatPair(
+                        qPtr, kPtr, qOutPtr, kOutPtr, sinPtr, cosPtr,
+                        B, qNumHeads, kNumHeads, N, headDim,
+                        sinB, sinH, hw,
+                        param->useFp16, param->interleaved);
+                } else {
+                    ropeApplyFloatPairLayouts(
+                        qPtr, kPtr, qOutPtr, kOutPtr, sinPtr, cosPtr,
+                        B, qNumHeads, kNumHeads, N, headDim,
+                        sinB, sinH, hw, param->interleaved,
+                        param->inputLayout,
+                        param->qOutputLayout,
+                        param->kOutputLayout);
+                }
 
+            } else if (GetTensorType(qData) == TFCAPI_FLOAT16
+                    && GetTensorType(kData) == TFCAPI_FLOAT16) {
+#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+                if (defaultFastLayout) {
+                    ropeApplyNativeFp16Pair(
+                        (const uint16_t *)GetTensordata(qData),
+                        (const uint16_t *)GetTensordata(kData),
+                        (uint16_t *)GetTensordata(qOutData),
+                        (uint16_t *)GetTensordata(kOutData),
+                        sinPtr, cosPtr,
+                        B, qNumHeads, kNumHeads, N, headDim,
+                        sinB, sinH, hw, param->interleaved);
+                } else {
+                    ropeApplyNativeFp16PairLayouts(
+                        (const uint16_t *)GetTensordata(qData),
+                        (const uint16_t *)GetTensordata(kData),
+                        (uint16_t *)GetTensordata(qOutData),
+                        (uint16_t *)GetTensordata(kOutData),
+                        sinPtr, cosPtr,
+                        B, qNumHeads, kNumHeads, N, headDim,
+                        sinB, sinH, hw, param->interleaved,
+                        param->inputLayout,
+                        param->qOutputLayout,
+                        param->kOutputLayout);
+                }
+#else
+                throw std::runtime_error(
+                    "ApplyRope native FP16 tensors require ARMv8.2 FP16");
+#endif
             } else if (GetTensorType(qData) == TFCAPI_UINT8 && GetTensorType(kData) == TFCAPI_UINT8) {
                 auto qQuant = GetTensorQuantizeInfo(tfContext, info.InputNames[0]);
                 auto kQuant = GetTensorQuantizeInfo(tfContext, info.InputNames[1]);
@@ -1046,12 +1569,27 @@ namespace TFDLOP {
                 auto qOutUint8 = (uint8_t *)GetTensordata(qOutData);
                 auto kOutUint8 = (uint8_t *)GetTensordata(kOutData);
 
-                ropeApplyUint8Pair(
-                    qUint8, kUint8, qOutUint8, kOutUint8,
-                    sinPtr, cosPtr,
-                    B, qNumHeads, kNumHeads, N, headDim,
-                    sinB, sinH, hw,
-                    qRopeQuant, kRopeQuant, param->interleaved);
+                if (defaultFastLayout) {
+                    ropeApplyUint8Pair(
+                        qUint8, kUint8, qOutUint8, kOutUint8,
+                        sinPtr, cosPtr,
+                        B, qNumHeads, kNumHeads, N, headDim,
+                        sinB, sinH, hw,
+                        qRopeQuant, kRopeQuant, param->interleaved);
+                } else {
+                    ropeApplyUint8PairLayouts(
+                        qUint8, kUint8, qOutUint8, kOutUint8,
+                        sinPtr, cosPtr,
+                        B, qNumHeads, kNumHeads, N, headDim,
+                        sinB, sinH, hw,
+                        qRopeQuant, kRopeQuant, param->interleaved,
+                        param->inputLayout,
+                        param->qOutputLayout,
+                        param->kOutputLayout);
+                }
+            } else {
+                throw std::runtime_error(
+                    "ApplyRope requires matching FP32, FP16, or UINT8 Q/K tensors");
             }
         }
 

@@ -14,6 +14,25 @@ Doc/ViT_TFDL_Dual_Graph_Quantization.md:
 The implementation intentionally keeps attention QK/AV MatMul as MatMul because
 those are activation x activation products. Only parameterized Linear/MatMul
 projections are rewritten to 1x1 Conv.
+
+Mixed-precision/quantization design
+-----------------------------------
+``explicit_qdq`` means that precision boundaries are part of the source graph,
+not inserted later with ``TFContext.Modify``.  The intended fast path is:
+
+* UINT8 patch/QKV/attention/MLP projections;
+* FP16 prefix/register tokens, LayerNorm outputs and residual additions;
+* FP32 LayerNorm gamma/beta (DINOv3 register-token outliers are sensitive to
+  rounding these learned parameters to FP16);
+* a small range-ranked set of Attention/MLP branches in FP16;
+* ``QuantizeLite`` for weight/range conversion, with scalar attention scaling
+  represented explicitly by a UINT8 ``Requantize`` lookup table.
+
+The main future optimization knobs are therefore the number of floating Top-K
+branches, attention range granularity (whole tensor versus per head), and how
+much of the FP16 residual/LayerNorm path the NPU can execute without extra
+layout conversions.  Keep every change measurable with CLS and patch-token
+cosine: a high aggregate tensor cosine can hide register-token failures.
 """
 
 from __future__ import annotations
@@ -493,6 +512,12 @@ class RangeCollector:
             raise ValueError(f"unsupported range method {method!r}; expected one of {self.METHODS}")
         self.method = method
         self.ranges: dict[str, tuple[float, float]] = {}
+        # Attention Softmax is logically a collection of H*S independent
+        # rows. Preserve one min/max pair per row instead of later expanding a
+        # coarse per-head range S times. These arrays stay small compared with
+        # the H*S*S attention tensor and are aggregated elementwise over all
+        # calibration images.
+        self.row_ranges: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self._range_sums: dict[str, tuple[float, float, int]] = {}
         self._samples: dict[str, list[np.ndarray]] = {}
         self._samples_per_observation = max(
@@ -580,6 +605,40 @@ class RangeCollector:
 
     def record(self, name: str, tensor: torch.Tensor) -> torch.Tensor:
         detached = tensor.detach()
+        if name.endswith((".qk_matmul", ".attn_scores")):
+            if detached.ndim == 4:
+                # [B,H,S,S] -> [H,S], aggregating the calibration batch and
+                # key dimension while retaining the runtime H*S row order.
+                row_min_tensor = detached.amin(dim=(0, 3))
+                row_max_tensor = detached.amax(dim=(0, 3))
+            elif detached.ndim == 3:
+                # [H,S,S] -> [H,S]
+                row_min_tensor = detached.amin(dim=2)
+                row_max_tensor = detached.amax(dim=2)
+            else:
+                raise ValueError(
+                    f"{name} row calibration expects rank 3/4, got "
+                    f"shape={tuple(detached.shape)}"
+                )
+            row_min = row_min_tensor.float().cpu().numpy().reshape(-1)
+            row_max = row_max_tensor.float().cpu().numpy().reshape(-1)
+            row_min = np.minimum(row_min, 0.0).astype(np.float32, copy=False)
+            row_max = np.maximum(row_max, 0.0).astype(np.float32, copy=False)
+            if name in self.row_ranges:
+                old_min, old_max = self.row_ranges[name]
+                if old_min.shape != row_min.shape:
+                    raise ValueError(
+                        f"{name} row count changed during calibration: "
+                        f"{old_min.size} -> {row_min.size}"
+                    )
+                row_min = np.minimum(old_min, row_min)
+                row_max = np.maximum(old_max, row_max)
+            equal = row_min == row_max
+            if np.any(equal):
+                epsilon = np.maximum(np.abs(row_min[equal]), 1.0) * 1e-6
+                row_min[equal] -= epsilon
+                row_max[equal] += epsilon
+            self.row_ranges[name] = (row_min, row_max)
         observed = self._exclude_register_tokens(name, detached)
         observed_min = float(observed.min().cpu())
         observed_max = float(observed.max().cpu())
@@ -745,7 +804,7 @@ class RangeCollector:
         return resolved
 
     def to_json(self) -> dict[str, dict[str, Any]]:
-        return {
+        output = {
             name: {
                 "min": qmin,
                 "max": qmax,
@@ -755,6 +814,18 @@ class RangeCollector:
             }
             for name, (qmin, qmax) in sorted(self.resolved_ranges().items())
         }
+        for name, (row_min, row_max) in sorted(self.row_ranges.items()):
+            output[f"{name}.rows"] = {
+                "min": row_min.tolist(),
+                "max": row_max.tolist(),
+                "range_method": "per-row-minmax",
+                "channel_layout": "H*S",
+                "row_count": int(row_min.size),
+                "calibration_observations": "elementwise union",
+                "exclude_register_tokens": False,
+                "register_range_policy": self.register_range_policy,
+            }
+        return output
 
 
 class TorchViTOpGraph(torch.nn.Module):
@@ -1176,6 +1247,7 @@ def compare_with_reference(
     compare_tfdl_fp: bool = False,
     addon_path: str | Path | None = None,
     fp16_residual_scale: float = 1.0,
+    conv_native_layout: bool = False,
 ) -> dict[str, Any]:
     device = torch.device(device_name or ("cuda" if torch.cuda.is_available() else "cpu"))
     old_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
@@ -1204,6 +1276,7 @@ def compare_with_reference(
                 weights,
                 create_executor=True,
                 fp16_residual_scale=fp16_residual_scale,
+                conv_native_layout=conv_native_layout,
             )
 
         with torch.no_grad():
@@ -1287,7 +1360,7 @@ def compare_tfdl_quant_fp(
     result: dict[str, Any] = {
         "device": str(device),
         "quant_fb": str(quant_fb),
-        "input_contract": "resized_raw_uint8_nchw",
+        "input_contract": None,
         "frugal_mode": True,
         "attn_softmax_impl": True,
         "prefix_len": config.prefix_len,
@@ -1307,6 +1380,12 @@ def compare_tfdl_quant_fp(
         inputs = executor.GetInputs()
         if len(inputs) != 1:
             raise RuntimeError(f"expected one TFDL input, got {len(inputs)}")
+        input_is_uint8 = "UINT8" in str(inputs[0].dtype)
+        result["input_contract"] = (
+            "resized_raw_uint8_nchw"
+            if input_is_uint8
+            else "resized_raw_float32_nchw"
+        )
         samples = _load_compare_samples(
             config, calib_dir, max(1, num_samples), device
         )
@@ -1335,7 +1414,12 @@ def compare_tfdl_quant_fp(
                 ref_cls = ref_tokens[:, 0]
                 ref_patch = ref_tokens[:, config.prefix_len :]
 
-                inputs[0].fromNumpy(raw_uint8)
+                runtime_input = (
+                    raw_uint8
+                    if input_is_uint8
+                    else np.ascontiguousarray(raw_uint8, dtype=np.float32)
+                )
+                inputs[0].fromNumpy(runtime_input)
                 outputs = executor()
                 if len(outputs) < 2:
                     raise RuntimeError(
@@ -1389,9 +1473,43 @@ def _load_range_json(path: str | Path) -> dict[str, tuple[float, float]]:
     out: dict[str, tuple[float, float]] = {}
     for name, value in raw.items():
         if isinstance(value, dict):
-            out[name] = (float(value["min"]), float(value["max"]))
+            qmin, qmax = value["min"], value["max"]
+            # H*S row arrays are loaded separately. Keeping this function
+            # scalar-only protects all existing ranking/range consumers.
+            if isinstance(qmin, list) or isinstance(qmax, list):
+                continue
+            out[name] = (float(qmin), float(qmax))
         else:
             out[name] = (float(value[0]), float(value[1]))
+    return out
+
+
+def _load_row_range_json(
+    path: str | Path,
+) -> dict[str, tuple[list[float], list[float]]]:
+    raw = json.loads(Path(path).read_text())
+    out: dict[str, tuple[list[float], list[float]]] = {}
+    for name, value in raw.items():
+        if not isinstance(value, dict):
+            continue
+        qmin, qmax = value.get("min"), value.get("max")
+        if not isinstance(qmin, list) and not isinstance(qmax, list):
+            continue
+        if not isinstance(qmin, list) or not isinstance(qmax, list):
+            raise ValueError(f"{name}: row min/max must both be arrays")
+        if not qmin or len(qmin) != len(qmax):
+            raise ValueError(
+                f"{name}: row min/max lengths must be equal and non-zero"
+            )
+        row_min = [float(value) for value in qmin]
+        row_max = [float(value) for value in qmax]
+        if not np.all(np.isfinite(row_min)) or not np.all(
+            np.isfinite(row_max)
+        ):
+            raise ValueError(f"{name}: non-finite per-row range")
+        if any(lo >= hi for lo, hi in zip(row_min, row_max)):
+            raise ValueError(f"{name}: every row range must satisfy min < max")
+        out[name] = (row_min, row_max)
     return out
 
 
@@ -1404,22 +1522,41 @@ def annotate_minmax_json_with_symbol_map(path: str | Path, symbol_map: dict[str,
             item = dict(value)
         else:
             item = {"min": float(value[0]), "max": float(value[1])}
-        if name in symbol_map:
-            item["tfdl_name"] = symbol_map[name]
+        symbol_tag = name[:-5] if name.endswith(".rows") else name
+        if symbol_tag in symbol_map:
+            item["tfdl_name"] = symbol_map[symbol_tag]
         annotated[name] = item
     path.write_text(json.dumps(annotated, indent=2, sort_keys=True))
 
 
-def _tokens_to_conv1d(hidden, config: ViTOpConfig):
+def _tokens_to_conv1d(
+    hidden,
+    config: ViTOpConfig,
+    *,
+    conv_native_layout: bool = False,
+):
     from TFDL2 import Op
 
     seq_h, seq_w = config.seq_map_hw
+    if conv_native_layout:
+        return Op.Reshape(
+            hidden,
+            (1, config.hidden_size, seq_h, seq_w),
+        )
     return Op.Reshape(Op.Transpose(hidden, (0, 2, 1)), (1, config.hidden_size, seq_h, seq_w))
 
 
-def _conv1d_to_tokens(hidden_4d, channels: int, config: ViTOpConfig):
+def _conv1d_to_tokens(
+    hidden_4d,
+    channels: int,
+    config: ViTOpConfig,
+    *,
+    conv_native_layout: bool = False,
+):
     from TFDL2 import Op
 
+    if conv_native_layout:
+        return Op.Reshape(hidden_4d, (1, channels, config.seq_len))
     return Op.Transpose(Op.Reshape(hidden_4d, (1, channels, config.seq_len)), (0, 2, 1))
 
 
@@ -1455,12 +1592,22 @@ def _token_group_specs(config: ViTOpConfig) -> tuple[tuple[str, int], ...]:
     return tuple(groups)
 
 
-def _split_token_groups(hidden, config: ViTOpConfig):
+def _split_token_groups(
+    hidden,
+    config: ViTOpConfig,
+    *,
+    conv_native_layout: bool = False,
+):
     from TFDL2 import Op
 
     specs = _token_group_specs(config)
+    token_axis = 2 if conv_native_layout else 1
     return specs, tuple(
-        Op.Slice(hidden, axis=1, split=tuple(size for _, size in specs))
+        Op.Slice(
+            hidden,
+            axis=token_axis,
+            split=tuple(size for _, size in specs),
+        )
     )
 
 
@@ -1473,10 +1620,16 @@ def _pointwise_token_group_op(
     out_channels: int,
     symbol_map: dict[str, str],
     tag: str,
+    *,
+    conv_native_layout: bool = False,
 ) -> dict[str, Any]:
     from TFDL2 import Op
 
-    specs, groups = _split_token_groups(hidden, config)
+    specs, groups = _split_token_groups(
+        hidden,
+        config,
+        conv_native_layout=conv_native_layout,
+    )
     outputs: dict[str, Any] = {}
     for (group_name, token_count), group in zip(specs, groups):
         channels = int(
@@ -1485,7 +1638,9 @@ def _pointwise_token_group_op(
             else config.hidden_size
         )
         group_4d = Op.Reshape(
-            Op.Transpose(group, (0, 2, 1)),
+            group
+            if conv_native_layout
+            else Op.Transpose(group, (0, 2, 1)),
             (1, channels, 1, token_count),
         )
         out_4d = _pointwise_4d_op(
@@ -1497,9 +1652,14 @@ def _pointwise_token_group_op(
             symbol_map,
             f"{tag}.{group_name}",
         )
-        outputs[group_name] = Op.Transpose(
-            Op.Reshape(out_4d, (1, out_channels, token_count)),
-            (0, 2, 1),
+        out_tokens = Op.Reshape(
+            out_4d,
+            (1, out_channels, token_count),
+        )
+        outputs[group_name] = (
+            out_tokens
+            if conv_native_layout
+            else Op.Transpose(out_tokens, (0, 2, 1))
         )
     return outputs
 
@@ -1510,24 +1670,41 @@ def _scale_register_update_op(
     scale: float,
     symbol_map: dict[str, str],
     tag: str,
+    *,
+    conv_native_layout: bool = False,
 ):
     from TFDL2 import Op
 
     if float(scale) == 1.0 or config.num_register_tokens == 0:
         return hidden
-    specs, groups = _split_token_groups(hidden, config)
+    specs, groups = _split_token_groups(
+        hidden,
+        config,
+        conv_native_layout=conv_native_layout,
+    )
     scaled = []
     for (group_name, _), group in zip(specs, groups):
         if group_name == "registers":
             group = Op.Mul(group, float(scale))
         scaled.append(group)
-    return _mark(symbol_map, tag, Op.Concat(tuple(scaled), axis=1))
+    return _mark(
+        symbol_map,
+        tag,
+        Op.Concat(tuple(scaled), axis=2 if conv_native_layout else 1),
+    )
 
 
-def _qkv_conv_to_heads(hidden_4d, config: ViTOpConfig):
+def _qkv_conv_to_heads(
+    hidden_4d,
+    config: ViTOpConfig,
+    *,
+    conv_native_layout: bool = False,
+):
     from TFDL2 import Op
 
     heads = Op.Reshape(hidden_4d, (1, config.num_attention_heads, config.head_dim, -1))
+    if conv_native_layout:
+        return heads
     return Op.Transpose(heads, (0, 1, 3, 2))
 
 
@@ -1540,11 +1717,86 @@ def _attention_to_conv1d(attn_3d, config: ViTOpConfig):
     return Op.Reshape(attn_4d, (1, config.hidden_size, seq_h, seq_w))
 
 
-def _apply_rope_op(q, k, rope_sin, rope_cos, layer_id: int):
+def _apply_rope_op(
+    q,
+    k,
+    rope_sin,
+    rope_cos,
+    layer_id: int,
+    *,
+    conv_native_layout: bool = False,
+):
     from TFDL2 import Op
 
-    out = Op.Custom((q, k, rope_sin, rope_cos), (f"vit_q_rope_{layer_id}", f"vit_k_rope_{layer_id}"), "ApplyRope", "{}")
+    custom_param = (
+        json.dumps(
+            {
+                "inputLayout": "BHDN",
+                "qOutputLayout": "BHND",
+                "kOutputLayout": "BHDN",
+            },
+            separators=(",", ":"),
+        )
+        if conv_native_layout
+        else "{}"
+    )
+    out = Op.Custom(
+        (q, k, rope_sin, rope_cos),
+        (f"vit_q_rope_{layer_id}", f"vit_k_rope_{layer_id}"),
+        "ApplyRope",
+        custom_param,
+    )
     return out[0], out[1]
+
+
+def _linear_requant_maptable(
+    input_range: tuple[float, float],
+    output_range: tuple[float, float],
+    *,
+    scale: float,
+    bias: float = 0.0,
+) -> list[int]:
+    """Encode ``y = x * scale + bias`` as a UINT8 -> UINT8 lookup table.
+
+    TFDL activation quantization is affine and per tensor here.  Reconstruct
+    each possible input code with the input scale/zero-point, apply the scalar
+    operation in this offline builder, then encode with the output
+    scale/zero-point.  The runtime operator is consequently only a 256-byte
+    lookup.  This is the source-graph equivalent of the full Quant pass folding
+    a tensor-wise Mul/Div into Requant.
+
+    For QK scaling the calibrated output range is normally the input range
+    divided by ``sqrt(head_dim)``.  The table can then be numerically identity
+    while still changing qscale; do not remove it as a redundant identity op.
+    """
+    input_min, input_max = (float(value) for value in input_range)
+    output_min, output_max = (float(value) for value in output_range)
+    if not (
+        np.isfinite(input_min)
+        and np.isfinite(input_max)
+        and np.isfinite(output_min)
+        and np.isfinite(output_max)
+        and np.isfinite(scale)
+        and np.isfinite(bias)
+        and input_min < input_max
+        and output_min < output_max
+    ):
+        raise ValueError(
+            "invalid ranges/scalars for Requantize map table: "
+            f"input={input_range}, output={output_range}, "
+            f"scale={scale}, bias={bias}"
+        )
+    input_step = (input_max - input_min) / 255.0
+    output_step = (output_max - output_min) / 255.0
+    input_zero = float(np.clip(np.rint(-input_min / input_step), 0.0, 255.0))
+    output_zero = float(
+        np.clip(np.rint(-output_min / output_step), 0.0, 255.0)
+    )
+    input_codes = np.arange(256, dtype=np.float64)
+    real_input = (input_codes - input_zero) * input_step
+    real_output = real_input * float(scale) + float(bias)
+    output_codes = np.rint(real_output / output_step + output_zero)
+    return np.clip(output_codes, 0.0, 255.0).astype(np.uint8).tolist()
 
 
 def _build_block_op(
@@ -1560,16 +1812,77 @@ def _build_block_op(
     split_mlp_token_groups: bool = False,
     split_attention_heads: bool = False,
     stable_attention_window: float = 0.0,
+    explicit_qdq: bool = False,
+    fp_attn_layers: frozenset[int] = frozenset(),
+    fp_mlp_layers: frozenset[int] = frozenset(),
+    dequant_dtype: Any = None,
+    float_entry_tensors: list[str] | None = None,
+    attention_requant_maptable: list[int] | dict[int, list[int]] | None = None,
+    source_quantize_entries: bool = False,
+    per_channel_qk: bool = False,
+    fold_attention_scale_into_q: bool = False,
+    conv_native_layout: bool = False,
 ):
-    from TFDL2 import Op
+    """Build one transformer block with source-level precision boundaries.
 
+    ``fp_attn_layers`` keeps the output projection floating; the QK/Softmax/AV
+    core stays quantized. ``fp_mlp_layers`` keeps the complete MLP floating.
+    ``per_channel_qk`` keeps QK quantized with one range per Softmax row.  Its
+    Requantize output receives the same H*S qinfo divided by
+    ``sqrt(head_dim)``; the lookup table is the exact ``0..255`` identity map.
+    ``fold_attention_scale_into_q`` instead scales the Q projection offline
+    and connects QK directly to UINT8 Softmax. Softmax is converted back to
+    UINT8 with ``Context.Modify`` after all qinfo is registered.
+    Every other branch is dequantized only at its residual Add.  This division
+    preserves the high-throughput matrix work on NPU while keeping the
+    numerically sensitive residual stream in FP16/FP32.
+    """
+    from TFDL2 import Op
+    from TFDL2.Common import TFDataType
+
+    if dequant_dtype is None:
+        dequant_dtype = TFDataType.TFDL_FLOAT
     c = f"layers.{layer_id}"
-    normed = Op.LayerNorm2(hidden, ctx.GetParamSymbol(f"{c}.norm1.weight"), ctx.GetParamSymbol(f"{c}.norm1.bias"), axis=-1)
+
+    def dequantize(value: Any, tag: str) -> Any:
+        # Record the *floating* side as a stop tensor.  QuantizeLite leaves the
+        # node untouched; full Quant must also be prevented from propagating
+        # UINT8 through it and silently changing the residual-path contract.
+        value = Op.DeQuantize(value, dequant_dtype)
+        if float_entry_tensors is not None:
+            float_entry_tensors.append(str(value))
+        return _mark(symbol_map, tag, value)
+
+    attention_scale: Any = 1.0 / math.sqrt(config.head_dim)
+    if (
+        explicit_qdq
+        and dequant_dtype == TFDataType.TFDL_FLOAT16
+        and attention_requant_maptable is None
+        and not per_channel_qk
+        and not fold_attention_scale_into_q
+    ):
+        attention_scale = ctx.GetParamSymbol(f"{c}.attn_scale")
+
+    norm_axis = 1 if conv_native_layout else -1
+    normed = Op.LayerNorm2(hidden, ctx.GetParamSymbol(f"{c}.norm1.weight"), ctx.GetParamSymbol(f"{c}.norm1.bias"), axis=norm_axis)
     normed = _mark(symbol_map, f"{c}.norm1", normed)
-    norm1_transposed = _mark(
-        symbol_map,
-        f"{c}.norm1_transposed",
-        Op.Transpose(normed, (0, 2, 1)),
+    normed_for_qkv = normed
+    if source_quantize_entries:
+        # QuantizeLite performs no propagation or graph rewrite.  This source
+        # Quantize is therefore the explicit entry to Q/K/V's UINT8 island.
+        normed_for_qkv = _mark(
+            symbol_map,
+            f"{c}.norm1.quantized",
+            Op.Quantize(normed_for_qkv),
+        )
+    norm1_transposed = (
+        normed_for_qkv
+        if conv_native_layout
+        else _mark(
+            symbol_map,
+            f"{c}.norm1_transposed",
+            Op.Transpose(normed_for_qkv, (0, 2, 1)),
+        )
     )
     normed_4d = _mark(
         symbol_map,
@@ -1579,20 +1892,64 @@ def _build_block_op(
             (1, config.hidden_size, *config.seq_map_hw),
         ),
     )
-    q = _qkv_conv_to_heads(_pointwise_4d_op(ctx, normed_4d, f"{c}.q.weight", f"{c}.q.bias", config.hidden_size, symbol_map, f"{c}.q"), config)
-    k = _qkv_conv_to_heads(_pointwise_4d_op(ctx, normed_4d, f"{c}.k.weight", f"{c}.k.bias", config.hidden_size, symbol_map, f"{c}.k"), config)
-    v = _qkv_conv_to_heads(_pointwise_4d_op(ctx, normed_4d, f"{c}.v.weight", f"{c}.v.bias", config.hidden_size, symbol_map, f"{c}.v"), config)
+    q = _qkv_conv_to_heads(
+        _pointwise_4d_op(ctx, normed_4d, f"{c}.q.weight", f"{c}.q.bias", config.hidden_size, symbol_map, f"{c}.q"),
+        config,
+        conv_native_layout=conv_native_layout,
+    )
+    k = _qkv_conv_to_heads(
+        _pointwise_4d_op(ctx, normed_4d, f"{c}.k.weight", f"{c}.k.bias", config.hidden_size, symbol_map, f"{c}.k"),
+        config,
+        conv_native_layout=conv_native_layout,
+    )
+    v = _qkv_conv_to_heads(
+        _pointwise_4d_op(ctx, normed_4d, f"{c}.v.weight", f"{c}.v.bias", config.hidden_size, symbol_map, f"{c}.v"),
+        config,
+        conv_native_layout=conv_native_layout,
+    )
     if config.use_rope:
-        q, k = _apply_rope_op(q, k, rope_sin, rope_cos, layer_id)
+        q, k = _apply_rope_op(
+            q,
+            k,
+            rope_sin,
+            rope_cos,
+            layer_id,
+            conv_native_layout=conv_native_layout,
+        )
         _mark(symbol_map, f"{c}.q_rope", q)
         _mark(symbol_map, f"{c}.k_rope", k)
+    elif conv_native_layout:
+        # Non-RoPE ViTs still need Q in row-major [H,N,D]. K can remain in
+        # the Conv-native [H,D,N] layout required by QK MatMul.
+        q = Op.Transpose(q, (0, 1, 3, 2))
+    if conv_native_layout:
+        # AV remains exactly prob @ V. Materialize V as [H,N,D] because NPU
+        # MatMul trans flags compile back into explicit Transpose operators.
+        v = Op.Transpose(v, (0, 1, 3, 2))
     q3 = Op.Reshape(q, (config.num_attention_heads, config.seq_len, config.head_dim))
-    k3 = Op.Transpose(Op.Reshape(k, (config.num_attention_heads, config.seq_len, config.head_dim)), (0, 2, 1))
+    k3 = (
+        Op.Reshape(k, (config.num_attention_heads, config.head_dim, config.seq_len))
+        if conv_native_layout
+        else Op.Transpose(
+            Op.Reshape(
+                k,
+                (
+                    config.num_attention_heads,
+                    config.seq_len,
+                    config.head_dim,
+                ),
+            ),
+            (0, 2, 1),
+        )
+    )
     v3 = Op.Reshape(v, (config.num_attention_heads, config.seq_len, config.head_dim))
     _mark(symbol_map, f"{c}.q_matmul_input", q3)
     _mark(symbol_map, f"{c}.k_matmul_input", k3)
     _mark(symbol_map, f"{c}.v_matmul_input", v3)
     if split_attention_heads:
+        # Experimental accuracy knob: separate heads can use independent QK
+        # and score ranges.  It increases Slice/Concat overhead substantially,
+        # so validate end-to-end latency and Softmax accuracy before enabling.
         head_splits = (1,) * config.num_attention_heads
         q_heads = Op.Slice(q3, axis=0, split=head_splits)
         k_heads = Op.Slice(k3, axis=0, split=head_splits)
@@ -1607,10 +1964,24 @@ def _build_block_op(
                 f"{c}.qk_matmul.{h}",
                 Op.MatMul(q_head, k_head, transA=False, transB=False),
             )
+            head_requant_maptable = (
+                attention_requant_maptable.get(head_id)
+                if isinstance(attention_requant_maptable, dict)
+                else attention_requant_maptable
+            )
+            scaled_head = (
+                # Scaling Q before RoPE is equivalent to scaling QK after
+                # MatMul, so no score-side operator is needed in fold-Q mode.
+                qk_head
+                if fold_attention_scale_into_q
+                # Requant replaces QK * (1/sqrt(head_dim)) without visiting a
+                # floating tensor. Its output qinfo belongs to attn_scores.
+                else Op.Requantize(qk_head, head_requant_maptable)
+                if head_requant_maptable is not None
+                else Op.Mul(qk_head, attention_scale)
+            )
             scores_head = _mark(
-                symbol_map,
-                f"{c}.attn_scores.raw.{h}",
-                Op.Mul(qk_head, 1.0 / math.sqrt(config.head_dim)),
+                symbol_map, f"{c}.attn_scores.raw.{h}", scaled_head
             )
             if float(stable_attention_window) > 0.0:
                 rowmax = _mark(
@@ -1656,11 +2027,31 @@ def _build_block_op(
             f"{c}.qk_matmul",
             Op.MatMul(q3, k3, transA=False, transB=False),
         )
-        scores = _mark(
-            symbol_map,
-            f"{c}.attn_scores",
-            Op.Mul(qk_matmul, 1.0 / math.sqrt(config.head_dim)),
-        )
+        if fold_attention_scale_into_q:
+            # q.weight/q.bias and their activation ranges were scaled by
+            # 1/sqrt(head_dim), so this UINT8 MatMul already represents the
+            # scaled attention scores. This applies to both scalar and H*S
+            # QK qinfo; no runtime Requant/DQ/Div is needed.
+            scaled_scores = qk_matmul
+        elif per_channel_qk:
+            # The score qinfo is registered as the QK qinfo divided by
+            # sqrt(head_dim).  Therefore each UINT8 code already represents
+            # the correctly scaled score and Requantize is deliberately the
+            # exact identity map.  Unlike fold-Q, this leaves Q/K parameters
+            # and their activation codes unchanged.  QK codes intentionally
+            # use the new H*S qinfo (so they are not scalar-baseline-identical)
+            # while Softmax receives one correctly scaled qinfo per score row.
+            scaled_scores = Op.Requantize(qk_matmul, list(range(256)))
+        else:
+            scaled_scores = (
+                # QuantizeLite intentionally will not discover/fold scalar
+                # Mul/Div. Express that fold directly so QK and Softmax stay
+                # UINT8 in the ordinary per-tensor path.
+                Op.Requantize(qk_matmul, attention_requant_maptable)
+                if attention_requant_maptable is not None
+                else Op.Mul(qk_matmul, attention_scale)
+            )
+        scores = _mark(symbol_map, f"{c}.attn_scores", scaled_scores)
         probs = _mark(symbol_map, f"{c}.attn_probs", Op.Softmax(scores, axis=2))
         attn = _mark(
             symbol_map,
@@ -1668,6 +2059,10 @@ def _build_block_op(
             Op.MatMul(probs, v3, transA=False, transB=False),
         )
     attn_4d = _mark(symbol_map, f"{c}.attn", _attention_to_conv1d(attn, config))
+    if explicit_qdq and layer_id in fp_attn_layers:
+        # Top-K attention bypass starts after AV: QKV/QK/Softmax/AV remain
+        # INT8, while only the selected output projection uses FP weights.
+        attn_4d = dequantize(attn_4d, f"{c}.attn.dequantized")
     proj = _mark(
         symbol_map,
         f"{c}.proj_tokens",
@@ -1675,6 +2070,7 @@ def _build_block_op(
         _pointwise_4d_op(ctx, attn_4d, f"{c}.proj.weight", f"{c}.proj.bias", config.hidden_size, symbol_map, f"{c}.proj"),
         config.hidden_size,
         config,
+        conv_native_layout=conv_native_layout,
         ),
     )
     proj = _scale_register_update_op(
@@ -1683,13 +2079,30 @@ def _build_block_op(
         register_residual_scale,
         symbol_map,
         f"{c}.proj.scaled",
+        conv_native_layout=conv_native_layout,
     )
+    if explicit_qdq and layer_id not in fp_attn_layers:
+        # The normal INT8 projection exits immediately before residual Add.
+        proj = dequantize(proj, f"{c}.proj_tokens.dequantized")
     hidden = _mark(symbol_map, f"{c}.resid1", Op.Add(hidden, proj))
-    normed2 = _mark(symbol_map, f"{c}.norm2", Op.LayerNorm2(hidden, ctx.GetParamSymbol(f"{c}.norm2.weight"), ctx.GetParamSymbol(f"{c}.norm2.bias"), axis=-1))
-    norm2_transposed = _mark(
-        symbol_map,
-        f"{c}.norm2_transposed",
-        Op.Transpose(normed2, (0, 2, 1)),
+    normed2 = _mark(symbol_map, f"{c}.norm2", Op.LayerNorm2(hidden, ctx.GetParamSymbol(f"{c}.norm2.weight"), ctx.GetParamSymbol(f"{c}.norm2.bias"), axis=norm_axis))
+    normed2_for_mlp = normed2
+    if source_quantize_entries and layer_id not in fp_mlp_layers:
+        # Explicit entry to the MLP INT8 island.  A selected Top-K MLP skips
+        # this Quantize and keeps FC1/activation/FC2 together in FP16.
+        normed2_for_mlp = _mark(
+            symbol_map,
+            f"{c}.norm2.quantized",
+            Op.Quantize(normed2_for_mlp),
+        )
+    norm2_transposed = (
+        normed2_for_mlp
+        if conv_native_layout
+        else _mark(
+            symbol_map,
+            f"{c}.norm2_transposed",
+            Op.Transpose(normed2_for_mlp, (0, 2, 1)),
+        )
     )
     normed2_4d = _mark(
         symbol_map,
@@ -1715,6 +2128,7 @@ def _build_block_op(
                 config.intermediate_size,
                 symbol_map,
                 f"{c}.fc1",
+                conv_native_layout=conv_native_layout,
             )
             fc2_groups = []
             for group_name, fc1_group in fc1_groups.items():
@@ -1725,7 +2139,9 @@ def _build_block_op(
                 )
                 token_count = dict(_token_group_specs(config))[group_name]
                 mid_4d = Op.Reshape(
-                    Op.Transpose(mid, (0, 2, 1)),
+                    mid
+                    if conv_native_layout
+                    else Op.Transpose(mid, (0, 2, 1)),
                     (1, config.intermediate_size, 1, token_count),
                 )
                 raw = _pointwise_4d_op(
@@ -1737,10 +2153,12 @@ def _build_block_op(
                     symbol_map,
                     f"{c}.fc2.raw.{group_name}",
                 )
-                out = Op.Transpose(
-                    Op.Reshape(raw, (1, config.hidden_size, token_count)),
-                    (0, 2, 1),
+                out = Op.Reshape(
+                    raw,
+                    (1, config.hidden_size, token_count),
                 )
+                if not conv_native_layout:
+                    out = Op.Transpose(out, (0, 2, 1))
                 if group_name == "registers" and float(register_residual_scale) != 1.0:
                     out = Op.Mul(out, float(register_residual_scale))
                 out = _mark(symbol_map, f"{c}.fc2.{group_name}", out)
@@ -1748,7 +2166,10 @@ def _build_block_op(
             mlp = _mark(
                 symbol_map,
                 f"{c}.fc2.scaled",
-                Op.Concat(tuple(fc2_groups), axis=1),
+                Op.Concat(
+                    tuple(fc2_groups),
+                    axis=2 if conv_native_layout else 1,
+                ),
             )
             symbol_map[f"{c}.fc2"] = str(mlp)
             resid2_base = hidden
@@ -1776,10 +2197,18 @@ def _build_block_op(
         _pointwise_4d_op(ctx, mlp, f"{c}.fc2.weight", f"{c}.fc2.bias", config.hidden_size, symbol_map, f"{c}.fc2"),
         config.hidden_size,
         config,
+        conv_native_layout=conv_native_layout,
         ),
     )
+    if explicit_qdq and layer_id not in fp_mlp_layers:
+        # Keep FC2 in UINT8 and convert only its result for the residual Add.
+        mlp = dequantize(mlp, f"{c}.fc2_tokens.dequantized")
     resid2_base = hidden
     if layer_id == 0 and float(fp16_residual_scale) != 1.0:
+        # DINOv3's first MLP can create a ~4e4 register-token outlier.  This
+        # exact reparameterization protects FP16 headroom; paired weights and
+        # ranges are prepared by the loader/collector, so do not tune it only
+        # on this Add without regenerating calibration data.
         resid2_base = _mark(
             symbol_map,
             f"{c}.resid2_base_scaled",
@@ -1802,14 +2231,212 @@ def build_vit_tfdl_graph(
     split_mlp_token_groups: bool = False,
     split_attention_heads: bool = False,
     stable_attention_window: float = 0.0,
+    explicit_qdq: bool = False,
+    fp_attn_layers: Sequence[int] = (),
+    fp_mlp_layers: Sequence[int] = (),
+    fp16_export: bool = False,
+    attention_scale_requant: bool = False,
+    source_quantize_entries: bool = False,
+    per_channel_qk: bool = False,
+    fold_attention_scale_into_q: bool = False,
+    per_row_attention_range_floor: float = 0.0,
+    per_channel_qk_max_requant_multiplier: float | None = 0.99,
+    conv_native_layout: bool = False,
 ):
+    """Build the float or explicit mixed-precision TFDL source graph.
+
+    This function owns the precision contract.  The calibration pass should
+    only encode weights/ranges; it must not be required to discover where the
+    graph crosses INT8 and floating domains.  ``symbol_map`` deliberately uses
+    semantic names so Torch-collected ranges survive added Q/DQ/reshape nodes.
+    """
     from TFDL2 import TFContext, TFExecutor, Op
     from TFDL2.Common import TFDataType
 
-    ctx = TFContext(f"{config.arch}_vit_op")
-    ctx.RegisterParamToContext(**weights)
+    fp_attn_layer_set = frozenset(int(value) for value in fp_attn_layers)
+    fp_mlp_layer_set = frozenset(int(value) for value in fp_mlp_layers)
+    dequant_dtype = (
+        TFDataType.TFDL_FLOAT16 if fp16_export else TFDataType.TFDL_FLOAT
+    )
+    loaded_ranges = _load_range_json(range_json) if range_json else None
+    loaded_row_ranges = (
+        _load_row_range_json(range_json) if range_json else {}
+    )
+    if attention_scale_requant and loaded_ranges is None:
+        raise ValueError("attention Requantize requires --range-json")
+    if per_channel_qk and loaded_ranges is None:
+        raise ValueError("per-channel QK quantization requires --range-json")
+    if per_channel_qk and attention_scale_requant:
+        raise ValueError(
+            "per-channel QK quantization replaces attention Requantize"
+        )
+    if per_channel_qk and split_attention_heads:
+        raise ValueError(
+            "per-channel QK quantization keeps heads in one MatMul and is "
+            "incompatible with split_attention_heads"
+        )
+    if not 0.0 <= float(per_row_attention_range_floor) <= 1.0:
+        raise ValueError("per-row attention range floor must be in [0, 1]")
+    qk_range_floor = float(per_row_attention_range_floor)
+    qk_max_requant_multiplier = (
+        None
+        if per_channel_qk_max_requant_multiplier is None
+        else float(per_channel_qk_max_requant_multiplier)
+    )
+    if qk_max_requant_multiplier is not None and (
+        not np.isfinite(qk_max_requant_multiplier)
+        or qk_max_requant_multiplier <= 0.0
+    ):
+        raise ValueError(
+            "per-channel QK max requant multiplier must be positive"
+        )
+    # Requant mode historically implied source Quantize entries. Keep that
+    # behavior for direct callers while allowing the per-channel path to use
+    # the same explicit INT8 islands without constructing Requant tables.
+    source_quantize_entries = bool(
+        source_quantize_entries or attention_scale_requant
+    )
+
+    attention_requant_tables: dict[
+        int, list[int] | dict[int, list[int]]
+    ] = {}
+    if attention_scale_requant:
+        # Prefer independently observed QK and scaled-score ranges.  Falling
+        # back to score_range / scale supports older calibration JSON files
+        # which did not expose the pre-scale QK tensor.
+        attention_scale_value = 1.0 / math.sqrt(config.head_dim)
+        for layer_id in range(config.num_hidden_layers):
+            if split_attention_heads:
+                head_tables: dict[int, list[int]] = {}
+                for head_id in range(config.num_attention_heads):
+                    score_tag = (
+                        f"layers.{layer_id}.attn_scores.h{head_id:02d}"
+                    )
+                    if score_tag not in loaded_ranges:
+                        raise KeyError(
+                            f"range JSON is missing {score_tag!r}, required "
+                            "for per-head attention Requantize"
+                        )
+                    output_range = loaded_ranges[score_tag]
+                    qk_tag = f"layers.{layer_id}.qk_matmul.h{head_id:02d}"
+                    input_range = loaded_ranges.get(qk_tag)
+                    if input_range is None:
+                        input_range = (
+                            float(output_range[0]) / attention_scale_value,
+                            float(output_range[1]) / attention_scale_value,
+                        )
+                    head_tables[head_id] = _linear_requant_maptable(
+                        input_range,
+                        output_range,
+                        scale=attention_scale_value,
+                    )
+                attention_requant_tables[layer_id] = head_tables
+            else:
+                score_tag = f"layers.{layer_id}.attn_scores"
+                if score_tag not in loaded_ranges:
+                    raise KeyError(
+                        f"range JSON is missing {score_tag!r}, required to "
+                        "build the attention-scale Requantize map table"
+                    )
+                output_range = loaded_ranges[score_tag]
+                qk_tag = f"layers.{layer_id}.qk_matmul"
+                input_range = loaded_ranges.get(qk_tag)
+                if input_range is None:
+                    input_range = (
+                        float(output_range[0]) / attention_scale_value,
+                        float(output_range[1]) / attention_scale_value,
+                    )
+                attention_requant_tables[layer_id] = _linear_requant_maptable(
+                    input_range,
+                    output_range,
+                    scale=attention_scale_value,
+                )
+    graph_weights = dict(weights)
+    if fold_attention_scale_into_q:
+        # RoPE is linear, therefore scaling Q before RoPE is exactly
+        # equivalent to scaling QK afterward. Scaling real parameters (as
+        # opposed to only changing qinfo) preserves the intended semantic
+        # factor through quantized Conv and MatMul.
+        attention_scale_value = 1.0 / math.sqrt(config.head_dim)
+        for layer_id in range(config.num_hidden_layers):
+            for suffix in ("q.weight", "q.bias"):
+                name = f"layers.{layer_id}.{suffix}"
+                value = graph_weights[name]
+                graph_weights[name] = np.ascontiguousarray(
+                    value * attention_scale_value,
+                    dtype=value.dtype,
+                )
+    if explicit_qdq and fp16_export:
+        # Only tensors consumed by known FP16 compute islands are converted.
+        # LayerNorm gamma/beta intentionally stay FP32: DINOv3's learned norm
+        # parameters plus register outliers made an all-parameter FP16 export
+        # collapse block-0 norm2 and the subsequent residual stream.
+        fp16_params = {
+            "prefix_tokens",
+            "pos_embed",
+            "fp16_residual_scale.weight",
+            "fp16_residual_scale.bias",
+        }
+        for layer_id in range(config.num_hidden_layers):
+            prefix = f"layers.{layer_id}"
+            if layer_id in fp_attn_layer_set:
+                fp16_params.update(
+                    {f"{prefix}.proj.weight", f"{prefix}.proj.bias"}
+                )
+            if layer_id in fp_mlp_layer_set:
+                if config.use_gated_mlp:
+                    names = ("gate", "up", "fc2")
+                else:
+                    names = ("fc1", "fc2")
+                for stem in names:
+                    fp16_params.update(
+                        {f"{prefix}.{stem}.weight", f"{prefix}.{stem}.bias"}
+                    )
+        graph_weights = {
+            name: (
+                np.ascontiguousarray(value, dtype=np.float16)
+                if name in fp16_params
+                else value
+            )
+            for name, value in graph_weights.items()
+        }
+        if (
+            not attention_scale_requant
+            and not per_channel_qk
+            and not fold_attention_scale_into_q
+        ):
+            for layer_id in range(config.num_hidden_layers):
+                graph_weights[f"layers.{layer_id}.attn_scale"] = np.asarray(
+                    [1.0 / math.sqrt(config.head_dim)], dtype=np.float16
+                )
+
+    if conv_native_layout:
+        # Residual/token state is [B,C,N]. Constants are transposed offline so
+        # the runtime graph does not pay layout conversions around Concat/Add.
+        for name in ("prefix_tokens", "pos_embed"):
+            if name in graph_weights:
+                graph_weights[name] = np.ascontiguousarray(
+                    np.transpose(graph_weights[name], (0, 2, 1))
+                )
+        # Conv-native ApplyRope consumes [B,H,D,N], so tables use [B,H,D,hw]
+        # as well. This is an offline parameter transform, not a graph op.
+        for name in ("rope_sin", "rope_cos"):
+            if name in graph_weights:
+                graph_weights[name] = np.ascontiguousarray(
+                    np.transpose(graph_weights[name], (0, 1, 3, 2))
+                )
+
+    ctx = TFContext(
+        f"{config.arch}_vit_op"
+        + ("_conv_native" if conv_native_layout else "")
+    )
+    ctx.RegisterParamToContext(**graph_weights)
     symbol_map: dict[str, str] = {}
+    float_entry_tensors: list[str] = []
     with ctx:
+        # Placeholder preprocessing turns raw 0..255 RGB into the normalized
+        # model domain.  QuantizeLite preserves this FLOAT Placeholder, so its
+        # runtime buffer is raw FP32; full Quant converts it to a UINT8 input.
         input_scale = tuple(
             float(v)
             for v in (float(config.image_rescale_factor) / np.array(config.image_std, dtype=np.float32))
@@ -1824,8 +2451,18 @@ def build_vit_tfdl_graph(
         )
         pixel_values = _mark(symbol_map, "input.normalized", pixel_values)
         input_name = str(pixel_values)
+        patch_input = pixel_values
+        if source_quantize_entries:
+            # QuantizeLite does not infer the first quantized region.  Keep an
+            # explicit source entry so patch weights are encoded and executed
+            # as UINT8 while preprocessing remains visible and floating.
+            patch_input = _mark(
+                symbol_map,
+                "input.normalized.quantized",
+                Op.Quantize(patch_input),
+            )
         hidden = Op.Convolution2(
-            pixel_values,
+            patch_input,
             ctx.GetParamSymbol("patch.weight"),
             ctx.GetParamSymbol("patch.bias"),
             kernel=config.patch_size,
@@ -1836,24 +2473,28 @@ def build_vit_tfdl_graph(
             group=1,
         )
         _mark(symbol_map, "patch.conv", hidden)
-        hidden = _mark(
-            symbol_map,
-            "patch.tokens",
-            Op.Transpose(
-                Op.Reshape(
-                    hidden,
-                    (1, config.hidden_size, config.num_patches),
-                ),
-                (0, 2, 1),
-            ),
+        hidden = Op.Reshape(
+            hidden,
+            (1, config.hidden_size, config.num_patches),
         )
+        if not conv_native_layout:
+            hidden = Op.Transpose(hidden, (0, 2, 1))
+        if explicit_qdq:
+            # Prefix/register tokens and residuals share one floating domain.
+            # Exit patch projection here rather than quantizing Concat/Add.
+            hidden = _mark(symbol_map, "patch.tokens.quantized", hidden)
+            hidden = Op.DeQuantize(hidden, dequant_dtype)
+            float_entry_tensors.append(str(hidden))
+            hidden = _mark(symbol_map, "patch.tokens", hidden)
+        else:
+            hidden = _mark(symbol_map, "patch.tokens", hidden)
         if config.prefix_len:
             hidden = _mark(
                 symbol_map,
                 "prefix_concat",
                 Op.Concat(
                     (ctx.GetParamSymbol("prefix_tokens"), hidden),
-                    axis=1,
+                    axis=2 if conv_native_layout else 1,
                 ),
             )
         if config.use_position_embeddings:
@@ -1865,6 +2506,7 @@ def build_vit_tfdl_graph(
             register_residual_scale,
             symbol_map,
             "tokens.scaled",
+            conv_native_layout=conv_native_layout,
         )
         hidden = _mark(symbol_map, "tokens", hidden)
         rope_sin = ctx.GetParamSymbol("rope_sin") if config.use_rope else None
@@ -1883,15 +2525,41 @@ def build_vit_tfdl_graph(
                 split_mlp_token_groups=split_mlp_token_groups,
                 split_attention_heads=split_attention_heads,
                 stable_attention_window=stable_attention_window,
+                explicit_qdq=explicit_qdq,
+                fp_attn_layers=fp_attn_layer_set,
+                fp_mlp_layers=fp_mlp_layer_set,
+                dequant_dtype=dequant_dtype,
+                float_entry_tensors=float_entry_tensors,
+                attention_requant_maptable=attention_requant_tables.get(
+                    layer_id
+                ),
+                source_quantize_entries=source_quantize_entries,
+                per_channel_qk=per_channel_qk,
+                fold_attention_scale_into_q=fold_attention_scale_into_q,
+                conv_native_layout=conv_native_layout,
             )
-        hidden = _mark(symbol_map, "final_norm", Op.LayerNorm2(hidden, ctx.GetParamSymbol("norm.weight"), ctx.GetParamSymbol("norm.bias"), axis=-1))
-        cls = Op.Gather2(hidden, 0, 1)
+        hidden = _mark(
+            symbol_map,
+            "final_norm",
+            Op.LayerNorm2(
+                hidden,
+                ctx.GetParamSymbol("norm.weight"),
+                ctx.GetParamSymbol("norm.bias"),
+                axis=1 if conv_native_layout else -1,
+            ),
+        )
+        cls = Op.Gather2(hidden, 0, 2 if conv_native_layout else 1)
         cls = _mark(symbol_map, "output.cls", Op.Reshape(cls, (1, config.hidden_size)))
-        output_names = [str(cls), str(hidden)]
+        output_tokens = (
+            Op.Transpose(hidden, (0, 2, 1))
+            if conv_native_layout
+            else hidden
+        )
+        output_names = [str(cls), str(output_tokens)]
     ctx.SetOutputs(output_names)
 
     if range_json:
-        ranges = _load_range_json(range_json)
+        ranges = loaded_ranges
         input_tag = "input.normalized"
         if input_tag not in ranges:
             raise ValueError(
@@ -1903,12 +2571,236 @@ def build_vit_tfdl_graph(
             raise ValueError(
                 f"invalid {input_tag!r} range: min={input_min}, max={input_max}"
             )
-        for tag, actual in symbol_map.items():
-            if tag in ranges:
-                qmin, qmax = ranges[tag]
-                if not ctx.AddInt8Config(actual, float(qmax), float(qmin)):
-                    raise RuntimeError(f"failed to add int8 config for {tag} -> {actual}")
+        def range_for_graph_tag(
+            tag: str,
+        ) -> tuple[str, tuple[float, float]] | None:
+            # Q/DQ and layout-only nodes do not have independent Torch
+            # observations.  Walk back to the nearest semantic tensor whose
+            # range is valid.  Add mappings here when introducing a new source
+            # boundary; missing qinfo often surfaces much later at runtime.
+            range_tag = tag
+            for suffix in (".quantized", ".dequantized"):
+                if range_tag.endswith(suffix):
+                    range_tag = range_tag[: -len(suffix)]
+                    break
+            # In fold-Q mode QK is already the scaled score tensor. Scalar
+            # QK needs the calibrated score range here; otherwise registering
+            # qk_matmul first would attach the unscaled range to that tensor.
+            if (
+                fold_attention_scale_into_q
+                and not per_channel_qk
+                and range_tag.endswith(".qk_matmul")
+            ):
+                score_tag = range_tag[: -len(".qk_matmul")] + ".attn_scores"
+                if score_tag in ranges:
+                    return score_tag, ranges[score_tag]
+            candidates = [range_tag]
+            if ".qk_matmul.h" in range_tag:
+                candidates.append(range_tag.split(".qk_matmul.h", 1)[0] + ".qk_matmul")
+            if ".attn_scores.raw.h" in range_tag or ".attn_scores.h" in range_tag:
+                candidates.append(range_tag.split(".attn_scores", 1)[0] + ".attn_scores")
+            if range_tag == "patch.tokens":
+                candidates.append("patch.conv")
+            if range_tag.endswith(".proj_tokens"):
+                candidates.append(range_tag[: -len("_tokens")])
+            if range_tag.endswith(".fc2_tokens"):
+                candidates.append(range_tag[: -len("_tokens")])
+            if range_tag.endswith(".av_matmul"):
+                candidates.append(
+                    range_tag[: -len("av_matmul")] + "attn"
+                )
+            if range_tag.endswith(".q_matmul_input"):
+                prefix = range_tag[: -len(".q_matmul_input")]
+                candidates.append(
+                    f"{prefix}.q_rope" if config.use_rope else f"{prefix}.q"
+                )
+            for candidate in candidates:
+                if candidate in ranges:
+                    return candidate, ranges[candidate]
+            if range_tag.endswith(".qk_matmul") or ".qk_matmul.h" in range_tag:
+                score_tag = (
+                    range_tag.split(".qk_matmul", 1)[0] + ".attn_scores"
+                )
+                if score_tag in ranges:
+                    qmin, qmax = ranges[score_tag]
+                    scale = 1.0 / math.sqrt(config.head_dim)
+                    return score_tag, (qmin / scale, qmax / scale)
+            return None
 
+        per_row_attention_configs: dict[
+            str, tuple[list[float], list[float]]
+        ] = {}
+        if per_channel_qk:
+            expected_rows = config.num_attention_heads * config.seq_len
+            attention_scale_value = 1.0 / math.sqrt(config.head_dim)
+            for layer_id in range(config.num_hidden_layers):
+                qk_tag = f"layers.{layer_id}.qk_matmul"
+                qk_name = symbol_map[qk_tag]
+                qk_range_tag = (
+                    f"layers.{layer_id}.attn_scores.rows"
+                    if fold_attention_scale_into_q
+                    else f"layers.{layer_id}.qk_matmul.rows"
+                )
+                if qk_range_tag not in loaded_row_ranges:
+                    raise KeyError(
+                        "--per-channel-qk now requires true H*S row ranges; "
+                        f"missing {qk_range_tag}. Regenerate --range-json with "
+                        "the current Vit.py --dump-minmax-json."
+                    )
+                qk_min, qk_max = loaded_row_ranges[qk_range_tag]
+                if len(qk_min) != expected_rows:
+                    raise ValueError(
+                        f"{qk_range_tag}: got {len(qk_min)} rows, expected "
+                        f"H*S={config.num_attention_heads}*"
+                        f"{config.seq_len}={expected_rows}"
+                    )
+                if qk_range_floor > 0.0:
+                    qk_head_stem = (
+                        f"layers.{layer_id}.attn_scores"
+                        if fold_attention_scale_into_q
+                        else f"layers.{layer_id}.qk_matmul"
+                    )
+                    for head_id in range(config.num_attention_heads):
+                        start = head_id * config.seq_len
+                        end = start + config.seq_len
+                        qk_head_min, qk_head_max = ranges[
+                            f"{qk_head_stem}.h{head_id:02d}"
+                        ]
+                        qk_floor_min = qk_head_min * qk_range_floor
+                        qk_floor_max = qk_head_max * qk_range_floor
+                        qk_min[start:end] = [
+                            min(value, qk_floor_min)
+                            for value in qk_min[start:end]
+                        ]
+                        qk_max[start:end] = [
+                            max(value, qk_floor_max)
+                            for value in qk_max[start:end]
+                        ]
+                if qk_max_requant_multiplier is not None:
+                    # MatMul's INT32 accumulator represents one integer step
+                    # as Q_scale*K_scale. gemmlowp's
+                    # QuantizeMultiplierSmallerThanOne requires the output
+                    # postscale multiplier to be strictly below one. Expand
+                    # ranges whose multiplier exceeds the requested limit,
+                    # preserving each range's min/max ratio and zero point.
+                    # The default 0.99 leaves an explicit margin for float32
+                    # range/qscale round trips during FB serialization.
+                    q_input_tag = (
+                        f"layers.{layer_id}.q_rope"
+                        if config.use_rope
+                        else f"layers.{layer_id}.q"
+                    )
+                    k_input_tag = (
+                        f"layers.{layer_id}.k_rope"
+                        if config.use_rope
+                        else f"layers.{layer_id}.k"
+                    )
+                    q_input_min, q_input_max = ranges[q_input_tag]
+                    k_input_min, k_input_max = ranges[k_input_tag]
+                    if fold_attention_scale_into_q:
+                        q_input_min *= attention_scale_value
+                        q_input_max *= attention_scale_value
+                    accumulator_scale = (
+                        (q_input_max - q_input_min)
+                        * (k_input_max - k_input_min)
+                        / (255.0 * 255.0)
+                    )
+                    minimum_row_scale = float(
+                        np.nextafter(
+                            np.float32(
+                                accumulator_scale
+                                / qk_max_requant_multiplier
+                            ),
+                            np.float32(np.inf),
+                        )
+                    )
+                    qk_min_array = np.asarray(qk_min, dtype=np.float64)
+                    qk_max_array = np.asarray(qk_max, dtype=np.float64)
+                    row_scales = (qk_max_array - qk_min_array) / 255.0
+                    expand_mask = row_scales < minimum_row_scale
+                    expanded_rows = int(np.count_nonzero(expand_mask))
+                    maximum_multiplier_before = float(
+                        np.max(accumulator_scale / row_scales)
+                    )
+                    if expanded_rows:
+                        factors = np.ones_like(row_scales)
+                        factors[expand_mask] = (
+                            minimum_row_scale / row_scales[expand_mask]
+                        )
+                        qk_min_array *= factors
+                        qk_max_array *= factors
+                        qk_min = qk_min_array.astype(np.float32).tolist()
+                        qk_max = qk_max_array.astype(np.float32).tolist()
+                    maximum_multiplier_after = float(
+                        np.max(
+                            accumulator_scale
+                            / ((qk_max_array - qk_min_array) / 255.0)
+                        )
+                    )
+                    print(
+                        f"[QK-SCALE-FLOOR] layer={layer_id:02d} "
+                        f"expanded={expanded_rows}/{expected_rows} "
+                        f"max_multiplier={maximum_multiplier_before:.6g}->"
+                        f"{maximum_multiplier_after:.6g}"
+                    )
+                per_row_attention_configs[qk_name] = (qk_max, qk_min)
+                # Do not calibrate this from an independent observation: this
+                # is precisely the qinfo transform performed by the scalar
+                # baseline Requant. Keeping it derived from QK makes the
+                # 256-entry LUT an exact identity map for every score row
+                # while its decoded value is /sqrt(head_dim).
+                score_name = symbol_map[f"layers.{layer_id}.attn_scores"]
+                per_row_attention_configs[score_name] = (
+                    [value * attention_scale_value for value in qk_max],
+                    [value * attention_scale_value for value in qk_min],
+                )
+
+        for tag, actual in symbol_map.items():
+            # The same QK symbol is also tagged as attn_scores in the folded
+            # graph. Do not overwrite its vector qinfo with a scalar range.
+            if actual in per_row_attention_configs:
+                continue
+            resolved_range = range_for_graph_tag(tag)
+            if resolved_range is not None:
+                range_tag, (qmin, qmax) = resolved_range
+                if fold_attention_scale_into_q and (
+                    tag.endswith(".q")
+                    or tag.endswith(".q_rope")
+                    or tag.endswith(".q_matmul_input")
+                ):
+                    qmin *= attention_scale_value
+                    qmax *= attention_scale_value
+                if not ctx.AddInt8Config(actual, float(qmax), float(qmin)):
+                    raise RuntimeError(
+                        f"failed to add int8 config for {tag} "
+                        f"(range {range_tag}) -> {actual}"
+                    )
+        for actual, (row_max, row_min) in per_row_attention_configs.items():
+            if not ctx.AddInt8ConfigPerChannel(actual, row_max, row_min):
+                raise RuntimeError(
+                    "failed to add per-row attention int8 config for "
+                    f"{actual} ({len(row_max)} rows)"
+                )
+        if per_channel_qk:
+            # Softmax still needs one ordinary output qinfo (registered above)
+            # plus the UINT8 dtype contract. AttnSoftmaxImpl then derives the
+            # H*S probability-row qinfo online; do not register H*S static
+            # output ranges with AddInt8ConfigPerChannel.
+            ctx.Modify(
+                {
+                    "AddOnPass": [],
+                    "DeleteLayer": [],
+                    "Layer": [
+                        {
+                            "layerName": symbol_map[
+                                f"layers.{layer_id}.attn_probs"
+                            ],
+                            "outputDataType": "TFDtypeUint8",
+                        }
+                        for layer_id in range(config.num_hidden_layers)
+                    ],
+                }
+            )
     executor = None
     if create_executor:
         executor = TFExecutor(
@@ -1919,6 +2811,90 @@ def build_vit_tfdl_graph(
                 "optimize": {"AttnSoftmaxImpl": True},
             },
         )
+    # Full Quant uses this set as an optimization fence. QuantizeLite does not
+    # rewrite the graph, but sharing the metadata keeps both paths auditable.
+    source_float_tags: set[str] = {
+        "patch.tokens",
+        "prefix_concat",
+        "add_position_embeddings",
+        "tokens.scaled",
+        "tokens",
+        "final_norm",
+        "output.cls",
+    }
+    for layer_id in range(config.num_hidden_layers):
+        prefix = f"layers.{layer_id}"
+        source_float_tags.update(
+            {
+                f"{prefix}.norm1",
+                f"{prefix}.proj_tokens.dequantized",
+                f"{prefix}.resid1",
+                f"{prefix}.norm2",
+                f"{prefix}.fc2_tokens.dequantized",
+                f"{prefix}.resid2",
+            }
+        )
+        if layer_id in fp_attn_layer_set:
+            source_float_tags.update(
+                {
+                    f"{prefix}.attn.dequantized",
+                    f"{prefix}.proj",
+                    f"{prefix}.proj_tokens",
+                    f"{prefix}.proj.scaled",
+                }
+            )
+        if layer_id in fp_mlp_layer_set:
+            source_float_tags.update(
+                {
+                    f"{prefix}.fc1",
+                    f"{prefix}.gate",
+                    f"{prefix}.gate_act",
+                    f"{prefix}.up",
+                    f"{prefix}.mlp_mid",
+                    f"{prefix}.fc2",
+                    f"{prefix}.fc2_tokens",
+                }
+            )
+    ctx.source_float_tensors = tuple(
+        dict.fromkeys(
+            symbol_map[tag]
+            for tag in source_float_tags
+            if tag in symbol_map
+        )
+    )
+    if (
+        explicit_qdq
+        and fp16_export
+        and not attention_scale_requant
+        and not per_channel_qk
+        and not fold_attention_scale_into_q
+    ):
+        ctx.source_float_tensors += tuple(
+            str(ctx.GetParamSymbol(f"layers.{layer_id}.attn_scale"))
+            for layer_id in range(config.num_hidden_layers)
+        )
+    # These entries are needed only by full Quant, which receives a dtype map
+    # in addition to the explicit graph. QuantizeLite uses the source Quantize
+    # nodes constructed above instead.
+    ctx.quant_entry_tensors = tuple(
+        dict.fromkeys(
+            [
+                symbol_map[f"layers.{layer_id}.norm1"]
+                for layer_id in range(config.num_hidden_layers)
+            ]
+            + [
+                symbol_map[f"layers.{layer_id}.norm2"]
+                for layer_id in range(config.num_hidden_layers)
+                if layer_id not in fp_mlp_layer_set
+            ]
+        )
+    ) if explicit_qdq else ()
+    # Full Quant needs the floating side of each DeQuantize as an optimization
+    # fence. QuantizeLite must *not* receive this list: although it preserves
+    # the source operators, its stop handling inserts another DeQuantize after
+    # an already-explicit DQ (mixed-case source name followed by an uppercase
+    # generated name).
+    ctx.float_entry_tensors = tuple(dict.fromkeys(float_entry_tensors))
     return ctx, executor, [input_name], output_names, symbol_map
 
 
@@ -1937,7 +2913,17 @@ def quantize_with_ranges(
     *,
     extra_stopquanttensors: tuple[str, ...] = (),
     avoidtensors: tuple[str, ...] = (),
+    convert_float_to_fp16: bool = False,
+    quantize_lite: bool = False,
 ) -> None:
+    """Encode a range-annotated graph without changing its precision plan.
+
+    Prefer ``quantize_lite=True`` for source FP16 DeQuantize graphs.  The full
+    Quant pass is retained for older FP32 flows because it can discover and
+    fold additional scalar operations, but the current SDK rejects FP16 DQ
+    destinations during that optimization.  Attention scaling is already a
+    source Requant in the Lite flow, so the important fold is not lost.
+    """
     from TFDL2 import TFCalibration, CalibrationMode
     from TFDL2.Common import TFDataType
 
@@ -1950,13 +2936,50 @@ def quantize_with_ranges(
             "optimize": {"AttnSoftmaxImpl": True},
         },
     )
-    calib.Quantize(
-        {name: TFDataType.TFDL_UINT8 for name in input_names},
-        stopquanttensors=tuple(output_names) + tuple(extra_stopquanttensors),
-        avoidtensors=tuple(avoidtensors),
+    if quantize_lite:
+        # QuantizeLite preserves the graph. Source Quantize operators define
+        # every UINT8 entry, so the externally supplied image remains float.
+        quant_inputs = {
+            name: TFDataType.TFDL_FLOAT for name in tuple(input_names)
+        }
+    else:
+        quant_inputs = {
+            name: TFDataType.TFDL_UINT8
+            for name in (
+                tuple(input_names)
+                + tuple(getattr(ctx, "quant_entry_tensors", ()))
+            )
+        }
+    quantize = calib.QuantizeLite if quantize_lite else calib.Quantize
+    # MergeConcate=False is intentional. Prefix/register/patch tokens and some
+    # experimental per-head tensors can have very different distributions;
+    # one merged range saves conversions but is a common source of accuracy
+    # loss. Benchmark it explicitly before enabling.
+    float_stops = (
+        ()
+        if quantize_lite
+        else tuple(getattr(ctx, "float_entry_tensors", ()))
+    )
+    quantize(
+        quant_inputs,
+        stopquanttensors=(
+            tuple(output_names)
+            + tuple(extra_stopquanttensors)
+            + float_stops
+        ),
+        avoidtensors=tuple(
+            dict.fromkeys(
+                tuple(avoidtensors)
+                + tuple(getattr(ctx, "source_float_tensors", ()))
+            )
+        ),
         MergeConcate=False,
         Perchannel=True,
     )
+    if convert_float_to_fp16:
+        # Kept for legacy callers only. New explicit-Q/DQ builds choose FP16
+        # parameters and DQ destinations while constructing the source graph.
+        calib.ConvertCalibrationFp32ToFp16()
     ctx.SetOutputs(output_names)
     if output is not None:
         dump_context(ctx, output)
@@ -1976,16 +2999,6 @@ def _range_item(
     if not np.isfinite(qmin) or not np.isfinite(qmax) or qmin >= qmax:
         raise ValueError(f"invalid range for {name}: min={qmin}, max={qmax}")
     return qmin, qmax
-
-
-def _modify_range_strings(
-    ranges: dict[str, Any],
-    name: str,
-) -> tuple[list[str], list[str]]:
-    qmin, qmax = _range_item(ranges, name)
-    # Modify's JSON parser expects strings here. Numeric arrays may parse but
-    # have historically produced a zero qscale for inserted Quantize nodes.
-    return [repr(qmin)], [repr(qmax)]
 
 
 def select_outlier_branches(
@@ -2030,442 +3043,6 @@ def select_outlier_branches(
         ],
         "ranking": candidates,
     }
-
-
-def apply_outlier_bypass_modify(
-    ctx: Any,
-    config: ViTOpConfig,
-    weights: dict[str, np.ndarray],
-    range_json: str | Path,
-    symbol_map: dict[str, str],
-    *,
-    top_k: int,
-    fp16_export: bool = False,
-    fp16_residual_scale: float = 1.0,
-    dump_modify_json: str | Path | None = None,
-    dump_bypass_report_json: str | Path | None = None,
-) -> dict[str, Any]:
-    """Post-quant Modify: INT8 branches, floating residuals and Top-K bypass.
-
-    The quantizer runs before this function. Selected Attention candidates
-    bypass only the output projection; selected MLP candidates bypass the
-    complete MLP. This preserves INT8 QKV/Softmax/AV work on the NPU.
-    """
-    if config.prefix_len <= 0:
-        raise ValueError("mixed Attention/MLP profile requires prefix tokens")
-
-    ranges = json.loads(Path(range_json).read_text())
-    report = select_outlier_branches(config, range_json, top_k)
-    fp_attn_layers = frozenset(report["fp_attn_layers"])
-    fp_mlp_layers = frozenset(report["fp_mlp_layers"])
-    if fp16_export:
-        fp16_limit = float(np.finfo(np.float16).max)
-        fp16_tags = ["tokens"]
-        for layer_id in range(config.num_hidden_layers):
-            prefix = f"layers.{layer_id}"
-            fp16_tags.extend(
-                (
-                    f"{prefix}.proj",
-                    f"{prefix}.resid1",
-                    f"{prefix}.fc2",
-                    f"{prefix}.resid2",
-                )
-            )
-        overflow = []
-        for tag in fp16_tags:
-            if tag not in ranges:
-                continue
-            qmin, qmax = _range_item(ranges, tag)
-            absolute = max(abs(qmin), abs(qmax))
-            if absolute > fp16_limit:
-                overflow.append((tag, absolute))
-        if overflow:
-            details = ", ".join(
-                f"{tag}={absolute:.6g}"
-                for tag, absolute in sorted(
-                    overflow, key=lambda item: item[1], reverse=True
-                )[:8]
-            )
-            raise ValueError(
-                "FP16 residual/branch range exceeds 65504; regenerate the "
-                "range JSON with the FP16 residual reparameterization enabled. "
-                f"Offenders: {details}"
-            )
-    branch_dtype = "TFDtypeFp16" if fp16_export else "TFDtypeFp32"
-    param_dtype = np.float16 if fp16_export else np.float32
-    dequant_options: dict[str, Any] = (
-        {"param": {"dstType": "TFDtypeFp16"}} if fp16_export else {}
-    )
-    float_param_names: set[str] = {"prefix_tokens"}
-    layers: list[dict[str, Any]] = []
-
-    def symbol(tag: str) -> str:
-        if tag not in symbol_map:
-            raise KeyError(
-                f"symbol map is missing {tag!r}; this profile is incompatible "
-                "with the selected graph transformation options"
-            )
-        return symbol_map[tag]
-
-    patch_tokens = symbol("patch.tokens")
-    prefix_concat = symbol("prefix_concat")
-    dequant_patch = "PostDeQuant_PatchTokens"
-    layers.extend(
-        (
-            {
-                "input": [patch_tokens],
-                "layerName": dequant_patch,
-                "layerType": "DeQuantize",
-                "output": [dequant_patch],
-                **dequant_options,
-            },
-            {
-                "input": ["PostFP.prefix_tokens", dequant_patch],
-                "layerName": prefix_concat,
-                "outputDataType": branch_dtype,
-            },
-        )
-    )
-
-    first_hidden = prefix_concat
-    tokens = symbol("tokens")
-    if config.use_position_embeddings:
-        float_param_names.add("pos_embed")
-        layers.append(
-            {
-                "input": [prefix_concat, "PostFP.pos_embed"],
-                "layerName": tokens,
-                "outputDataType": branch_dtype,
-            }
-        )
-        first_hidden = tokens
-    elif tokens != prefix_concat:
-        raise ValueError(
-            "Top-K bypass currently requires --register-residual-scale=1 for "
-            "DINOv3 so the prefix concat is the first block input"
-        )
-
-    for layer_id in range(config.num_hidden_layers):
-        prefix = f"layers.{layer_id}"
-        hidden = (
-            first_hidden
-            if layer_id == 0
-            else symbol(f"layers.{layer_id - 1}.resid2")
-        )
-        norm1 = symbol(f"{prefix}.norm1")
-        norm1_transposed = symbol(f"{prefix}.norm1_transposed")
-        quant_norm1 = f"PostQuant_AttnInput_{layer_id}"
-        norm1_min, norm1_max = _modify_range_strings(
-            ranges, f"{prefix}.norm1"
-        )
-        attn = symbol(f"{prefix}.attn")
-        proj = symbol(f"{prefix}.proj")
-        proj_tokens = symbol(f"{prefix}.proj_tokens")
-        resid1 = symbol(f"{prefix}.resid1")
-        norm2 = symbol(f"{prefix}.norm2")
-        norm2_transposed = symbol(f"{prefix}.norm2_transposed")
-        norm2_conv_input = symbol(f"{prefix}.norm2_conv_input")
-        quant_norm2 = f"PostQuant_MLPInput_{layer_id}"
-        norm2_min, norm2_max = _modify_range_strings(
-            ranges, f"{prefix}.norm2"
-        )
-        fc2 = symbol(f"{prefix}.fc2")
-        fc2_tokens = symbol(f"{prefix}.fc2_tokens")
-        resid2 = symbol(f"{prefix}.resid2")
-
-        layers.extend(
-            (
-                {
-                    "input": [
-                        hidden,
-                        f"{prefix}.norm1.weight",
-                        f"{prefix}.norm1.bias",
-                    ],
-                    "layerName": norm1,
-                    "outputDataType": branch_dtype,
-                },
-                {
-                    "input": [norm1],
-                    "layerName": quant_norm1,
-                    "layerType": "Quantize",
-                    "output": [quant_norm1],
-                    "outputDataType": "TFDtypeUint8",
-                    "OutDataMin": norm1_min,
-                    "OutDataMax": norm1_max,
-                },
-                {
-                    "input": [quant_norm1],
-                    "layerName": norm1_transposed,
-                    "outputDataType": "TFDtypeUint8",
-                },
-            )
-        )
-
-        if layer_id in fp_attn_layers:
-            dequant_attn = f"PostDeQuant_AttnCore_{layer_id}"
-            float_param_names.update(
-                (f"{prefix}.proj.weight", f"{prefix}.proj.bias")
-            )
-            layers.extend(
-                (
-                    {
-                        "input": [attn],
-                        "layerName": dequant_attn,
-                        "layerType": "DeQuantize",
-                        "output": [dequant_attn],
-                        **dequant_options,
-                    },
-                    {
-                        "input": [
-                            dequant_attn,
-                            f"PostFP.{prefix}.proj.weight",
-                            f"PostFP.{prefix}.proj.bias",
-                        ],
-                        "layerName": proj,
-                        "outputDataType": branch_dtype,
-                    },
-                    {
-                        "layerName": proj_tokens,
-                        "outputDataType": branch_dtype,
-                    },
-                )
-            )
-            attn_residual_input = proj_tokens
-        else:
-            dequant_proj = f"PostDeQuant_AttnOutput_{layer_id}"
-            layers.append(
-                {
-                    "input": [proj_tokens],
-                    "layerName": dequant_proj,
-                    "layerType": "DeQuantize",
-                    "output": [dequant_proj],
-                    **dequant_options,
-                }
-            )
-            attn_residual_input = dequant_proj
-
-        layers.extend(
-            (
-                {
-                    "input": [hidden, attn_residual_input],
-                    "layerName": resid1,
-                    "outputDataType": branch_dtype,
-                },
-                {
-                    "input": [
-                        resid1,
-                        f"{prefix}.norm2.weight",
-                        f"{prefix}.norm2.bias",
-                    ],
-                    "layerName": norm2,
-                    "outputDataType": branch_dtype,
-                },
-            )
-        )
-
-        if layer_id in fp_mlp_layers:
-            # Keep LayerNorm computation in FP32. The Transpose output is the
-            # explicit FP32->FP16 boundary when --fp16-export is enabled.
-            layers.extend(
-                (
-                    {
-                        "input": [norm2],
-                        "layerName": norm2_transposed,
-                        "outputDataType": branch_dtype,
-                    },
-                    {
-                        "layerName": norm2_conv_input,
-                        "outputDataType": branch_dtype,
-                    },
-                )
-            )
-            if config.use_gated_mlp:
-                gate = symbol(f"{prefix}.gate")
-                gate_act = symbol(f"{prefix}.gate_act")
-                up = symbol(f"{prefix}.up")
-                mlp_mid = symbol(f"{prefix}.mlp_mid")
-                for stem in ("gate", "up", "fc2"):
-                    float_param_names.update(
-                        (
-                            f"{prefix}.{stem}.weight",
-                            f"{prefix}.{stem}.bias",
-                        )
-                    )
-                layers.extend(
-                    (
-                        {
-                            "input": [
-                                norm2_conv_input,
-                                f"PostFP.{prefix}.gate.weight",
-                                f"PostFP.{prefix}.gate.bias",
-                            ],
-                            "layerName": gate,
-                            "outputDataType": branch_dtype,
-                        },
-                        {
-                            "input": [gate],
-                            "layerName": gate_act,
-                            "outputDataType": branch_dtype,
-                        },
-                        {
-                            "input": [
-                                norm2_conv_input,
-                                f"PostFP.{prefix}.up.weight",
-                                f"PostFP.{prefix}.up.bias",
-                            ],
-                            "layerName": up,
-                            "outputDataType": branch_dtype,
-                        },
-                        {
-                            "input": [gate_act, up],
-                            "layerName": mlp_mid,
-                            "outputDataType": branch_dtype,
-                        },
-                    )
-                )
-                mlp_input = mlp_mid
-            else:
-                fc1 = symbol(f"{prefix}.fc1")
-                mlp_mid = symbol(f"{prefix}.mlp_mid")
-                float_param_names.update(
-                    (
-                        f"{prefix}.fc1.weight",
-                        f"{prefix}.fc1.bias",
-                        f"{prefix}.fc2.weight",
-                        f"{prefix}.fc2.bias",
-                    )
-                )
-                layers.extend(
-                    (
-                        {
-                            "input": [
-                                norm2_conv_input,
-                                f"PostFP.{prefix}.fc1.weight",
-                                f"PostFP.{prefix}.fc1.bias",
-                            ],
-                            "layerName": fc1,
-                            "outputDataType": branch_dtype,
-                        },
-                        {
-                            "input": [fc1],
-                            "layerName": mlp_mid,
-                            "outputDataType": branch_dtype,
-                        },
-                    )
-                )
-                mlp_input = mlp_mid
-            layers.extend(
-                (
-                    {
-                        "input": [
-                            mlp_input,
-                            f"PostFP.{prefix}.fc2.weight",
-                            f"PostFP.{prefix}.fc2.bias",
-                        ],
-                        "layerName": fc2,
-                        "outputDataType": branch_dtype,
-                    },
-                    {
-                        "layerName": fc2_tokens,
-                        "outputDataType": branch_dtype,
-                    },
-                )
-            )
-            mlp_residual_input = fc2_tokens
-        else:
-            dequant_mlp = f"PostDeQuant_MLPOutput_{layer_id}"
-            layers.extend(
-                (
-                    {
-                        "input": [norm2],
-                        "layerName": quant_norm2,
-                        "layerType": "Quantize",
-                        "output": [quant_norm2],
-                        "outputDataType": "TFDtypeUint8",
-                        "OutDataMin": norm2_min,
-                        "OutDataMax": norm2_max,
-                    },
-                    {
-                        "input": [quant_norm2],
-                        "layerName": norm2_transposed,
-                        "outputDataType": "TFDtypeUint8",
-                    },
-                    {
-                        "input": [fc2_tokens],
-                        "layerName": dequant_mlp,
-                        "layerType": "DeQuantize",
-                        "output": [dequant_mlp],
-                        **dequant_options,
-                    },
-                )
-            )
-            mlp_residual_input = dequant_mlp
-
-        resid2_base = resid1
-        resid2_base_tag = f"{prefix}.resid2_base_scaled"
-        if resid2_base_tag in symbol_map:
-            resid2_base = symbol(resid2_base_tag)
-            scale_weight = "fp16_residual_scale.weight"
-            scale_bias = "fp16_residual_scale.bias"
-            float_param_names.update((scale_weight, scale_bias))
-            layers.append(
-                {
-                    "input": [
-                        resid1,
-                        f"PostFP.{scale_weight}",
-                        f"PostFP.{scale_bias}",
-                    ],
-                    "layerName": resid2_base,
-                    "outputDataType": branch_dtype,
-                }
-            )
-
-        layers.append(
-            {
-                "input": [resid2_base, mlp_residual_input],
-                "layerName": resid2,
-                "outputDataType": branch_dtype,
-            }
-        )
-
-    final_norm = symbol("final_norm")
-    final_hidden = symbol(
-        f"layers.{config.num_hidden_layers - 1}.resid2"
-    )
-    layers.append(
-        {
-            "input": [final_hidden, "norm.weight", "norm.bias"],
-            "layerName": final_norm,
-            "outputDataType": branch_dtype,
-        }
-    )
-
-    restored_params = {
-        f"PostFP.{name}": np.ascontiguousarray(weights[name], dtype=param_dtype)
-        for name in sorted(float_param_names)
-    }
-    ctx.RegisterParamToContext(**restored_params)
-    modify = {"AddOnPass": [], "DeleteLayer": [], "Layer": layers}
-    ctx.Modify(modify)
-
-    report.update(
-        {
-            "fp16_export": bool(fp16_export),
-            "fp16_residual_scale": float(fp16_residual_scale),
-            "restored_param_dtype": str(np.dtype(param_dtype)),
-            "restored_params": sorted(restored_params),
-            "modified_layer_entries": len(layers),
-        }
-    )
-    if dump_modify_json:
-        Path(dump_modify_json).write_text(
-            json.dumps(modify, indent=2, sort_keys=True)
-        )
-    if dump_bypass_report_json:
-        Path(dump_bypass_report_json).write_text(
-            json.dumps(report, indent=2, sort_keys=True)
-        )
-    return report
 
 
 def build_arg_parser(default_arch: str | None = None) -> argparse.ArgumentParser:
@@ -2548,22 +3125,47 @@ def build_arg_parser(default_arch: str | None = None) -> argparse.ArgumentParser
     parser.add_argument("--range-json", default=None, help="Existing min/max JSON to map to TFDL AddInt8Config")
     parser.add_argument("--dump-fb", default=None)
     parser.add_argument("--dump-quant-fb", default=None)
+    parser.add_argument(
+        "--conv-native-layout",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Keep the residual stream as [B,C,N], use LayerNorm2(axis=1), "
+            "and let ApplyRope consume Conv-native [B,H,D,N] inputs while "
+            "emitting Q=[B,H,N,D], K=[B,H,D,N]. MatMul trans flags remain "
+            "disabled for NPU compatibility. Enabled by default; use "
+            "--no-conv-native-layout for the legacy [B,N,C] graph."
+        ),
+    )
+    parser.add_argument(
+        "--quantize-lite",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Use QuantizeLite and keep the explicit source Q/DQ topology. "
+            "The attention 1/sqrt(head_dim) scalar is emitted as Requantize. "
+            "Enabled by default when --dump-quant-fb is requested."
+        ),
+    )
     parser.add_argument("--dump-symbol-map", default=None)
     parser.add_argument(
         "--outlier-bypass-top-k",
         type=int,
-        default=0,
+        default=None,
         help=(
-            "After quantization, globally rank Attention proj and MLP fc2 "
-            "merge ranges and bypass INT8 for the largest K branches."
+            "Globally rank Attention proj and MLP fc2 merge ranges, then "
+            "build the largest K branches as explicit floating source islands. "
+            "Default: 1 for quantized export, otherwise 0."
         ),
     )
     parser.add_argument(
         "--fp16-export",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help=(
-            "Use FP16 for post-quant DeQuant destinations, prefix parameters "
-            "and restored Top-K branch parameters/outputs."
+            "Build the floating source islands, residual path, and DeQuantize "
+            "destinations as FP16 while retaining LayerNorm parameters in FP32. "
+            "Enabled by default when --dump-quant-fb is requested."
         ),
     )
     parser.add_argument(
@@ -2579,7 +3181,10 @@ def build_arg_parser(default_arch: str | None = None) -> argparse.ArgumentParser
     parser.add_argument(
         "--dump-modify-json",
         default=None,
-        help="Optional path for the generated post-quant Modify JSON",
+        help=(
+            "Compatibility alias: dump the explicit source Q/DQ precision "
+            "plan (no Modify call is generated)."
+        ),
     )
     parser.add_argument(
         "--dump-bypass-report-json",
@@ -2614,6 +3219,49 @@ def build_arg_parser(default_arch: str | None = None) -> argparse.ArgumentParser
         help=(
             "Run each attention head's QK/Softmax/AV path separately so all "
             "activation MatMuls and Softmax tensors get per-head INT8 scales."
+        ),
+    )
+    parser.add_argument(
+        "--per-channel-qk",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Keep all heads in one QK MatMul and register true H*S per-row "
+            "ranges for QK output. Requires a range JSON regenerated by the "
+            "current Vit.py. QK then uses an identity UINT8 Requantize whose "
+            "H*S output qinfo is the QK qinfo divided by sqrt(head_dim), "
+            "before UINT8 Softmax. Enabled by default when --dump-quant-fb "
+            "is requested."
+        ),
+    )
+    parser.add_argument(
+        "--fold-attention-scale-into-q",
+        action="store_true",
+        help=(
+            "Multiply every Q projection weight/bias and Q activation range "
+            "by 1/sqrt(head_dim), then connect QK UINT8 directly to Softmax "
+            "without Requant/DeQuant/Div. Can be used with scalar or H*S QK."
+        ),
+    )
+    parser.add_argument(
+        "--per-row-attention-range-floor",
+        type=float,
+        default=0.0,
+        help=(
+            "Expand each QK H*S row range to cover at least this fraction of "
+            "its calibrated per-head range. Softmax output keeps scalar "
+            "qinfo because AttnSoftmaxImpl quantizes it online."
+        ),
+    )
+    parser.add_argument(
+        "--per-channel-qk-max-requant-multiplier",
+        type=float,
+        default=0.99,
+        help=(
+            "Maximum Q_scale*K_scale/QK_row_scale allowed for H*S QK. "
+            "Rows exceeding this value are expanded about zero while "
+            "preserving their min/max ratio. Default: 0.99, keeping the "
+            "gemmlowp multiplier strictly below one after float32 rounding."
         ),
     )
     parser.add_argument(
@@ -2674,8 +3322,29 @@ def _method_output_path(
     )
 
 
+def _resolve_npu_default_profile(args: argparse.Namespace) -> argparse.Namespace:
+    """Apply the validated high-accuracy defaults to quantized exports."""
+    # Resolve the profile only for model export so calibration-only and
+    # external-model comparison commands do not accidentally require a
+    # quantized output path. BooleanOptionalAction retains explicit --no-*
+    # escape hatches for legacy/ablation graphs.
+    quant_export_requested = args.dump_quant_fb is not None
+    if args.quantize_lite is None:
+        args.quantize_lite = quant_export_requested
+    if args.fp16_export is None:
+        args.fp16_export = quant_export_requested
+    if args.per_channel_qk is None:
+        args.per_channel_qk = quant_export_requested
+    if args.outlier_bypass_top_k is None:
+        args.outlier_bypass_top_k = 1 if quant_export_requested else 0
+    return args
+
+
 def main(argv: list[str] | None = None, default_arch: str | None = None) -> None:
-    args = build_arg_parser(default_arch).parse_args(argv)
+    args = _resolve_npu_default_profile(
+        build_arg_parser(default_arch).parse_args(argv)
+    )
+
     if not (0.0 < float(args.register_residual_scale) <= 1.0):
         raise ValueError("--register-residual-scale must be in (0, 1]")
     if float(args.stable_attention_window) < 0.0:
@@ -2683,6 +3352,22 @@ def main(argv: list[str] | None = None, default_arch: str | None = None) -> None
     if args.stable_attention_window and not args.split_attention_heads:
         raise ValueError(
             "--stable-attention-window currently requires --split-attention-heads"
+        )
+    if args.per_channel_qk and args.split_attention_heads:
+        raise ValueError(
+            "--per-channel-qk and --split-attention-heads are mutually "
+            "exclusive"
+        )
+    if args.per_channel_qk and not args.quantize_lite:
+        raise ValueError("--per-channel-qk currently requires --quantize-lite")
+    if not 0.0 <= args.per_row_attention_range_floor <= 1.0:
+        raise ValueError("--per-row-attention-range-floor must be in [0, 1]")
+    if args.per_channel_qk_max_requant_multiplier is not None and (
+        not np.isfinite(args.per_channel_qk_max_requant_multiplier)
+        or args.per_channel_qk_max_requant_multiplier <= 0.0
+    ):
+        raise ValueError(
+            "--per-channel-qk-max-requant-multiplier must be positive"
         )
     if args.outlier_bypass_top_k < 0:
         raise ValueError("--outlier-bypass-top-k must be non-negative")
@@ -2703,7 +3388,7 @@ def main(argv: list[str] | None = None, default_arch: str | None = None) -> None
         and args.split_mlp_token_groups
     ):
         raise ValueError(
-            "Top-K post-quant bypass is incompatible with "
+            "Top-K source mixed precision is incompatible with "
             "--split-mlp-token-groups"
         )
     range_methods = list(
@@ -2728,13 +3413,19 @@ def main(argv: list[str] | None = None, default_arch: str | None = None) -> None
         )
 
     config = ViTOpConfig.from_model_path(args.model_path, args.arch, image_size=args.image_size)
-    fp16_residual_scale = 1.0
-    if args.fp16_export:
-        fp16_residual_scale = (
-            float(args.fp16_residual_scale)
-            if args.fp16_residual_scale is not None
-            else (0.25 if config.num_register_tokens else 1.0)
+    # An explicitly requested residual reparameterization must also apply to
+    # calibration-only runs. Previously --fp16-residual-scale was silently
+    # ignored unless --fp16-export was present, so a separately generated
+    # range JSON described scale=1 while the later FP16 graph used scale=.25.
+    fp16_residual_scale = (
+        float(args.fp16_residual_scale)
+        if args.fp16_residual_scale is not None
+        else (
+            0.25
+            if args.fp16_export and config.num_register_tokens
+            else 1.0
         )
+    )
     raw = load_safetensors(args.model_path)
     weights = canonicalize_weights(raw, config)
     apply_fp16_residual_reparameterization(
@@ -2756,6 +3447,7 @@ def main(argv: list[str] | None = None, default_arch: str | None = None) -> None
             compare_tfdl_fp=args.compare_tfdl_fp,
             addon_path=args.addon_path,
             fp16_residual_scale=fp16_residual_scale,
+            conv_native_layout=args.conv_native_layout,
         )
 
     needs_graph = bool(
@@ -2794,6 +3486,28 @@ def main(argv: list[str] | None = None, default_arch: str | None = None) -> None
 
         if not needs_graph:
             continue
+        explicit_qdq = bool(args.outlier_bypass_top_k or args.fp16_export)
+        if args.quantize_lite and not explicit_qdq:
+            raise ValueError(
+                "--quantize-lite currently requires --fp16-export or "
+                "--outlier-bypass-top-k so all INT8/float boundaries are "
+                "explicit in the source graph"
+            )
+        if args.fp16_export and not args.quantize_lite:
+            raise ValueError(
+                "the current SDK full Quantize pass rejects source "
+                "DeQuantize(dstType=FP16); use --quantize-lite, which keeps "
+                "the explicit source topology"
+            )
+        bypass_report = (
+            select_outlier_branches(
+                config,
+                range_json,
+                args.outlier_bypass_top_k,
+            )
+            if explicit_qdq
+            else None
+        )
         ctx, _, input_names, output_names, symbol_map = build_vit_tfdl_graph(
             config,
             weights,
@@ -2803,6 +3517,31 @@ def main(argv: list[str] | None = None, default_arch: str | None = None) -> None
             split_mlp_token_groups=args.split_mlp_token_groups,
             split_attention_heads=args.split_attention_heads,
             stable_attention_window=args.stable_attention_window,
+            explicit_qdq=explicit_qdq,
+            fp_attn_layers=(
+                bypass_report["fp_attn_layers"] if bypass_report else ()
+            ),
+            fp_mlp_layers=(
+                bypass_report["fp_mlp_layers"] if bypass_report else ()
+            ),
+            fp16_export=args.fp16_export,
+            attention_scale_requant=(
+                args.quantize_lite
+                and not args.per_channel_qk
+                and not args.fold_attention_scale_into_q
+            ),
+            source_quantize_entries=args.quantize_lite,
+            per_channel_qk=args.per_channel_qk,
+            fold_attention_scale_into_q=(
+                args.fold_attention_scale_into_q
+            ),
+            per_row_attention_range_floor=(
+                args.per_row_attention_range_floor
+            ),
+            per_channel_qk_max_requant_multiplier=(
+                args.per_channel_qk_max_requant_multiplier
+            ),
+            conv_native_layout=args.conv_native_layout,
         )
         if range_json:
             annotate_minmax_json_with_symbol_map(range_json, symbol_map)
@@ -2823,43 +3562,72 @@ def main(argv: list[str] | None = None, default_arch: str | None = None) -> None
                 extra_stopquanttensors = (
                     symbol_map[f"layers.{config.num_hidden_layers - 1}.resid2"],
                 )
-            postquant_modify = bool(
-                args.outlier_bypass_top_k or args.fp16_export
-            )
             quantize_with_ranges(
                 ctx,
                 input_names,
                 output_names,
-                None if postquant_modify else _method_output_path(
+                _method_output_path(
                     args.dump_quant_fb, method, multiple_methods
                 ),
                 extra_stopquanttensors=extra_stopquanttensors,
+                convert_float_to_fp16=False,
+                quantize_lite=args.quantize_lite,
             )
             quant_output = _method_output_path(
                 args.dump_quant_fb, method, multiple_methods
             )
             if quant_output is None:
                 raise AssertionError("quant output path was unexpectedly None")
-            if postquant_modify:
-                report = apply_outlier_bypass_modify(
-                    ctx,
-                    config,
-                    weights,
-                    range_json,
-                    symbol_map,
-                    top_k=args.outlier_bypass_top_k,
-                    fp16_export=args.fp16_export,
-                    fp16_residual_scale=fp16_residual_scale,
-                    dump_modify_json=_method_output_path(
-                        args.dump_modify_json, method, multiple_methods
-                    ),
-                    dump_bypass_report_json=_method_output_path(
-                        args.dump_bypass_report_json,
-                        method,
-                        multiple_methods,
-                    ),
+            if bypass_report is not None:
+                report = dict(bypass_report)
+                report.update(
+                    {
+                        "graph_rewrite": "source-explicit-qdq",
+                        "quantizer": (
+                            "TFCalibration.QuantizeLite"
+                            if args.quantize_lite
+                            else "TFCalibration.Quantize"
+                        ),
+                        "fp16_export": bool(args.fp16_export),
+                        "fp16_residual_scale": float(fp16_residual_scale),
+                        "source_dequant_dst_type": (
+                            "TFDtypeFp16"
+                            if args.fp16_export
+                            else "TFDtypeFp32"
+                        ),
+                        "post_quant_float_conversion": None,
+                        "attention_scale": (
+                            "Q weight/bias folded; QK directly feeds "
+                            "Softmax (scalar or per-channel qinfo)"
+                            if args.fold_attention_scale_into_q
+                            else "per-channel QK -> identity Requant(UINT8) -> "
+                            "H*S score qinfo -> AttnSoftmaxImpl online output "
+                            "quantization"
+                            if args.per_channel_qk
+                            else "source Requantize uint8 lookup table"
+                            if args.quantize_lite
+                            else "full-Quant scalar optimization"
+                        ),
+                    }
                 )
-                dump_context(ctx, quant_output)
+                report_path = _method_output_path(
+                    args.dump_bypass_report_json,
+                    method,
+                    multiple_methods,
+                )
+                if report_path:
+                    Path(report_path).write_text(
+                        json.dumps(report, indent=2, sort_keys=True)
+                    )
+                source_plan_path = _method_output_path(
+                    args.dump_modify_json,
+                    method,
+                    multiple_methods,
+                )
+                if source_plan_path:
+                    Path(source_plan_path).write_text(
+                        json.dumps(report, indent=2, sort_keys=True)
+                    )
                 selected_summary = ", ".join(
                     f"{item['kind']}:{item['layer']}="
                     f"{item['abs_max']:.6g}"
@@ -2869,6 +3637,8 @@ def main(argv: list[str] | None = None, default_arch: str | None = None) -> None
                     f"[BYPASS] method={method} top_k="
                     f"{args.outlier_bypass_top_k} fp16={args.fp16_export} "
                     f"residual_scale={fp16_residual_scale:g} "
+                    "graph=source-explicit-qdq "
+                    f"quantizer={'QuantizeLite' if args.quantize_lite else 'Quantize'} "
                     f"selected=[{selected_summary}]"
                 )
             generated_quant_paths[method] = quant_output
