@@ -2273,9 +2273,9 @@ namespace PythonInter {
         QuantizeLite(self.self,inputtype_,avoidnodes_,stopquantnodes_,mergeeltwise,mergeconcat,perchannel);
     }
 
-    void LoadCustomOp(py::str path){
+    int LoadCustomOp(py::str path){
         string cpath = path;
-        RegisterCustomOpFromFile(cpath);
+        return RegisterCustomOpFromFile(cpath);
     }
 
     void pyRegisterCustomOp(py::str OpName,py::function Reshape,py::function Eval){
@@ -2760,7 +2760,10 @@ PYBIND11_MODULE(TFDL2,m) {
             .def("_open", PythonInter::pyOpenContext);
 
     py::class_<PythonInter::pyTFExecutor>(m, "_TFExecutor", "this is the wrape of tfdl　for python")
-            .def(py::init<PythonInter::pyTFContext &, py::str>())
+            // CompileExecutor is called with shareWeight=true, so the context
+            // owns storage referenced by the executor for its whole lifetime.
+            .def(py::init<PythonInter::pyTFContext &, py::str>(),
+                 py::keep_alive<1, 2>())
             .def("_Forward", PythonInter::Forward)
             .def("_Getinputs", PythonInter::GetInputTensor)
             .def("_SetPrintInfo", PythonInter::pySetPrintInfo)

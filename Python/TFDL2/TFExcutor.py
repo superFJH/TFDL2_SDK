@@ -38,6 +38,13 @@ Modify = {
 
 class TFExecutor(_TFExecutor):
     def __init__(self,context,config:dict):
+        # The native wrapper compiles with shareWeight=true.  In that mode the
+        # SDK contract requires TFContext to outlive TFExecutor; otherwise the
+        # executor keeps pointers to weights owned by an already-freed context.
+        # Retain the Python object as well as using pybind11 keep_alive in the
+        # native binding so callers cannot accidentally create a dangling
+        # executor with TFExecutor(TFContext(path=...), ...).
+        self._shared_weight_context = context
         super(TFExecutor,self).__init__(context,json.dumps(config))
 
     def GetInputs(self):
