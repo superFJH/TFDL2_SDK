@@ -1,0 +1,234 @@
+{
+  "AddOnPass": [],
+  "DeleteLayer": [],
+  "Layer": [
+    {
+      "layerName": "TFDL_Placeholder_0",
+      "outputDataType": "TFDtypeFp16"
+    },
+    {
+      "input": [
+        "TFDL_Placeholder_0"
+      ],
+      "layerName": "qwen_prefill_l0_input_rms_raw",
+      "outputDataType": "TFDtypeFp16"
+    },
+    {
+      "input": [
+        "qwen_prefill_l0_input_rms_raw",
+        "PostFP.layers.0.input_layernorm.weight"
+      ],
+      "layerName": "TFDL_MUL_0",
+      "outputDataType": "TFDtypeFp16"
+    },
+    {
+      "OutDataMax": [
+        "0.5328759551048279"
+      ],
+      "OutDataMin": [
+        "-0.2864960730075836"
+      ],
+      "input": [
+        "TFDL_MUL_0"
+      ],
+      "layerName": "PostQuant_QwenInputNorm_0",
+      "layerType": "Quantize",
+      "output": [
+        "PostQuant_QwenInputNorm_0"
+      ],
+      "outputDataType": "TFDtypeUint8"
+    },
+    {
+      "input": [
+        "PostQuant_QwenInputNorm_0"
+      ],
+      "layerName": "TFDL_Transpose_0",
+      "outputDataType": "TFDtypeUint8"
+    },
+    {
+      "input": [
+        "PostQuant_QwenInputNorm_0"
+      ],
+      "layerName": "TFDL_Transpose_2",
+      "outputDataType": "TFDtypeUint8"
+    },
+    {
+      "input": [
+        "PostQuant_QwenInputNorm_0"
+      ],
+      "layerName": "TFDL_Transpose_4",
+      "outputDataType": "TFDtypeUint8"
+    },
+    {
+      "input": [
+        "TFDL_MUL_3"
+      ],
+      "layerName": "PostDeQuant_QwenScores_0",
+      "layerType": "DeQuantize",
+      "output": [
+        "PostDeQuant_QwenScores_0"
+      ],
+      "param": {
+        "dstType": "TFDtypeFp16"
+      }
+    },
+    {
+      "layerName": "TFDL_Placeholder_3",
+      "outputDataType": "TFDtypeFp16"
+    },
+    {
+      "input": [
+        "PostDeQuant_QwenScores_0",
+        "TFDL_Placeholder_3"
+      ],
+      "layerName": "TFDL_ADD_0",
+      "outputDataType": "TFDtypeFp16"
+    },
+    {
+      "input": [
+        "TFDL_ADD_0"
+      ],
+      "layerName": "TFDL_SOFTMAX_0",
+      "outputDataType": "TFDtypeFp16"
+    },
+    {
+      "OutDataMax": [
+        "1.0"
+      ],
+      "OutDataMin": [
+        "0.0"
+      ],
+      "input": [
+        "TFDL_SOFTMAX_0"
+      ],
+      "layerName": "PostQuant_QwenProbabilities_0",
+      "layerType": "Quantize",
+      "output": [
+        "PostQuant_QwenProbabilities_0"
+      ],
+      "outputDataType": "TFDtypeUint8"
+    },
+    {
+      "input": [
+        "PostQuant_QwenProbabilities_0",
+        "TFDL_Reshape_11"
+      ],
+      "layerName": "TFDL_MATMUL_1",
+      "outputDataType": "TFDtypeUint8"
+    },
+    {
+      "input": [
+        "TFDL_Transpose_12"
+      ],
+      "layerName": "PostDeQuant_QwenOProj_0",
+      "layerType": "DeQuantize",
+      "output": [
+        "PostDeQuant_QwenOProj_0"
+      ],
+      "param": {
+        "dstType": "TFDtypeFp16"
+      }
+    },
+    {
+      "input": [
+        "TFDL_Placeholder_0",
+        "PostDeQuant_QwenOProj_0"
+      ],
+      "layerName": "TFDL_ADD_1",
+      "outputDataType": "TFDtypeFp16"
+    },
+    {
+      "input": [
+        "TFDL_ADD_1"
+      ],
+      "layerName": "qwen_prefill_l0_post_rms_raw",
+      "outputDataType": "TFDtypeFp16"
+    },
+    {
+      "input": [
+        "qwen_prefill_l0_post_rms_raw",
+        "PostFP.layers.0.post_attention_layernorm.weight"
+      ],
+      "layerName": "TFDL_MUL_4",
+      "outputDataType": "TFDtypeFp16"
+    },
+    {
+      "OutDataMax": [
+        "0.8776882290840149"
+      ],
+      "OutDataMin": [
+        "-0.7912061810493469"
+      ],
+      "input": [
+        "TFDL_MUL_4"
+      ],
+      "layerName": "PostQuant_QwenPostNorm_0",
+      "layerType": "Quantize",
+      "output": [
+        "PostQuant_QwenPostNorm_0"
+      ],
+      "outputDataType": "TFDtypeUint8"
+    },
+    {
+      "input": [
+        "PostQuant_QwenPostNorm_0"
+      ],
+      "layerName": "TFDL_Transpose_13",
+      "outputDataType": "TFDtypeUint8"
+    },
+    {
+      "input": [
+        "PostQuant_QwenPostNorm_0"
+      ],
+      "layerName": "TFDL_Transpose_15",
+      "outputDataType": "TFDtypeUint8"
+    },
+    {
+      "input": [
+        "TFDL_Transpose_18"
+      ],
+      "layerName": "PostDeQuant_QwenDownProj_0",
+      "layerType": "DeQuantize",
+      "output": [
+        "PostDeQuant_QwenDownProj_0"
+      ],
+      "param": {
+        "dstType": "TFDtypeFp16"
+      }
+    },
+    {
+      "input": [
+        "TFDL_ADD_1",
+        "PostDeQuant_QwenDownProj_0"
+      ],
+      "layerName": "TFDL_ADD_2",
+      "outputDataType": "TFDtypeFp16"
+    },
+    {
+      "input": [
+        "qwen_prefill_l0_k_rope"
+      ],
+      "layerName": "qwen_prefill_l0_k_fp16",
+      "layerType": "DeQuantize",
+      "output": [
+        "qwen_prefill_l0_k_fp16"
+      ],
+      "param": {
+        "dstType": "TFDtypeFp16"
+      }
+    },
+    {
+      "input": [
+        "TFDL_Transpose_8"
+      ],
+      "layerName": "qwen_prefill_l0_v_fp16",
+      "layerType": "DeQuantize",
+      "output": [
+        "qwen_prefill_l0_v_fp16"
+      ],
+      "param": {
+        "dstType": "TFDtypeFp16"
+      }
+    }
+  ]
+}

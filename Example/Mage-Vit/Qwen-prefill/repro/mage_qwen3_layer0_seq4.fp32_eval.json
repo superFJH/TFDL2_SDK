@@ -1,0 +1,74 @@
+{
+  "comparisons": {
+    "hidden": {
+      "actual_dtype": "float32",
+      "cosine": 0.9999999999985388,
+      "max_abs": 6.556510925292969e-06,
+      "mean_abs": 1.990904252124892e-07,
+      "reference_dtype": "float32",
+      "rel_l2": 1.7187459959039538e-06,
+      "shape": [
+        1,
+        4,
+        2560
+      ]
+    },
+    "key": {
+      "actual_dtype": "float32",
+      "cosine": 0.9999999999994557,
+      "max_abs": 0.0002288818359375,
+      "mean_abs": 1.7280389528195883e-06,
+      "reference_dtype": "float32",
+      "rel_l2": 1.2064200937619743e-06,
+      "shape": [
+        1,
+        8,
+        4,
+        128
+      ]
+    },
+    "value": {
+      "actual_dtype": "float32",
+      "cosine": 0.9999999999993916,
+      "max_abs": 2.4586915969848633e-07,
+      "mean_abs": 2.1702095232001284e-08,
+      "reference_dtype": "float32",
+      "rel_l2": 1.136499921284063e-06,
+      "shape": [
+        1,
+        8,
+        4,
+        128
+      ]
+    }
+  },
+  "compile_seconds": 0.3968161200173199,
+  "execute_seconds": 0.021410231012851,
+  "fb": "Example/Mage-Vit/Qwen-prefill/repro/mage_qwen3_layer0_seq4_fp32.fb",
+  "layer": 0,
+  "model_path": "/home/tf/.cache/modelscope/models/microsoft--Mage-VL/snapshots/master",
+  "range_count": 24,
+  "reference_shapes": [
+    [
+      1,
+      4,
+      2560
+    ],
+    [
+      1,
+      8,
+      4,
+      128
+    ],
+    [
+      1,
+      8,
+      4,
+      128
+    ]
+  ],
+  "seq_len": 4,
+  "torch_device": "cpu",
+  "torch_seconds": 0.05818610987626016,
+  "use_hardware": false
+}

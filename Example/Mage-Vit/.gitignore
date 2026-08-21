@@ -1,0 +1,11 @@
+build/
+artifacts/
+__pycache__/
+*.pyc
+*.fb
+*.quant.fb
+!deploy/models/**/*.fb
+*.f32
+megavit_output/
+deploy/var/jobs/*
+!deploy/var/jobs/.gitkeep

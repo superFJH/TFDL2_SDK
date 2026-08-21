@@ -25,6 +25,7 @@
 !Python/**
 !.devcontainer/**
 
+Example/Mage-Vit/deploy/models
 
 
 # 忽略所有 __pycache__ 文件夹

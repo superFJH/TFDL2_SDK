@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Mage-VL Hybrid Demo</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <script defer src="{{ url_for('static', filename='app.js') }}"></script>
+</head>
+<body>
+  <div class="ambient ambient-one"></div>
+  <div class="ambient ambient-two"></div>
+  <main class="shell">
+    <header class="hero">
+      <div>
+        <p class="eyebrow">THINKFORCE · MULTIMODAL INFERENCE</p>
+        <h1>Mage‑VL Hybrid Demo</h1>
+        <p class="subtitle">NPU 完成视频编码与 Qwen Prefill，CPU W8A8 流式解码</p>
+      </div>
+      <div class="health" id="health">
+        <span class="health-dot"></span>
+        <span id="health-text">检查运行环境…</span>
+      </div>
+    </header>
+
+    <section class="architecture" aria-label="inference architecture">
+      <span>FFmpeg</span><i>→</i><span class="accent">Mage‑ViT · NPU</span>
+      <i>→</i><span class="accent">Qwen Prefill · NPU</span>
+      <i>→</i><span>ORT W8A8 · CPU</span>
+    </section>
+
+    <div class="workspace">
+      <section class="panel input-panel">
+        <div class="panel-heading">
+          <div><span class="step">01</span><h2>输入</h2></div>
+          <span class="profile">{{ profile }}</span>
+        </div>
+
+        <form id="inference-form">
+          <label class="drop-zone" id="drop-zone" for="video-input">
+            <input id="video-input" name="video" type="file" accept="video/*,.h264,.h265,.hevc" required>
+            <video id="video-preview" muted controls playsinline></video>
+            <div class="drop-copy" id="drop-copy">
+              <span class="upload-icon">↑</span>
+              <strong>拖入视频，或点击选择</strong>
+              <small>MP4 / MOV / MKV / H.264 / H.265 · 最大 2 GiB</small>
+            </div>
+          </label>
+          <div class="file-meta" id="file-meta"></div>
+
+          <label class="field-label" for="question">问题</label>
+          <textarea id="question" name="question" rows="4" required>{{ default_question }}</textarea>
+
+          <div class="options-row">
+            <label for="max-tokens">最大输出 tokens</label>
+            <input id="max-tokens" name="max_new_tokens" type="number"
+                   min="1" max="{{ max_allowed_new_tokens }}"
+                   value="{{ default_max_new_tokens }}">
+          </div>
+
+          <div class="actions">
+            <button class="primary" id="run-button" type="submit">
+              <span class="button-idle">开始推理</span>
+              <span class="button-running">推理中 <b class="pulse">•••</b></span>
+            </button>
+            <button class="secondary" id="cancel-button" type="button" disabled>停止</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="panel output-panel">
+        <div class="panel-heading">
+          <div><span class="step">02</span><h2>回答</h2></div>
+          <span class="status-pill" id="run-status">等待输入</span>
+        </div>
+
+        <div class="metrics">
+          <article><span>首 Token</span><strong id="metric-ttft">—</strong><small>TTFT</small></article>
+          <article><span>Decode</span><strong id="metric-decode">—</strong><small>首 token 后</small></article>
+          <article><span>吞吐</span><strong id="metric-tps">—</strong><small>token/s</small></article>
+          <article><span>总耗时</span><strong id="metric-total">—</strong><small>端到端</small></article>
+        </div>
+
+        <div class="stages" id="stages">
+          <div data-stage="codec-and-vision"><b></b><span>视频解析与视觉编码</span><time>—</time></div>
+          <div data-stage="assemble-prompt"><b></b><span>Prompt 组装</span><time>—</time></div>
+          <div data-stage="npu-prefill"><b></b><span>NPU Prefill</span><time>—</time></div>
+          <div data-stage="ort-decode"><b></b><span>CPU 流式 Decode</span><time>—</time></div>
+        </div>
+
+        <div class="answer" id="answer">
+          <p class="placeholder">提交视频后，模型回答会在这里逐 token 出现。</p>
+        </div>
+        <footer class="output-footer">
+          <span id="token-count">0 tokens</span>
+          <span id="elapsed">0.00 s</span>
+        </footer>
+      </section>
+    </div>
+  </main>
+</body>
+</html>

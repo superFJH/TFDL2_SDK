@@ -2556,6 +2556,41 @@ def build_vit_tfdl_graph(
             else hidden
         )
         output_names = [str(cls), str(output_tokens)]
+
+        # UINT8 activation operators validate their input/output qinfo when
+        # leaving the TFContext scope. The complete semantic range map is
+        # registered below after graph construction, which is too late for
+        # that lifecycle check and makes the SDK print a misleading
+        # ``<Fatal> ... input or output can't find Quantization`` for the first
+        # quantized GeLU/Swish even though QuantizeLite later emits a valid
+        # model. Seed only activation-chain qinfo here; the normal registration
+        # pass below deliberately remains the single general range mapper.
+        if loaded_ranges is not None and source_quantize_entries:
+            for layer_id in range(config.num_hidden_layers):
+                if layer_id in fp_mlp_layer_set:
+                    continue
+                prefix = f"layers.{layer_id}"
+                activation_tags = (
+                    (
+                        f"{prefix}.gate",
+                        f"{prefix}.gate_act",
+                        f"{prefix}.up",
+                        f"{prefix}.mlp_mid",
+                    )
+                    if config.use_gated_mlp
+                    else (f"{prefix}.fc1", f"{prefix}.mlp_mid")
+                )
+                for tag in activation_tags:
+                    if tag not in symbol_map or tag not in loaded_ranges:
+                        continue
+                    qmin, qmax = loaded_ranges[tag]
+                    if not ctx.AddInt8Config(
+                        symbol_map[tag], float(qmax), float(qmin)
+                    ):
+                        raise RuntimeError(
+                            "failed to pre-register activation int8 config "
+                            f"for {tag} -> {symbol_map[tag]}"
+                        )
     ctx.SetOutputs(output_names)
 
     if range_json:

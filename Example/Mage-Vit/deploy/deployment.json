@@ -1,0 +1,29 @@
+{
+  "format": "mage-vl-deployment-v1",
+  "profile": "s1024-flex-topk4-qkv12",
+  "model_path": "",
+  "frontend_bin": "build/megavit_frontend",
+  "vision_fb": "deploy/models/vision/mage_vit_288x512.int8_fp16_topk2.fb",
+  "addon": "deploy/runtime/libTFDLAddOn.so",
+  "executor_config": "runconfig.json",
+  "decoder_dir": "deploy/models/qwen-decode-ort/w8a8",
+  "work_dir": "deploy/var/jobs",
+  "threads": 16,
+  "vision_workers": 4,
+  "max_new_tokens": 128,
+  "max_allowed_new_tokens": 256,
+  "request_timeout_seconds": 1800,
+  "max_upload_bytes": 2147483648,
+  "require_npu": true,
+  "keep_jobs": false,
+  "persistent_runtime": true,
+  "prefill_bucket": {
+    "seq_len": 1024,
+    "target_canvases": 4,
+    "outlier_top_k": 4,
+    "question": "Describe this video.",
+    "system": "You are a helpful assistant.",
+    "max_question_tokens": 120,
+    "fb_dir": "deploy/models/qwen-prefill/s1024-flex-topk4-qkv12"
+  }
+}

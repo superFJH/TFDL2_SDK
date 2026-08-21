@@ -1,0 +1,21 @@
+{
+  "UseHardware": true,
+  "FrugalMode": true,
+  "Eltmode": 2,
+  "Core": [-1],
+  "cpuLimit": 16,
+  "compileMod": 0,
+  "useCache": true,
+  "shareConcatslice": false,
+  "useInterleave": false,
+  "optimize": {
+    "DoAlign": false,
+    "MakeAlign": true,
+    "MakeBroadCast": false,
+    "MakeUnfold": true,
+    "SplitDeconv": false,
+    "AttnSoftmaxImpl": true,
+    "HighAccuracy": false
+  },
+  "InputShape": []
+}

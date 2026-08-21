@@ -1,0 +1,27 @@
+{
+  "format": "mage-vl-deployment-assets-v1",
+  "profile": "s1024-flex-topk4-qkv12",
+  "expected_prefill_fb_count": 36,
+  "expected_decoder_data_count": 37,
+  "prefill_profiles": {
+    "s1024-flex-topk4-qkv12": {
+      "directory": "deploy/models/qwen-prefill/s1024-flex-topk4-qkv12",
+      "seq_len": 1024,
+      "expected_fb_count": 36
+    },
+    "s1024-flex-topk0-qkv12": {
+      "directory": "deploy/models/qwen-prefill/s1024-flex-topk0-qkv12",
+      "seq_len": 1024,
+      "expected_fb_count": 36
+    }
+  },
+  "sha256": {
+    "deploy/models/vision/mage_vit_288x512.int8_fp16_topk2.fb": "259d0381ea9efbf32dcc381b3e4fa6bb808f6b4536fb96b9511a264493e936f6",
+    "deploy/models/qwen-prefill/s1024-flex-topk4-qkv12/manifest.json": "d7114d6f4394a6cba7c394404b33b054814e312a26fc652e45e9bb817aa227e9",
+    "deploy/models/qwen-prefill/s1024-flex-topk0-qkv12/manifest.json": "c3e5d6e6f5239232d65730cfb6a4b2f499a1430c8a9d4c56f43828f0de4be1a7",
+    "deploy/models/qwen-decode-ort/w8a8/decoder.w8a8.onnx": "949fd8c6c09def92b432ca6af2a4df351f3ff77320b0db932c6ceeca65c1874d",
+    "deploy/models/qwen-decode-ort/w8a8/final_head.w8a8.onnx": "d1f492c8167e6533744c3455c996bab9bfa0488a681aaa5da172127025acf0b7",
+    "deploy/models/qwen-decode-ort/w8a8/manifest.json": "e7ca8335573d4ad1234071e9e937e955afa53425e4603c19e3717c8016598227",
+    "deploy/runtime/libTFDLAddOn.so": "5c8bcd4f4412ede660b436a7e014f9e0dd22cb64fe3e532343b361914b1f564a"
+  }
+}
