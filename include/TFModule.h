@@ -225,6 +225,15 @@ namespace TFDL_CAPI {
 
         TFDL2_CAPI_EXPORT  string Quantize(TFContext &, string input);
 
+        /*!
+         * @brief Runtime quantization. isPerchannel=false produces one q-info;
+         *        otherwise axis selects the contiguous blocks whose q-info is
+         *        updated independently at runtime.
+         */
+        TFDL2_CAPI_EXPORT  string DynamicQuantize(TFContext &, string input,
+                                                  bool runtimeQ, int axis,
+                                                  bool isPerchannel);
+
         TFDL2_CAPI_EXPORT  string DeQuantize(TFContext &, string input, TFCAPI_DATATYPE dst_dtype);
 
         /*!
