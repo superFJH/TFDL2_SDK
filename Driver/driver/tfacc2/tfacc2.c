@@ -10,6 +10,7 @@
 #include <linux/sizes.h>
 #include <linux/time.h>
 #include <linux/jiffies.h>
+#include <linux/version.h>
 
 static struct tf_device *tf_dev = NULL;
 static bool versionIsRight = false; // 表明version是否check过，如果check成功则置为true
@@ -1902,7 +1903,11 @@ static int tf_mmap(struct file *filp, struct vm_area_struct *vma) {
     DPRINTK("mmap dma_addr: 0x%llx, cpu_phys_addr: 0x%llx, size: %d\n",
             (unsigned long long)phy_addr,
             (unsigned long long)cpu_phys_addr, size);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+    vm_flags_set(vma, VM_LOCKED | VM_DONTEXPAND | VM_DONTDUMP);
+#else
     vma->vm_flags |= VM_LOCKED | VM_DONTEXPAND | VM_DONTDUMP;
+#endif
 
     DPRINTK("PAGE_SHIFT: %d\n", PAGE_SHIFT);
     if (!mmap_id || (mmap_id >= REG2ID && mmap_id < REG2ID + TFACC_REG_CNT * chips - 1) ||
@@ -3118,7 +3123,12 @@ static int __init tf_init_module(void)
         output_tfacc_id(gap + 0xE9900000);
     }
 
-    if (IS_ERR(thinkforce_class = class_create(THIS_MODULE, "thinkforce_class"))) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
+    thinkforce_class = class_create("thinkforce_class");
+#else
+    thinkforce_class = class_create(THIS_MODULE, "thinkforce_class");
+#endif
+    if (IS_ERR(thinkforce_class)) {
         DPRINTK("failed to device register class\n");
         retval = -ENOMEM;
         goto origin;
