@@ -1,0 +1,96 @@
+{
+  "format": "gelab-zero-4b-fp16-accuracy-v2",
+  "status": "fail",
+  "status_reason": "TFDL software FP16 BCS vision outputs are below the configured 0.99 cosine gate",
+  "checkpoint": "stepfun-ai/GELab-Zero-4B-preview",
+  "test_input": {
+    "dataset": "COCO validation holdout outside the calibration split",
+    "sources": [
+      "000000109055.jpg",
+      "000000249550.jpg",
+      "000000350023.jpg",
+      "000000248400.jpg"
+    ],
+    "processed_size": [512, 288],
+    "grid_thw": [1, 32, 18],
+    "visual_tokens": 144
+  },
+  "vision": {
+    "artifact": {
+      "file": "model/vision/single-g32x18-fp16/vision_g32x18-fp16.fb",
+      "bytes": 827717284,
+      "sha256": "4343170f7bfef7b88fd69fdb232676712426688e5a51c13ea17275a4185c3704",
+      "precision": "fp16",
+      "main_trunk_layout": "BCS"
+    },
+    "tfdl_software_fp16_vs_torch_fp32": {
+      "main": {
+        "minimum_cosine": 0.9483457827673991,
+        "mean_cosine": 0.9655665321337402,
+        "maximum_rel_l2": 0.32197413871311764,
+        "maximum_abs": 3.9844772964715958
+      },
+      "deepstack_0": {
+        "minimum_cosine": 0.9949715549910212,
+        "mean_cosine": 0.9956680001926677,
+        "maximum_rel_l2": 0.10621183001783385
+      },
+      "deepstack_1": {
+        "minimum_cosine": 0.9882324281021333,
+        "mean_cosine": 0.9908997019060768,
+        "maximum_rel_l2": 0.15305052960745474
+      },
+      "deepstack_2": {
+        "minimum_cosine": 0.9803798304022535,
+        "mean_cosine": 0.9842414784630785,
+        "maximum_rel_l2": 0.19718646501828646
+      }
+    },
+    "fp32_bcs_semantic_control": {
+      "holdout_count": 1,
+      "main_cosine": 0.9999999999707155,
+      "maximum_abs": 0.00010967254638671875
+    },
+    "topology_audit": {
+      "spatial_reshape_policy": "closest-factor HxW; 1xS only for prime S",
+      "sequence_spatial_shape": [24, 24],
+      "merged_sequence_spatial_shape": [12, 12],
+      "expected_transformer_logical_projections": 96,
+      "covered_transformer_logical_projections": 96,
+      "projection_conv_nodes": 104,
+      "direct_pretranspose_count": 0,
+      "invalid_projection_count": 0,
+      "ok": true
+    },
+    "configured_each_output_minimum_cosine_gate": 0.99,
+    "gate_pass": false
+  },
+  "ort_decode_smoke": {
+    "backend": "ONNX Runtime CPU dynamic U8/S8 W8A8",
+    "graph_nodes": 5344,
+    "graph_initializers": 904,
+    "inputs": 75,
+    "outputs": 73,
+    "session_load_seconds": 5.49637590162456,
+    "one_token_seconds_with_zero_past_s4": 0.10159945487976074,
+    "logits_shape": [1, 151936],
+    "logits_dtype": "float32",
+    "present_kv_dtype": "float16",
+    "all_outputs_finite": true,
+    "semantic_prompt": {
+      "prompt_tokens": 169,
+      "seed_token": 785,
+      "generated_text_after_two_tokens": "The image",
+      "cache_load_seconds": 0.027924482710659504,
+      "session_load_seconds": 5.452495069708675,
+      "one_decode_step_seconds": 0.09958013286814094,
+      "tokens_per_second": 10.04216374489227
+    }
+  },
+  "notes": [
+    "All observed outputs were finite; no FP16 overflow or NaN was observed.",
+    "The FP32 BCS control proves the layout and merger semantics match the PyTorch reference.",
+    "The vision gap is specific to the current TFDL software FP16 execution path.",
+    "Target-NPU accuracy must be measured separately because its accumulation kernels may differ."
+  ]
+}

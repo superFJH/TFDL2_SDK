@@ -1,0 +1,89 @@
+{
+  "format": "gelab-vision-vit-style-quantization-report-v1",
+  "selected_profile": "g32x18-fp16",
+  "graph_contract": {
+    "construction": "direct-TFContext-Vit.py-style",
+    "main_trunk_layout": "BCS",
+    "projection_input_layout": "[B,C,S] -> balanced [B,C,H,W], H*W=S; 1xS only for prime S",
+    "projection_spatial_shapes": {
+      "sequence": [24, 24],
+      "merged_sequence": [12, 12],
+      "token_bucket_64": [8, 8]
+    },
+    "projection_pretranspose_count": 0,
+    "parameterized_linear_lowering": "Conv1x1",
+    "attention_core": "QK-scale-Softmax-AV",
+    "sequence": 576,
+    "merged_sequence": 144
+  },
+  "fp16": {
+    "file": "model/vision/single-g32x18-fp16/vision_g32x18-fp16.fb",
+    "bytes": 827717284,
+    "sha256": "4343170f7bfef7b88fd69fdb232676712426688e5a51c13ea17275a4185c3704",
+    "holdout_count": 4,
+    "main_minimum_cosine": 0.9483457827673991,
+    "main_mean_cosine": 0.9655665321337402,
+    "deepstack_minimum_cosine": [
+      0.9949715549910212,
+      0.9882324281021333,
+      0.9803798304022535
+    ],
+    "topology_audit": {
+      "projection_conv_nodes": 104,
+      "covered_transformer_logical_projections": 96,
+      "direct_pretranspose_count": 0,
+      "invalid_projection_count": 0,
+      "ok": true
+    },
+    "fp32_bcs_semantic_control": {
+      "holdout_count": 1,
+      "main_cosine": 0.9999999999707155,
+      "maximum_abs": 0.00010967254638671875
+    },
+    "status": "selected-bring-up-baseline"
+  },
+  "w8a8_global_range": {
+    "file": "model/vision/single-g32x18-w8a8-linear-fp16/vision_g32x18-int8-linear-fp16-fppatch-fpmerger.fb",
+    "bytes": 529329796,
+    "sha256": "d44517b3e7805231bcd7c2110a74ca1ec94dab4cf4b82bc0729fbef0fcba77f2",
+    "holdout_image": "000000109055.jpg",
+    "main_cosine": 0.49551733440838236,
+    "deepstack_cosine": [
+      0.9715456679761152,
+      0.6412873932397084,
+      0.6673577541020017
+    ],
+    "topology_audit": {
+      "projection_conv_nodes": 104,
+      "direct_pretranspose_count": 0,
+      "invalid_projection_count": 0,
+      "ok": true
+    },
+    "status": "fail-not-selected"
+  },
+  "w8a8_token_bucket_64": {
+    "file": "model/vision/single-g32x18-w8a8-linear-fp16-vit-tb64/vision_g32x18-int8-linear-fp16-fppatch-fpmerger-tb64.fb",
+    "bytes": 530724868,
+    "sha256": "30782bb6c99578b91490f46adf29339e595c87e088a69c48282a51b31c6f6f5a",
+    "quantized_weight_count": 96,
+    "quantized_mlp_layer_count": 24,
+    "fp16_mlp_layer_count": 0,
+    "token_bucket_size": 64,
+    "token_bucket_count": 9,
+    "registered_activation_range_count": 1728,
+    "holdout_image": "000000109055.jpg",
+    "main_cosine": 0.5655799942350933,
+    "deepstack_cosine": [
+      0.9828995144550928,
+      0.6708664363275426,
+      0.747270817348307
+    ],
+    "topology_audit": {
+      "projection_conv_nodes": 872,
+      "direct_pretranspose_count": 0,
+      "invalid_projection_count": 0,
+      "ok": true
+    },
+    "status": "fail-not-selected"
+  }
+}

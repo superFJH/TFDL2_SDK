@@ -93,6 +93,76 @@ namespace TFDLOP {
             return 1.0f / (1.0f + expf(-x));
         }
 
+        static float fp16ToFloat(uint16_t half) {
+            uint32_t sign = (uint32_t)(half & 0x8000u) << 16;
+            uint32_t exponent = (half >> 10) & 0x1fu;
+            uint32_t mantissa = half & 0x03ffu;
+            uint32_t bits;
+            if (exponent == 0) {
+                if (mantissa == 0) {
+                    bits = sign;
+                } else {
+                    int shift = 0;
+                    while ((mantissa & 0x0400u) == 0) {
+                        mantissa <<= 1;
+                        ++shift;
+                    }
+                    mantissa &= 0x03ffu;
+                    bits = sign | (uint32_t)(127 - 15 - shift) << 23
+                        | mantissa << 13;
+                }
+            } else if (exponent == 31) {
+                bits = sign | 0x7f800000u | (mantissa << 13);
+            } else {
+                bits = sign | ((exponent + 112u) << 23) | (mantissa << 13);
+            }
+            float value;
+            memcpy(&value, &bits, sizeof(value));
+            return value;
+        }
+
+        static uint16_t floatToFp16(float value) {
+            uint32_t bits;
+            memcpy(&bits, &value, sizeof(bits));
+            const uint16_t sign = (uint16_t)((bits >> 16) & 0x8000u);
+            int exponent = (int)((bits >> 23) & 0xffu) - 127 + 15;
+            uint32_t mantissa = bits & 0x007fffffu;
+            if (exponent <= 0) {
+                if (exponent < -10) return sign;
+                mantissa = (mantissa | 0x00800000u) >> (1 - exponent);
+                return (uint16_t)(sign + ((mantissa + 0x00001000u) >> 13));
+            }
+            if (exponent >= 31) {
+                return (uint16_t)(sign | 0x7c00u);
+            }
+            mantissa += 0x00001000u;
+            if (mantissa & 0x00800000u) {
+                mantissa = 0;
+                if (++exponent >= 31) {
+                    return (uint16_t)(sign | 0x7c00u);
+                }
+            }
+            return (uint16_t)(
+                sign | (uint16_t)(exponent << 10)
+                | (uint16_t)(mantissa >> 13));
+        }
+
+        static void fp16ToFloatArray(
+            const uint16_t *source, float *target, int count
+        ) {
+            for (int index = 0; index < count; ++index) {
+                target[index] = fp16ToFloat(source[index]);
+            }
+        }
+
+        static void floatToFp16Array(
+            const float *source, uint16_t *target, int count
+        ) {
+            for (int index = 0; index < count; ++index) {
+                target[index] = floatToFp16(source[index]);
+            }
+        }
+
         static void sdpAttentionFloat(
             const float *Q, const float *K_new, const float *V_new,
             const float *K_cache, const float *V_cache,
@@ -250,6 +320,55 @@ namespace TFDLOP {
                     B, nHeadsQ, nHeadsKV, Sq, maxSeq, headDim,
                     cachePos, p->nRep, p->useSinks
                 );
+            } else if (GetTensorType(qData) == TFCAPI_FLOAT16) {
+                // FP16 is the deployment storage/ABI. Attention dot products,
+                // Softmax and AV accumulation remain FP32 before rounding the
+                // output and updated caches back to FP16.
+                int qCount = B * nHeadsQ * Sq * headDim;
+                int kvNewCount = B * nHeadsKV * Sq * headDim;
+                int kvCacheCount = B * nHeadsKV * maxSeq * headDim;
+                float *qF = new float[qCount];
+                float *kNewF = new float[kvNewCount];
+                float *vNewF = new float[kvNewCount];
+                float *kCacheF = new float[kvCacheCount];
+                float *vCacheF = new float[kvCacheCount];
+                float *outF = new float[qCount];
+                float *kCacheOutF = new float[kvCacheCount];
+                float *vCacheOutF = new float[kvCacheCount];
+
+                fp16ToFloatArray(
+                    (const uint16_t *)GetTensordata(qData), qF, qCount);
+                fp16ToFloatArray(
+                    (const uint16_t *)GetTensordata(kNewData), kNewF,
+                    kvNewCount);
+                fp16ToFloatArray(
+                    (const uint16_t *)GetTensordata(vNewData), vNewF,
+                    kvNewCount);
+                fp16ToFloatArray(
+                    (const uint16_t *)GetTensordata(kCacheData), kCacheF,
+                    kvCacheCount);
+                fp16ToFloatArray(
+                    (const uint16_t *)GetTensordata(vCacheData), vCacheF,
+                    kvCacheCount);
+
+                sdpAttentionFloat(
+                    qF, kNewF, vNewF, kCacheF, vCacheF,
+                    outF, kCacheOutF, vCacheOutF, nullptr,
+                    B, nHeadsQ, nHeadsKV, Sq, maxSeq, headDim,
+                    cachePos, p->nRep, false
+                );
+                floatToFp16Array(
+                    outF, (uint16_t *)GetTensordata(outData), qCount);
+                floatToFp16Array(
+                    kCacheOutF, (uint16_t *)GetTensordata(kOutData),
+                    kvCacheCount);
+                floatToFp16Array(
+                    vCacheOutF, (uint16_t *)GetTensordata(vOutData),
+                    kvCacheCount);
+
+                delete[] qF; delete[] kNewF; delete[] vNewF;
+                delete[] kCacheF; delete[] vCacheF;
+                delete[] outF; delete[] kCacheOutF; delete[] vCacheOutF;
             } else if (GetTensorType(qData) == TFCAPI_UINT8) {
                 // uint8 路径: 反量化所有输入 → float 计算 → 重新量化输出
                 int qCount = B * nHeadsQ * Sq * headDim;
