@@ -406,6 +406,85 @@ calib.Quantize(
 
 因此主要节省的是**校准数据前向执行和范围收集时间**。TFDL SDK 的权重量化、节点改写和模型序列化仍然会执行。加速收益取决于模型大小、样本数量、GPU 性能和 TFDL 软件执行器速度。
 
+### 7.4 Top-K MLP 按 token 角色混合：CLS/register FP16，patch INT8
+
+`Vit.py` 的 Top-K 排名仍统一比较每层 Attention `proj` 和 MLP `fc2`
+残差分支的绝对范围。启用 `--topk-mlp-bucket-size N` 后，排名命中的
+Attention 分支保持原有 FP16 bypass；排名命中的 MLP 分支则按 token 角色拆分：
+
+```text
+FP16 residual
+  → 按连续区间切成 prefix（CLS+register）和 patches
+  ├→ prefix：独立 LayerNorm → FP16 FC1/GeLU/FC2
+  └→ patches：独立 LayerNorm → 每 N 个 token 一桶 → INT8 MLP
+  → 每个 patch FC2 后立即 DeQuantize
+  → 按原 token 顺序 Concat
+  → 浮点 residual add
+```
+
+prefix 分支使用独立的 FP16 weight/bias 别名；所有 patch 桶共享原始参数经
+`QuantizeLite` 得到的一套 W8 weight 和 FP32 bias。prefix 和 patches 各自执行
+LayerNorm，避免在同一个 LayerNorm 输出上形成 FP16/INT8 混合 fan-out，也避免
+prefix 入口多余的 Q/DQ。不能让同一参数同时被 FP16 Conv 和 INT8 Conv 消费，SDK
+对这种混合 fan-out 的处理不稳定。FC2 必须以 GeLU 后的 `mlp_mid` 为输入，不能
+误接 `norm2`；TFDL 对这种输入通道不一致未必在构图时报告 shape 错误，因此必须
+做逐层中间 tensor 对拍。
+
+当前实现仅开放普通 GeLU ViT MLP。gated/SwiGLU 的 UINT8 分支汇合涉及混合
+`Mul`，当前 SDK `QuantizeLite` 不能稳定下沉，导出时会明确报错，避免量化器内部
+段错误。校准 JSON 除标量范围外，还保存 `layers.L.<tensor>.tokens` 的逐 token
+min/max；导出时只合并当前 INT8 桶覆盖的 token 范围。因此修改 bucket 大小无需
+重新执行模型校准，但第一次启用必须用当前 `Vit.py` 重新生成 range JSON。
+
+```bash
+python ConvertTools/python/example/Vit.py \
+  --arch dinov3 \
+  --model-path /path/to/model \
+  --calib-dir /path/to/calibration-images \
+  --dump-minmax-json /tmp/dinov3.ranges.json \
+  --dump-quant-fb /tmp/dinov3.prefix-fp16-patch-b128.fb \
+  --outlier-bypass-top-k 1 \
+  --topk-mlp-bucket-size 128
+```
+
+参数语义如下：
+
+- 不传 `--topk-mlp-bucket-size`：保留旧行为，Top-K 命中的 MLP 整支回退 FP16。
+- 传 `0`：CLS/register prefix 走 FP16，所有 patch 共用一个 INT8 桶。
+- 传正整数 `N`：CLS/register prefix 走 FP16，patch 每 `N` 个 token 一个 INT8 桶。
+
+导出报告会记录原始命中层、实际整层 FP16 MLP、分桶 MLP 以及每个桶的
+`begin/end`。部署前应审计 CLS/register Conv 为 FP16、patch Conv 为 UINT8、每个
+INT8 FC2 后存在 DQ、Concat 与 residual add 为浮点。
+
+DINOv3-L 第 0 层未缩放的 register FC2 更新约为 `-1.56e5`，超过 FP16 的有限
+范围 `[-65504, 65504]`。FP16 导出默认使用 `fp16_residual_scale=0.25`：从第 0 层
+MLP merge 开始把 residual stream、该层 FC2 以及后续各层输出分支一起缩放，从而
+保持 pre-norm Transformer 的等价关系，同时把实测 prefix FC2 范围压到约
+`[-38528, 3500]`。该层 prefix FC2 对 FP32 参考的 cosine 为 `0.9999993`，没有
+发生 FP16 overflow。
+
+#### DINOv3-L 实测（Top-K=1）
+
+使用 8 张 COCO 图校准、另外 8 张图验证，输入 224×224、201 tokens（1 CLS、
+4 register、196 patch），`fp16_residual_scale=0.25`。以下是相同参考模型和数据下
+的软件执行器结果：
+
+| 策略 | CLS cosine 均值 | register token 均值 | patch tensor cosine | patch token 最小值 | patch token P01 |
+|---|---:|---:|---:|---:|---:|
+| 普通 INT8（Top-K=0） | 0.44325 | 0.55514 | 0.65703 | 0.24340 | 0.35148 |
+| 旧 16-token 桶（register 仍 INT8） | 0.85643 | 0.60771 | 0.82926 | 0.36830 | 0.53527 |
+| register FP16 + CLS/全 patch 两个 INT8 桶 | 0.87754 | 0.73678 | 0.85764 | **0.45813** | 0.58702 |
+| **CLS/register FP16 + patch b128** | **0.89059** | **0.95195** | **0.88052** | 0.40334 | **0.60659** |
+| Top-K MLP 整层 FP16 | 0.89247 | 0.95331 | 0.88178 | 0.44101 | 0.58733 |
+
+prefix FP16 + patch b128 相对普通 INT8 恢复了约 99.6% 的 CLS 差距和 99.4% 的
+patch tensor 差距，整体已经非常接近整层 FP16；不过绝对最差 patch token 仍低于
+整层 FP16，因此不能只看均值。该方案需要同时保存 INT8 主权重和 prefix 专用
+FP16 权重，本次模型约 312 MiB，反而大于整层 FP16 版本的约 304 MiB。它的价值
+是让 196/201 个 token 的 MLP 继续走 INT8，是否在 NPU 上更快必须以硬件计时
+验证；软件执行器耗时不能代表 NPU 收益。
+
 ## 8. 正确的开发与验证顺序
 
 新增类似模型时建议使用以下顺序，避免在错误的等效图上耗时收集 range：
