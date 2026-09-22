@@ -1,0 +1,9 @@
+# Chat templating and image decoding/preprocessing. Inference stays in C++.
+jinja2>=3.1,<4
+# Optional download providers: huggingface_hub / modelscope.
+# HF conversion: use the pinned llama/requirements/requirements-convert_hf_to_gguf.txt.
+
+Pillow>=10,<12
+numpy>=1.26,<3
+# Video file decoding only; inference still uses native TFLLM / llama.
+av>=14,<17

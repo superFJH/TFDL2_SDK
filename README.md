@@ -34,6 +34,7 @@ TFDL2_SDK/
 ├── Example/            # C++示例（分类、检测、分割、Benchmark等）
 ├── bin/                # 预编译可执行文件
 └── Doc/legacy/         # 完整文档
+└── tfllm               # 基于ThinkForce NPU和开源LLama.cpp的LLM推理引擎，使用PD分离实现，prefill使用NPU，decode使用llama.cpp 在arm cpu上进行
 ```
 
 ## 支持的硬件平台

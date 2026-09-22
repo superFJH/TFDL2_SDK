@@ -1,0 +1,100 @@
+namespace tfllm.fb;
+
+enum Encoding : ubyte { F32, F16, U8RowSymmetric }
+enum RegionKind : ubyte { Input, Output, Weight, Workspace, Kv }
+enum AddressPart : ubyte { Low32, High8, Full40 }
+
+table Config {
+  architecture:string (required);
+  layers:uint;
+  hidden:uint;
+  intermediate:uint;
+  query_heads:uint;
+  kv_heads:uint;
+  head_dim:uint;
+  vocabulary:uint;
+  context:uint;
+  rms_epsilon:float = 0.000001;
+  rope_theta:float = 1000000;
+  model_id:string (required);
+  execution:string;
+  source_gguf:string;
+  fallback_reason:string;
+  parameter_count:ulong;
+  rope_neox:bool = true;
+  qk_norm:bool = true;
+  gelu:bool = false;
+  embedding_scale:float = 1;
+  attention_scale:float = 0;
+  attention_soft_cap:float = 0;
+  logits_soft_cap:float = 0;
+  rope_freq_scale:float = 1;
+  rope_theta_swa:float = 10000;
+  rope_freq_scale_swa:float = 1;
+  sliding_windows:[uint];
+  decode_model_id:string;
+  recurrent_layers:[ubyte];
+  rotary_dim:uint;
+  linear_key_heads:uint;
+  linear_value_heads:uint;
+  linear_key_dim:uint;
+  linear_value_dim:uint;
+  linear_conv_kernel:uint;
+}
+// All offsets are relative to the external payload file. Large weights never
+// live inside a FlatBuffer (whose internal offsets are 32 bit).
+table Tensor {
+  name:string (required);
+  encoding:Encoding;
+  shape:[uint] (required);
+  offset:ulong;
+  bytes:ulong;
+  scales_offset:ulong;
+  scales_count:uint;
+}
+table Region {
+  name:string (required);
+  kind:RegionKind;
+  bytes:ulong;
+  alignment:uint = 64;
+}
+table Relocation {
+  image:uint;
+  byte_offset:ulong;
+  region:uint;
+  addend:ulong;
+  span:ulong = 1;
+  part:AddressPart;
+  right_shift:ubyte;
+  bit_offset:ubyte;
+  bit_count:ubyte = 32;
+  alignment:uint = 1;
+}
+// image 0 is the 32-byte BlasOp stream; additional images hold LUTs or other
+// address-bearing state. Every address field must be explicitly relocated.
+table Image {
+  region:uint;
+  offset:ulong;
+  bytes:ulong;
+}
+table Program {
+  name:string (required);
+  command_abi:string (required);
+  core_kind:uint;
+  query_bucket:uint;
+  key_bucket:uint;
+  regions:[Region] (required);
+  images:[Image] (required);
+  relocations:[Relocation];
+  heads:[ubyte] (required);
+}
+table Model {
+  version:uint = 1;
+  config:Config (required);
+  workspace_bytes:ulong;
+  tensors:[Tensor] (required);
+  programs:[Program];
+}
+root_type Model;
+file_identifier "TFLM";
+file_extension "tfllm";

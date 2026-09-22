@@ -1,0 +1,9 @@
+#!/usr/bin/env python3
+import os
+from pathlib import Path
+import sys
+installed = Path(__file__).resolve().parent.parent / "share" / "tfllm" / "python"
+sys.path.insert(0, str(installed if installed.is_dir() else Path("/workspaces/NPU40T/TFLLM/python")))
+os.environ.setdefault("TFLLM_LLAMA_CONVERTER", "/workspaces/NPU40T/Third_Party/llama.cpp")
+from tfllm_cli.main import main
+sys.exit(main(profile_build=False))
