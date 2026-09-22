@@ -1,6 +1,0 @@
-__pycache__/
-*.py[cod]
-deploy/var/
-deploy/model
-calibration
-deploy/EXTERNAL_MODEL_PATH.txt
