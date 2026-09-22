@@ -24,7 +24,8 @@ not inserted later with ``TFContext.Modify``.  The intended fast path is:
 * FP16 prefix/register tokens, LayerNorm outputs and residual additions;
 * FP32 LayerNorm gamma/beta (DINOv3 register-token outliers are sensitive to
   rounding these learned parameters to FP16);
-* a small range-ranked set of Attention/MLP branches in FP16;
+* a small range-ranked set of Attention branches in FP16, while selected MLP
+  branches may instead use an FP16 CLS/register prefix plus INT8 patch buckets;
 * ``QuantizeLite`` for weight/range conversion, with scalar attention scaling
   represented explicitly by a UINT8 ``Requantize`` lookup table.
 
@@ -42,7 +43,7 @@ import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 import numpy as np
 import torch
@@ -518,6 +519,10 @@ class RangeCollector:
         # the H*S*S attention tensor and are aggregated elementwise over all
         # calibration images.
         self.row_ranges: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        # Top-K MLP bucket export needs one interval per sequence token. The
+        # exporter later unions only the tokens that share a fixed bucket,
+        # keeping CLS/register outliers isolated from ordinary patch tokens.
+        self.token_ranges: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self._range_sums: dict[str, tuple[float, float, int]] = {}
         self._samples: dict[str, list[np.ndarray]] = {}
         self._samples_per_observation = max(
@@ -639,6 +644,47 @@ class RangeCollector:
                 row_min[equal] -= epsilon
                 row_max[equal] += epsilon
             self.row_ranges[name] = (row_min, row_max)
+        mlp_token_suffixes = {
+            "norm2",
+            "fc1",
+            "gate",
+            "gate_act",
+            "up",
+            "mlp_mid",
+            "fc2",
+        }
+        if (
+            name.startswith("layers.")
+            and name.rsplit(".", 1)[-1] in mlp_token_suffixes
+        ):
+            if detached.ndim != 3:
+                raise ValueError(
+                    f"{name} token calibration expects [B,S,C], got "
+                    f"{tuple(detached.shape)}"
+                )
+            token_min = detached.amin(dim=(0, 2)).float().cpu().numpy()
+            token_max = detached.amax(dim=(0, 2)).float().cpu().numpy()
+            token_min = np.minimum(token_min, 0.0).astype(
+                np.float32, copy=False
+            )
+            token_max = np.maximum(token_max, 0.0).astype(
+                np.float32, copy=False
+            )
+            if name in self.token_ranges:
+                old_min, old_max = self.token_ranges[name]
+                if old_min.shape != token_min.shape:
+                    raise ValueError(
+                        f"{name} token count changed during calibration: "
+                        f"{old_min.size} -> {token_min.size}"
+                    )
+                token_min = np.minimum(old_min, token_min)
+                token_max = np.maximum(old_max, token_max)
+            equal = token_min == token_max
+            if np.any(equal):
+                epsilon = np.maximum(np.abs(token_min[equal]), 1.0) * 1e-6
+                token_min[equal] -= epsilon
+                token_max[equal] += epsilon
+            self.token_ranges[name] = (token_min, token_max)
         observed = self._exclude_register_tokens(name, detached)
         observed_min = float(observed.min().cpu())
         observed_max = float(observed.max().cpu())
@@ -821,6 +867,19 @@ class RangeCollector:
                 "range_method": "per-row-minmax",
                 "channel_layout": "H*S",
                 "row_count": int(row_min.size),
+                "calibration_observations": "elementwise union",
+                "exclude_register_tokens": False,
+                "register_range_policy": self.register_range_policy,
+            }
+        for name, (token_min, token_max) in sorted(
+            self.token_ranges.items()
+        ):
+            output[f"{name}.tokens"] = {
+                "min": token_min.tolist(),
+                "max": token_max.tolist(),
+                "range_method": "per-token-minmax",
+                "channel_layout": "S",
+                "token_count": int(token_min.size),
                 "calibration_observations": "elementwise union",
                 "exclude_register_tokens": False,
                 "register_range_policy": self.register_range_policy,
@@ -1490,7 +1549,7 @@ def _load_row_range_json(
     raw = json.loads(Path(path).read_text())
     out: dict[str, tuple[list[float], list[float]]] = {}
     for name, value in raw.items():
-        if not isinstance(value, dict):
+        if not name.endswith(".rows") or not isinstance(value, dict):
             continue
         qmin, qmax = value.get("min"), value.get("max")
         if not isinstance(qmin, list) and not isinstance(qmax, list):
@@ -1510,6 +1569,45 @@ def _load_row_range_json(
         if any(lo >= hi for lo, hi in zip(row_min, row_max)):
             raise ValueError(f"{name}: every row range must satisfy min < max")
         out[name] = (row_min, row_max)
+    return out
+
+
+def _load_token_range_json(
+    path: str | Path,
+) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """Load only the per-token MLP calibration arrays.
+
+    Attention H*S row ranges share the same JSON representation, so the
+    ``.tokens`` suffix is part of the ABI and prevents the two vector-qinfo
+    schemes from being mixed accidentally.
+    """
+    raw = json.loads(Path(path).read_text())
+    out: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for name, value in raw.items():
+        if not name.endswith(".tokens") or not isinstance(value, dict):
+            continue
+        qmin, qmax = value.get("min"), value.get("max")
+        # A scalar semantic tensor may itself end in ``.tokens``. Only the
+        # new vector payload is part of the bucket ABI.
+        if not isinstance(qmin, list) and not isinstance(qmax, list):
+            continue
+        if not isinstance(qmin, list) or not isinstance(qmax, list):
+            raise ValueError(f"{name}: token min/max must both be arrays")
+        if not qmin or len(qmin) != len(qmax):
+            raise ValueError(
+                f"{name}: token min/max lengths must be equal and non-zero"
+            )
+        token_min = np.asarray(qmin, dtype=np.float32)
+        token_max = np.asarray(qmax, dtype=np.float32)
+        if not np.all(np.isfinite(token_min)) or not np.all(
+            np.isfinite(token_max)
+        ):
+            raise ValueError(f"{name}: non-finite per-token range")
+        if np.any(token_min >= token_max):
+            raise ValueError(
+                f"{name}: every token range must satisfy min < max"
+            )
+        out[name] = (token_min, token_max)
     return out
 
 
@@ -1590,6 +1688,50 @@ def _token_group_specs(config: ViTOpConfig) -> tuple[tuple[str, int], ...]:
         groups.append(("registers", config.num_register_tokens))
     groups.append(("patches", config.num_patches))
     return tuple(groups)
+
+
+def _mlp_token_bucket_specs(
+    config: ViTOpConfig,
+    bucket_size: int,
+) -> tuple[tuple[str, int, int], ...]:
+    """Return fixed MLP token buckets as ``(name, begin, end)``.
+
+    Every prefix token (CLS and registers) shares one FP16 group. Patch tokens
+    use deterministic fixed-size INT8 buckets. ``bucket_size=0`` means every
+    patch token shares one role-level bucket.
+    """
+    bucket_size = int(bucket_size)
+    if bucket_size < 0:
+        raise ValueError("MLP token bucket size must be non-negative")
+    specs: list[tuple[str, int, int]] = []
+    offset = 0
+    if config.prefix_len:
+        specs.append(("prefix_fp16", 0, config.prefix_len))
+        offset = config.prefix_len
+    patch_end = offset + config.num_patches
+    patch_bucket_size = bucket_size or config.num_patches
+    bucket_id = 0
+    while offset < patch_end:
+        end = min(offset + patch_bucket_size, patch_end)
+        specs.append((f"patch_b{bucket_id:03d}", offset, end))
+        offset = end
+        bucket_id += 1
+    if offset != config.seq_len:
+        raise AssertionError(
+            f"MLP token buckets cover {offset} tokens, expected "
+            f"{config.seq_len}"
+        )
+    return tuple(specs)
+
+
+def _mlp_bucket_weight_alias(layer_id: int, stem: str) -> str:
+    """Return the FP16 weight alias used only by prefix tokens."""
+    return f"__vit_bucket_layer_{int(layer_id):02d}_{stem}_weight"
+
+
+def _mlp_bucket_bias_alias(layer_id: int, stem: str) -> str:
+    """Return the FP16 bias alias used only by prefix tokens."""
+    return f"__vit_bucket_layer_{int(layer_id):02d}_{stem}_bias"
 
 
 def _split_token_groups(
@@ -1815,6 +1957,12 @@ def _build_block_op(
     explicit_qdq: bool = False,
     fp_attn_layers: frozenset[int] = frozenset(),
     fp_mlp_layers: frozenset[int] = frozenset(),
+    bucketed_mlp_layers: frozenset[int] = frozenset(),
+    mlp_token_bucket_size: int = 0,
+    token_ranges: dict[
+        str, tuple[np.ndarray, np.ndarray]
+    ] | None = None,
+    sliced_int8_ranges: dict[str, tuple[float, float]] | None = None,
     dequant_dtype: Any = None,
     float_entry_tensors: list[str] | None = None,
     attention_requant_maptable: list[int] | dict[int, list[int]] | None = None,
@@ -1827,6 +1975,9 @@ def _build_block_op(
 
     ``fp_attn_layers`` keeps the output projection floating; the QK/Softmax/AV
     core stays quantized. ``fp_mlp_layers`` keeps the complete MLP floating.
+    ``bucketed_mlp_layers`` instead keeps every prefix token (CLS/registers)
+    in one FP16 MLP group, splits only patch tokens into INT8 islands, and
+    rejoins them after FC2 DQ.
     ``per_channel_qk`` keeps QK quantized with one range per Softmax row.  Its
     Requantize output receives the same H*S qinfo divided by
     ``sqrt(head_dim)``; the lookup table is the exact ``0..255`` identity map.
@@ -2085,6 +2236,292 @@ def _build_block_op(
         # The normal INT8 projection exits immediately before residual Add.
         proj = dequantize(proj, f"{c}.proj_tokens.dequantized")
     hidden = _mark(symbol_map, f"{c}.resid1", Op.Add(hidden, proj))
+    if layer_id in bucketed_mlp_layers:
+        if token_ranges is None or sliced_int8_ranges is None:
+            raise AssertionError("bucketed MLP range state was not provided")
+        bucket_specs = _mlp_token_bucket_specs(
+            config, mlp_token_bucket_size
+        )
+        token_axis = 2 if conv_native_layout else 1
+        if config.prefix_len:
+            prefix_hidden, patch_hidden = Op.Slice(
+                hidden,
+                axis=token_axis,
+                split=(config.prefix_len, config.num_patches),
+            )
+            prefix_norm = _mark(
+                symbol_map,
+                f"{c}.norm2.prefix_fp16",
+                Op.LayerNorm2(
+                    prefix_hidden,
+                    ctx.GetParamSymbol(f"{c}.norm2.weight"),
+                    ctx.GetParamSymbol(f"{c}.norm2.bias"),
+                    axis=norm_axis,
+                ),
+            )
+            patch_norm = _mark(
+                symbol_map,
+                f"{c}.norm2.patches",
+                Op.LayerNorm2(
+                    patch_hidden,
+                    ctx.GetParamSymbol(f"{c}.norm2.weight"),
+                    ctx.GetParamSymbol(f"{c}.norm2.bias"),
+                    axis=norm_axis,
+                ),
+            )
+            patch_specs = bucket_specs[1:]
+            patch_groups = Op.Slice(
+                patch_norm,
+                axis=token_axis,
+                split=tuple(
+                    end - begin for _, begin, end in patch_specs
+                ),
+            )
+            norm2_groups = (prefix_norm, *patch_groups)
+        else:
+            patch_norm = _mark(
+                symbol_map,
+                f"{c}.norm2.patches",
+                Op.LayerNorm2(
+                    hidden,
+                    ctx.GetParamSymbol(f"{c}.norm2.weight"),
+                    ctx.GetParamSymbol(f"{c}.norm2.bias"),
+                    axis=norm_axis,
+                ),
+            )
+            norm2_groups = Op.Slice(
+                patch_norm,
+                axis=token_axis,
+                split=tuple(
+                    end - begin for _, begin, end in bucket_specs
+                ),
+            )
+
+        def mark_bucket_int8(
+            tag: str,
+            value: Any,
+            source_tag: str,
+            begin: int,
+            end: int,
+        ) -> Any:
+            value = _mark(symbol_map, tag, value)
+            token_tag = f"{source_tag}.tokens"
+            token_min, token_max = token_ranges[token_tag]
+            qmin = float(np.min(token_min[begin:end]))
+            qmax = float(np.max(token_max[begin:end]))
+            if not np.isfinite(qmin) or not np.isfinite(qmax) or qmin >= qmax:
+                raise ValueError(
+                    f"invalid bucket range for {token_tag}[{begin}:{end}]: "
+                    f"min={qmin}, max={qmax}"
+                )
+            sliced_int8_ranges[str(value)] = (qmin, qmax)
+            return value
+
+        bucket_outputs: list[Any] = []
+        bucket_weight_symbols: dict[str, Any] = {}
+        for (bucket_name, begin, end), group in zip(
+            bucket_specs, norm2_groups
+        ):
+            token_count = end - begin
+            floating_prefix = bucket_name == "prefix_fp16"
+            group_4d = Op.Reshape(
+                group
+                if conv_native_layout
+                else Op.Transpose(group, (0, 2, 1)),
+                (1, config.hidden_size, 1, token_count),
+            )
+
+            def pointwise_group(
+                stem: str,
+                out_channels: int,
+                input_value: Any | None = None,
+            ) -> Any:
+                pointwise_input = (
+                    group_input if input_value is None else input_value
+                )
+                if floating_prefix:
+                    value = _pointwise_4d_op(
+                        ctx,
+                        pointwise_input,
+                        _mlp_bucket_weight_alias(layer_id, stem),
+                        _mlp_bucket_bias_alias(layer_id, stem),
+                        out_channels,
+                        symbol_map,
+                        f"{c}.{stem}.raw.{bucket_name}",
+                    )
+                else:
+                    weight = bucket_weight_symbols.get(stem)
+                    if weight is None:
+                        weight = ctx.GetParamSymbol(f"{c}.{stem}.weight")
+                        symbol_map[f"{c}.{stem}.weight.quantized"] = str(
+                            weight
+                        )
+                        bucket_weight_symbols[stem] = weight
+                    value = _mark(
+                        symbol_map,
+                        f"{c}.{stem}.raw.{bucket_name}",
+                        Op.Convolution2(
+                            pointwise_input,
+                            weight,
+                            ctx.GetParamSymbol(f"{c}.{stem}.bias"),
+                            kernel=1,
+                            pad=0,
+                            stride=1,
+                            dilation=1,
+                            outChannel=out_channels,
+                            group=1,
+                        ),
+                    )
+                if floating_prefix:
+                    return _mark(
+                        symbol_map, f"{c}.{stem}.{bucket_name}", value
+                    )
+                return mark_bucket_int8(
+                    f"{c}.{stem}.{bucket_name}",
+                    value,
+                    f"{c}.{stem}",
+                    begin,
+                    end,
+                )
+
+            def activate_group(
+                stem: str, value: Any, operation: Any
+            ) -> Any:
+                activated = operation(value)
+                if floating_prefix:
+                    return _mark(
+                        symbol_map, f"{c}.{stem}.{bucket_name}", activated
+                    )
+                return mark_bucket_int8(
+                    f"{c}.{stem}.{bucket_name}",
+                    activated,
+                    f"{c}.{stem}",
+                    begin,
+                    end,
+                )
+
+            if floating_prefix:
+                group_input = _mark(
+                    symbol_map,
+                    f"{c}.norm2.{bucket_name}.floating",
+                    group_4d,
+                )
+            else:
+                group_input = mark_bucket_int8(
+                    f"{c}.norm2.quantized.{bucket_name}",
+                    Op.Quantize(group_4d),
+                    f"{c}.norm2",
+                    begin,
+                    end,
+                )
+            if config.use_gated_mlp:
+                gate = pointwise_group("gate", config.intermediate_size)
+                gate = activate_group(
+                    "gate_act", gate, Op.Swish
+                )
+                up = pointwise_group("up", config.intermediate_size)
+                if floating_prefix:
+                    mid = _mark(
+                        symbol_map,
+                        f"{c}.mlp_mid.{bucket_name}",
+                        Op.Mul(gate, up),
+                    )
+                else:
+                    # QuantizeLite cannot safely lower a UINT8×UINT8 Mul in
+                    # this mixed FP16/INT8 graph.  Keep only the inexpensive
+                    # elementwise gate merge floating, then re-enter INT8 for
+                    # the dominant FC2 convolution.
+                    gate_for_mul = dequantize(
+                        gate,
+                        f"{c}.gate_act.{bucket_name}.dequantized",
+                    )
+                    up_for_mul = dequantize(
+                        up, f"{c}.up.{bucket_name}.dequantized"
+                    )
+                    mid = mark_bucket_int8(
+                        f"{c}.mlp_mid.{bucket_name}",
+                        Op.Quantize(Op.Mul(gate_for_mul, up_for_mul)),
+                        f"{c}.mlp_mid",
+                        begin,
+                        end,
+                    )
+            else:
+                fc1 = pointwise_group("fc1", config.intermediate_size)
+                mid = activate_group(
+                    "mlp_mid", fc1, Op.GeLU
+                )
+            fc2_raw = pointwise_group(
+                "fc2", config.hidden_size, input_value=mid
+            )
+            out = Op.Reshape(
+                fc2_raw,
+                (1, config.hidden_size, token_count),
+            )
+            if not conv_native_layout:
+                out = Op.Transpose(out, (0, 2, 1))
+            if floating_prefix:
+                out = _mark(
+                    symbol_map,
+                    f"{c}.fc2_tokens.{bucket_name}.floating",
+                    out,
+                )
+            else:
+                out = mark_bucket_int8(
+                    f"{c}.fc2_tokens.quantized.{bucket_name}",
+                    out,
+                    f"{c}.fc2",
+                    begin,
+                    end,
+                )
+                out = dequantize(
+                    out, f"{c}.fc2_tokens.{bucket_name}.dequantized"
+                )
+            if (
+                bucket_name == "prefix_fp16"
+                and config.num_register_tokens
+                and float(register_residual_scale) != 1.0
+            ):
+                if config.has_cls_token:
+                    cls_out, register_out = Op.Slice(
+                        out,
+                        axis=token_axis,
+                        split=(1, config.num_register_tokens),
+                    )
+                    register_out = Op.Mul(
+                        register_out, float(register_residual_scale)
+                    )
+                    out = Op.Concat(
+                        (cls_out, register_out), axis=token_axis
+                    )
+                else:
+                    out = Op.Mul(out, float(register_residual_scale))
+                out = _mark(
+                    symbol_map,
+                    f"{c}.fc2_tokens.{bucket_name}.scaled",
+                    out,
+                )
+            bucket_outputs.append(out)
+        mlp = _mark(
+            symbol_map,
+            f"{c}.fc2_tokens",
+            Op.Concat(tuple(bucket_outputs), axis=token_axis),
+        )
+        resid2_base = hidden
+        if layer_id == 0 and float(fp16_residual_scale) != 1.0:
+            resid2_base = _mark(
+                symbol_map,
+                f"{c}.resid2_base_scaled",
+                Op.Scale2(
+                    hidden,
+                    ctx.GetParamSymbol("fp16_residual_scale.weight"),
+                    ctx.GetParamSymbol("fp16_residual_scale.bias"),
+                ),
+            )
+        return _mark(
+            symbol_map,
+            f"{c}.resid2",
+            Op.Add(resid2_base, mlp),
+        )
     normed2 = _mark(symbol_map, f"{c}.norm2", Op.LayerNorm2(hidden, ctx.GetParamSymbol(f"{c}.norm2.weight"), ctx.GetParamSymbol(f"{c}.norm2.bias"), axis=norm_axis))
     normed2_for_mlp = normed2
     if source_quantize_entries and layer_id not in fp_mlp_layers:
@@ -2234,6 +2671,8 @@ def build_vit_tfdl_graph(
     explicit_qdq: bool = False,
     fp_attn_layers: Sequence[int] = (),
     fp_mlp_layers: Sequence[int] = (),
+    bucketed_mlp_layers: Sequence[int] = (),
+    mlp_token_bucket_size: int = 0,
     fp16_export: bool = False,
     attention_scale_requant: bool = False,
     source_quantize_entries: bool = False,
@@ -2255,12 +2694,38 @@ def build_vit_tfdl_graph(
 
     fp_attn_layer_set = frozenset(int(value) for value in fp_attn_layers)
     fp_mlp_layer_set = frozenset(int(value) for value in fp_mlp_layers)
+    bucketed_mlp_layer_set = frozenset(
+        int(value) for value in bucketed_mlp_layers
+    )
+    valid_layers = frozenset(range(config.num_hidden_layers))
+    for label, layers in (
+        ("fp_attn_layers", fp_attn_layer_set),
+        ("fp_mlp_layers", fp_mlp_layer_set),
+        ("bucketed_mlp_layers", bucketed_mlp_layer_set),
+    ):
+        invalid = sorted(layers - valid_layers)
+        if invalid:
+            raise ValueError(f"{label} contains invalid layers: {invalid}")
+    overlap = sorted(fp_mlp_layer_set & bucketed_mlp_layer_set)
+    if overlap:
+        raise ValueError(
+            "MLP layers cannot be both FP16 and INT8 bucketed: "
+            f"{overlap}"
+        )
+    if bucketed_mlp_layer_set and int(mlp_token_bucket_size) < 0:
+        raise ValueError(
+            "bucketed MLP layers require a non-negative "
+            "mlp_token_bucket_size"
+        )
     dequant_dtype = (
         TFDataType.TFDL_FLOAT16 if fp16_export else TFDataType.TFDL_FLOAT
     )
     loaded_ranges = _load_range_json(range_json) if range_json else None
     loaded_row_ranges = (
         _load_row_range_json(range_json) if range_json else {}
+    )
+    loaded_token_ranges = (
+        _load_token_range_json(range_json) if range_json else {}
     )
     if attention_scale_requant and loaded_ranges is None:
         raise ValueError("attention Requantize requires --range-json")
@@ -2296,6 +2761,44 @@ def build_vit_tfdl_graph(
     source_quantize_entries = bool(
         source_quantize_entries or attention_scale_requant
     )
+    if bucketed_mlp_layer_set:
+        if config.use_gated_mlp:
+            raise ValueError(
+                "Top-K MLP token buckets currently support GeLU ViT MLPs; "
+                "gated/SwiGLU bucket export is disabled because the SDK "
+                "QuantizeLite pass cannot safely lower its mixed Mul path"
+            )
+        if loaded_ranges is None:
+            raise ValueError("bucketed MLP quantization requires --range-json")
+        if not explicit_qdq or not source_quantize_entries:
+            raise ValueError(
+                "bucketed MLP quantization requires explicit Q/DQ and source "
+                "Quantize entries (use QuantizeLite export)"
+            )
+        if not fp16_export:
+            raise ValueError(
+                "bucketed MLP register tokens require FP16 export"
+            )
+        required_suffixes = (
+            ("norm2", "gate", "gate_act", "up", "mlp_mid", "fc2")
+            if config.use_gated_mlp
+            else ("norm2", "fc1", "mlp_mid", "fc2")
+        )
+        for layer_id in sorted(bucketed_mlp_layer_set):
+            for suffix in required_suffixes:
+                tag = f"layers.{layer_id}.{suffix}.tokens"
+                if tag not in loaded_token_ranges:
+                    raise KeyError(
+                        f"range JSON is missing {tag!r}, required for Top-K "
+                        "MLP buckets. Regenerate --dump-minmax-json with the "
+                        "current Vit.py."
+                    )
+                token_min, token_max = loaded_token_ranges[tag]
+                if token_min.size != config.seq_len:
+                    raise ValueError(
+                        f"{tag}: got {token_min.size} tokens, expected "
+                        f"S={config.seq_len}"
+                    )
 
     attention_requant_tables: dict[
         int, list[int] | dict[int, list[int]]
@@ -2400,6 +2903,23 @@ def build_vit_tfdl_graph(
             )
             for name, value in graph_weights.items()
         }
+        for layer_id in sorted(bucketed_mlp_layer_set):
+            prefix = f"layers.{layer_id}"
+            stems = ("gate", "up", "fc2") if config.use_gated_mlp else (
+                "fc1",
+                "fc2",
+            )
+            for stem in stems:
+                graph_weights[_mlp_bucket_weight_alias(layer_id, stem)] = (
+                    np.ascontiguousarray(
+                        weights[f"{prefix}.{stem}.weight"], dtype=np.float16
+                    )
+                )
+                graph_weights[_mlp_bucket_bias_alias(layer_id, stem)] = (
+                    np.ascontiguousarray(
+                        weights[f"{prefix}.{stem}.bias"], dtype=np.float16
+                    )
+                )
         if (
             not attention_scale_requant
             and not per_channel_qk
@@ -2433,6 +2953,7 @@ def build_vit_tfdl_graph(
     ctx.RegisterParamToContext(**graph_weights)
     symbol_map: dict[str, str] = {}
     float_entry_tensors: list[str] = []
+    sliced_int8_ranges: dict[str, tuple[float, float]] = {}
     with ctx:
         # Placeholder preprocessing turns raw 0..255 RGB into the normalized
         # model domain.  QuantizeLite preserves this FLOAT Placeholder, so its
@@ -2528,6 +3049,10 @@ def build_vit_tfdl_graph(
                 explicit_qdq=explicit_qdq,
                 fp_attn_layers=fp_attn_layer_set,
                 fp_mlp_layers=fp_mlp_layer_set,
+                bucketed_mlp_layers=bucketed_mlp_layer_set,
+                mlp_token_bucket_size=mlp_token_bucket_size,
+                token_ranges=loaded_token_ranges,
+                sliced_int8_ranges=sliced_int8_ranges,
                 dequant_dtype=dequant_dtype,
                 float_entry_tensors=float_entry_tensors,
                 attention_requant_maptable=attention_requant_tables.get(
@@ -2567,7 +3092,10 @@ def build_vit_tfdl_graph(
         # pass below deliberately remains the single general range mapper.
         if loaded_ranges is not None and source_quantize_entries:
             for layer_id in range(config.num_hidden_layers):
-                if layer_id in fp_mlp_layer_set:
+                if (
+                    layer_id in fp_mlp_layer_set
+                    or layer_id in bucketed_mlp_layer_set
+                ):
                     continue
                 prefix = f"layers.{layer_id}"
                 activation_tags = (
@@ -2591,6 +3119,14 @@ def build_vit_tfdl_graph(
                             "failed to pre-register activation int8 config "
                             f"for {tag} -> {symbol_map[tag]}"
                         )
+            for actual, (qmin, qmax) in sliced_int8_ranges.items():
+                if not ctx.AddInt8Config(
+                    actual, float(qmax), float(qmin)
+                ):
+                    raise RuntimeError(
+                        "failed to pre-register bucketed MLP int8 config "
+                        f"for {actual}: min={qmin}, max={qmax}"
+                    )
     ctx.SetOutputs(output_names)
 
     if range_json:
@@ -2793,7 +3329,10 @@ def build_vit_tfdl_graph(
         for tag, actual in symbol_map.items():
             # The same QK symbol is also tagged as attn_scores in the folded
             # graph. Do not overwrite its vector qinfo with a scalar range.
-            if actual in per_row_attention_configs:
+            if (
+                actual in per_row_attention_configs
+                or actual in sliced_int8_ranges
+            ):
                 continue
             resolved_range = range_for_graph_tag(tag)
             if resolved_range is not None:
@@ -2890,6 +3429,34 @@ def build_vit_tfdl_graph(
                     f"{prefix}.fc2_tokens",
                 }
             )
+        if layer_id in bucketed_mlp_layer_set:
+            source_float_tags.add(f"{prefix}.fc2_tokens")
+            for bucket_name, _, _ in _mlp_token_bucket_specs(
+                config, mlp_token_bucket_size
+            ):
+                if bucket_name == "prefix_fp16":
+                    source_float_tags.update(
+                        {
+                            f"{prefix}.fc1.{bucket_name}",
+                            f"{prefix}.norm2.{bucket_name}",
+                            f"{prefix}.norm2.{bucket_name}.floating",
+                            f"{prefix}.gate.{bucket_name}",
+                            f"{prefix}.gate_act.{bucket_name}",
+                            f"{prefix}.up.{bucket_name}",
+                            f"{prefix}.mlp_mid.{bucket_name}",
+                            f"{prefix}.fc2.{bucket_name}",
+                            f"{prefix}.fc2_tokens.{bucket_name}.floating",
+                            f"{prefix}.fc2_tokens.{bucket_name}.scaled",
+                        }
+                    )
+                else:
+                    source_float_tags.update(
+                        {
+                            f"{prefix}.gate_act.{bucket_name}.dequantized",
+                            f"{prefix}.up.{bucket_name}.dequantized",
+                            f"{prefix}.fc2_tokens.{bucket_name}.dequantized",
+                        }
+                    )
     ctx.source_float_tensors = tuple(
         dict.fromkeys(
             symbol_map[tag]
@@ -2921,6 +3488,7 @@ def build_vit_tfdl_graph(
                 symbol_map[f"layers.{layer_id}.norm2"]
                 for layer_id in range(config.num_hidden_layers)
                 if layer_id not in fp_mlp_layer_set
+                and layer_id not in bucketed_mlp_layer_set
             ]
         )
     ) if explicit_qdq else ()
@@ -3189,8 +3757,22 @@ def build_arg_parser(default_arch: str | None = None) -> argparse.ArgumentParser
         default=None,
         help=(
             "Globally rank Attention proj and MLP fc2 merge ranges, then "
-            "build the largest K branches as explicit floating source islands. "
+            "build the largest K branches as explicit floating source islands; "
+            "--topk-mlp-bucket-size replaces selected MLP islands with INT8 "
+            "token buckets. "
             "Default: 1 for quantized export, otherwise 0."
+        ),
+    )
+    parser.add_argument(
+        "--topk-mlp-bucket-size",
+        type=int,
+        default=None,
+        help=(
+            "For MLP branches selected by --outlier-bypass-top-k, keep every "
+            "prefix token (CLS and registers) in FP16 while quantizing only "
+            "patch tokens in fixed buckets of this size. 0 means one bucket "
+            "for all patches; omitting the option keeps the legacy full MLP "
+            "FP16 fallback."
         ),
     )
     parser.add_argument(
@@ -3407,6 +3989,25 @@ def main(argv: list[str] | None = None, default_arch: str | None = None) -> None
     if args.outlier_bypass_top_k < 0:
         raise ValueError("--outlier-bypass-top-k must be non-negative")
     if (
+        args.topk_mlp_bucket_size is not None
+        and args.topk_mlp_bucket_size < 0
+    ):
+        raise ValueError("--topk-mlp-bucket-size must be non-negative")
+    if (
+        args.topk_mlp_bucket_size is not None
+        and not args.outlier_bypass_top_k
+    ):
+        raise ValueError(
+            "--topk-mlp-bucket-size requires --outlier-bypass-top-k > 0"
+        )
+    if (
+        args.topk_mlp_bucket_size is not None
+        and not args.quantize_lite
+    ):
+        raise ValueError(
+            "--topk-mlp-bucket-size currently requires --quantize-lite"
+        )
+    if (
         args.fp16_residual_scale is not None
         and not (0.0 < float(args.fp16_residual_scale) <= 1.0)
     ):
@@ -3425,6 +4026,14 @@ def main(argv: list[str] | None = None, default_arch: str | None = None) -> None
         raise ValueError(
             "Top-K source mixed precision is incompatible with "
             "--split-mlp-token-groups"
+        )
+    if (
+        args.topk_mlp_bucket_size is not None
+        and args.split_mlp_token_groups
+    ):
+        raise ValueError(
+            "--topk-mlp-bucket-size and --split-mlp-token-groups are "
+            "mutually exclusive"
         )
     range_methods = list(
         dict.fromkeys(args.range_methods or (args.range_method,))
@@ -3543,6 +4152,49 @@ def main(argv: list[str] | None = None, default_arch: str | None = None) -> None
             if explicit_qdq
             else None
         )
+        selected_mlp_layers = tuple(
+            bypass_report["fp_mlp_layers"] if bypass_report else ()
+        )
+        use_mlp_buckets = args.topk_mlp_bucket_size is not None
+        bucketed_mlp_layers = (
+            selected_mlp_layers if use_mlp_buckets else ()
+        )
+        fp_mlp_layers = (
+            () if use_mlp_buckets else selected_mlp_layers
+        )
+        if bypass_report is not None:
+            bypass_report["selected_mlp_layers"] = list(
+                selected_mlp_layers
+            )
+            bypass_report["fp_mlp_layers"] = list(fp_mlp_layers)
+            bypass_report["bucketed_mlp_layers"] = list(
+                bucketed_mlp_layers
+            )
+            bypass_report["topk_mlp_bucket_size"] = (
+                int(args.topk_mlp_bucket_size)
+                if use_mlp_buckets
+                else None
+            )
+            bypass_report["selected_mlp_policy"] = (
+                "fp16-prefix-int8-patch-buckets"
+                if use_mlp_buckets
+                else "fp16-bypass"
+            )
+            bypass_report["mlp_token_buckets"] = (
+                [
+                    {
+                        "name": name,
+                        "begin": begin,
+                        "end": end,
+                        "tokens": end - begin,
+                    }
+                    for name, begin, end in _mlp_token_bucket_specs(
+                        config, int(args.topk_mlp_bucket_size)
+                    )
+                ]
+                if use_mlp_buckets
+                else []
+            )
         ctx, _, input_names, output_names, symbol_map = build_vit_tfdl_graph(
             config,
             weights,
@@ -3557,7 +4209,13 @@ def main(argv: list[str] | None = None, default_arch: str | None = None) -> None
                 bypass_report["fp_attn_layers"] if bypass_report else ()
             ),
             fp_mlp_layers=(
-                bypass_report["fp_mlp_layers"] if bypass_report else ()
+                fp_mlp_layers
+            ),
+            bucketed_mlp_layers=bucketed_mlp_layers,
+            mlp_token_bucket_size=(
+                int(args.topk_mlp_bucket_size)
+                if use_mlp_buckets
+                else 0
             ),
             fp16_export=args.fp16_export,
             attention_scale_requant=(
@@ -3625,6 +4283,16 @@ def main(argv: list[str] | None = None, default_arch: str | None = None) -> None
                         ),
                         "fp16_export": bool(args.fp16_export),
                         "fp16_residual_scale": float(fp16_residual_scale),
+                        "topk_mlp_bucket_size": (
+                            int(args.topk_mlp_bucket_size)
+                            if use_mlp_buckets
+                            else None
+                        ),
+                        "mlp_bucket_policy": (
+                            "FP16 CLS/register prefix, INT8 patch buckets"
+                            if use_mlp_buckets
+                            else None
+                        ),
                         "source_dequant_dst_type": (
                             "TFDtypeFp16"
                             if args.fp16_export
@@ -3672,6 +4340,7 @@ def main(argv: list[str] | None = None, default_arch: str | None = None) -> None
                     f"[BYPASS] method={method} top_k="
                     f"{args.outlier_bypass_top_k} fp16={args.fp16_export} "
                     f"residual_scale={fp16_residual_scale:g} "
+                    f"mlp_bucket={args.topk_mlp_bucket_size} "
                     "graph=source-explicit-qdq "
                     f"quantizer={'QuantizeLite' if args.quantize_lite else 'Quantize'} "
                     f"selected=[{selected_summary}]"

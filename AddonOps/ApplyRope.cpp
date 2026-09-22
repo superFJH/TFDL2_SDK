@@ -691,6 +691,81 @@ namespace TFDLOP {
             delete[] sinFp16;
             delete[] cosFp16;
         }
+
+        // The standard ABI originally stored RoPE tables as FP32, then
+        // converted them for every invocation.  Vision graphs use fixed
+        // tables and native FP16 Q/K, so accept pre-quantized FP16 tables as
+        // well.  This deliberately mirrors ropeApplyNativeFp16Pair's math
+        // and only changes table ownership/conversion.
+        static void ropeApplyNativeFp16PairFp16Tables(
+                const uint16_t *qStorage, const uint16_t *kStorage,
+                uint16_t *qOutStorage, uint16_t *kOutStorage,
+                const uint16_t *sinStorage, const uint16_t *cosStorage,
+                int B, int qNumHeads, int kNumHeads, int N, int headDim,
+                int sinB, int sinH, int hw, bool interleaved) {
+            const __fp16 *q = reinterpret_cast<const __fp16 *>(qStorage);
+            const __fp16 *k = reinterpret_cast<const __fp16 *>(kStorage);
+            __fp16 *qOut = reinterpret_cast<__fp16 *>(qOutStorage);
+            __fp16 *kOut = reinterpret_cast<__fp16 *>(kOutStorage);
+            const __fp16 *sinFp16 = reinterpret_cast<const __fp16 *>(sinStorage);
+            const __fp16 *cosFp16 = reinterpret_cast<const __fp16 *>(cosStorage);
+            const int half = headDim / 2;
+            const int prefix = N - hw;
+            const int tokensPerWork = 16;
+            const int tokenChunks = (N + tokensPerWork - 1) / tokensPerWork;
+            const int qItems = B * qNumHeads * tokenChunks;
+            const int kItems = B * kNumHeads * tokenChunks;
+            const int totalItems = qItems + kItems;
+            const long long totalElements =
+                (long long)B * (qNumHeads + kNumHeads) * N * headDim;
+
+            #pragma omp parallel for schedule(static) if(totalElements >= kMinParallelElements)
+            for (int item = 0; item < totalItems; ++item) {
+                const bool isQ = item < qItems;
+                const int localItem = isQ ? item : item - qItems;
+                const int numHeads = isQ ? qNumHeads : kNumHeads;
+                const __fp16 *input = isQ ? q : k;
+                __fp16 *output = isQ ? qOut : kOut;
+                const int tokenChunk = localItem % tokenChunks;
+                const int headRow = localItem / tokenChunks;
+                const int batch = headRow / numHeads;
+                const int head = headRow % numHeads;
+                const int sinBatch = sinB == 1 ? 0 : batch;
+                const int sinHead = sinH == 1 ? 0 : head;
+                const int begin = tokenChunk * tokensPerWork;
+                const int end = std::min(N, begin + tokensPerWork);
+                const long long headOffset = (long long)headRow * N * headDim;
+
+                for (int token = begin; token < end; ++token) {
+                    const __fp16 *x = input + headOffset + (long long)token * headDim;
+                    __fp16 *y = output + headOffset + (long long)token * headDim;
+                    if (token < prefix) {
+                        memcpy(y, x, headDim * sizeof(__fp16));
+                        continue;
+                    }
+                    const int ropeToken = token - prefix;
+                    const int tableOffset =
+                        ((sinBatch * sinH + sinHead) * hw + ropeToken) * headDim;
+                    const __fp16 *sinRow = sinFp16 + tableOffset;
+                    const __fp16 *cosRow = cosFp16 + tableOffset;
+                    if (interleaved) {
+                        for (int dim = 0; dim < headDim; dim += 2) {
+                            const __fp16 x0 = x[dim];
+                            const __fp16 x1 = x[dim + 1];
+                            y[dim] = x0 * cosRow[dim] - x1 * sinRow[dim];
+                            y[dim + 1] = x1 * cosRow[dim + 1] + x0 * sinRow[dim + 1];
+                        }
+                        continue;
+                    }
+                    for (int dim = 0; dim < half; ++dim) {
+                        const __fp16 front = x[dim];
+                        const __fp16 back = x[half + dim];
+                        y[dim] = front * cosRow[dim] - back * sinRow[dim];
+                        y[half + dim] = back * cosRow[half + dim] + front * sinRow[half + dim];
+                    }
+                }
+            }
+        }
 #endif
 #endif // __aarch64__
 
@@ -1494,11 +1569,24 @@ namespace TFDLOP {
                 && param->qOutputLayout == RopeLayout::BHND
                 && param->kOutputLayout == RopeLayout::BHND;
 
-            // sin and cos are always float
-            const float *sinPtr = (const float *) GetTensordata(sinData);
-            const float *cosPtr = (const float *) GetTensordata(cosData);
+            const auto sinType = GetTensorType(sinData);
+            const auto cosType = GetTensorType(cosData);
+            if (sinType != cosType ||
+                    (sinType != TFCAPI_FLOAT && sinType != TFCAPI_FLOAT16)) {
+                throw std::runtime_error(
+                    "ApplyRope sin/cos must have matching FP32 or FP16 dtypes");
+            }
+            const bool tablesAreFp16 = sinType == TFCAPI_FLOAT16;
+            const float *sinPtr = tablesAreFp16
+                ? nullptr : (const float *) GetTensordata(sinData);
+            const float *cosPtr = tablesAreFp16
+                ? nullptr : (const float *) GetTensordata(cosData);
 
             if (GetTensorType(qData) == TFCAPI_FLOAT && GetTensorType(kData) == TFCAPI_FLOAT) {
+                if (tablesAreFp16) {
+                    throw std::runtime_error(
+                        "ApplyRope FP16 tables require native FP16 Q/K tensors");
+                }
                 // Pure float path
                 const float *qPtr = (const float *) GetTensordata(qData);
                 const float *kPtr = (const float *) GetTensordata(kData);
@@ -1525,15 +1613,31 @@ namespace TFDLOP {
                     && GetTensorType(kData) == TFCAPI_FLOAT16) {
 #if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
                 if (defaultFastLayout) {
-                    ropeApplyNativeFp16Pair(
-                        (const uint16_t *)GetTensordata(qData),
-                        (const uint16_t *)GetTensordata(kData),
-                        (uint16_t *)GetTensordata(qOutData),
-                        (uint16_t *)GetTensordata(kOutData),
-                        sinPtr, cosPtr,
-                        B, qNumHeads, kNumHeads, N, headDim,
-                        sinB, sinH, hw, param->interleaved);
+                    if (tablesAreFp16) {
+                        ropeApplyNativeFp16PairFp16Tables(
+                            (const uint16_t *)GetTensordata(qData),
+                            (const uint16_t *)GetTensordata(kData),
+                            (uint16_t *)GetTensordata(qOutData),
+                            (uint16_t *)GetTensordata(kOutData),
+                            (const uint16_t *)GetTensordata(sinData),
+                            (const uint16_t *)GetTensordata(cosData),
+                            B, qNumHeads, kNumHeads, N, headDim,
+                            sinB, sinH, hw, param->interleaved);
+                    } else {
+                        ropeApplyNativeFp16Pair(
+                            (const uint16_t *)GetTensordata(qData),
+                            (const uint16_t *)GetTensordata(kData),
+                            (uint16_t *)GetTensordata(qOutData),
+                            (uint16_t *)GetTensordata(kOutData),
+                            sinPtr, cosPtr,
+                            B, qNumHeads, kNumHeads, N, headDim,
+                            sinB, sinH, hw, param->interleaved);
+                    }
                 } else {
+                    if (tablesAreFp16) {
+                        throw std::runtime_error(
+                            "ApplyRope FP16 tables require the BHND fast layout");
+                    }
                     ropeApplyNativeFp16PairLayouts(
                         (const uint16_t *)GetTensordata(qData),
                         (const uint16_t *)GetTensordata(kData),
@@ -1551,6 +1655,10 @@ namespace TFDLOP {
                     "ApplyRope native FP16 tensors require ARMv8.2 FP16");
 #endif
             } else if (GetTensorType(qData) == TFCAPI_UINT8 && GetTensorType(kData) == TFCAPI_UINT8) {
+                if (tablesAreFp16) {
+                    throw std::runtime_error(
+                        "ApplyRope FP16 tables require native FP16 Q/K tensors");
+                }
                 auto qQuant = GetTensorQuantizeInfo(tfContext, info.InputNames[0]);
                 auto kQuant = GetTensorQuantizeInfo(tfContext, info.InputNames[1]);
                 auto qOutQuant =
