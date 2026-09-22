@@ -1,6 +1,0 @@
-numpy
-safetensors
-transformers>=4.57
-Pillow
-opencv-python-headless
-torch
