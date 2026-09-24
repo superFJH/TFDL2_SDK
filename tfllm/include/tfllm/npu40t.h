@@ -1,6 +1,7 @@
 #pragma once
 #include "tfllm/engine.h"
 #include "tfllm/scheduler.h"
+#include "tfllm/spatial_conv.h"
 namespace tfllm {
 struct NpuOptions {
     int chip=0;
@@ -11,6 +12,16 @@ struct NpuOptions {
     int timeout_ms=30000, lock_timeout_ms=30000;
     std::vector<int> worker_cpus; // Four persistent pair workers.
     bool verify_outputs=false;
+    // Active QK INT32 budget across four independent pair lanes, per slot.
+    // Pipeline uses two slots; minimum 16 rows/lane can round the budget up.
+    // This is not the total execution workspace.
+    size_t attention_score_bytes=4*1024*1024;
+    size_t attention_lease_tiles=4; // Fairness boundary; release after this many tiles/pair.
+    bool attention_fused=true,attention_pipeline=true;
+    // 1..32 CPU participants per lane, including the pair worker. Also grows
+    // the shared CPU pool to at least this value minus one background threads.
+    // Ordinary CPU kernels retain their per-call limit of eight participants.
+    size_t attention_fuse_workers=16;
 };
 // Also useful for deployment planning without opening an NPU.
 uint64_t NpuMemoryBudget(uint64_t hugepage_bytes,double utilization);
@@ -27,8 +38,14 @@ public:
     void RunQuantizedInto(const Tensor&,const QuantizedInput&,Fp16OutputView) override;
     bool Healthy() const noexcept override;
     void Prepare(const Tensor&,size_t rows) override;
+    void Forget(const Tensor&) override;
+    std::shared_ptr<SpatialConvWeight> PrepareSpatial(const SpatialConvSpec&,const uint16_t*);
+    void RunSpatial(const std::shared_ptr<SpatialConvWeight>&,const uint16_t*,uint16_t*,size_t batch,size_t height,size_t width);
     Tensor PrepareDynamic(const Tensor&,const std::vector<size_t>& rows) override;
     size_t AttentionTileRows(size_t keys) const override;
+    bool SupportsAttentionFp16(size_t keys,size_t head_dim) const override;
+    bool RunAttentionFp16(const Tensor&,const Tensor&,Fp16InputView,
+                         Fp16OutputView,const AttentionMask&) override;
     void PrepareModel(const Model&,size_t max_rows=1024);
     PoolStats Stats() const;
     NpuMemoryStats MemoryStats() const;

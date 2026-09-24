@@ -1,5 +1,10 @@
 # TFLLM
 
+原生 NPU prefill / vision 的融合 Attention 与板端 `AttentionTest` / `VisionAttentionTest` 使用方法见 [Attention 测试说明](ATTENTION_TEST.md)。
+PyTorch 的 `NpuAttention` 也可直接调用相同融合后端（支持 causal/cross/GQA，不生成 Torch score/probability tile），用法与板端 sample 见 [PyTorch 模块](TORCH.md)。
+现有模型可通过 `tfllm.torch.optimize()` 自动接管受支持的 Linear/Conv2d 和 Transformers/Diffusers attention，保留原 Parameter/state_dict；函数式代码另提供 `make_backend()` 编译后端。支持范围、严格模式、覆盖报告及 `torch_auto.py` sample 见 [自动接管](TORCH.md#自动接管现有模型)。
+`make install` 会同时输出 pip 打包入口，在 `SDK/tfllm` 下执行 `python -m pip install .` 即可安装命令和可用的 Python 模块；详见 [安装树打包](PIP.md)。
+
 独立于 TFDL 图执行器的 LLM 运行时，接收 GGUF、生成 TFLLM 模型包，按真实长度分块 prefill，并与 llama.cpp 接力 decode。面向本地 0.1B–30B dense 模型；视觉支持 MoonViT、CLIP/SigLIP、InternVL、Pixtral、Qwen2/2.5/3-VL 的指定结构。patch 卷积用 Unfold + MatMul，复用整芯片 NPU 调度，不引入通用 Conv/Pool 图执行器。
 
 ## 模型支持范围
@@ -351,6 +356,16 @@ K/V 预处理新增 `kv_host_prepare`（普通主存快照、完整 `[K][N]` 排
 
 Recorder 在请求执行前按事件上限预留数组容量，记录期间不再扩容或搬移已有事件，消除原来 65536/131072 事件附近的整表搬移停顿。上限越高，profile 预留的额外内存容量越大；计时、字符串和记录锁的开销仍存在。图文请求建议 `--profile-max-events 1000000`。
 
+本地可视化查看 CSV（Python 3.10+，不需要 NPU 或第三方依赖）：
+
+```sh
+python3 TFLLM/tools/profile_viewer.py /path/to/tfllm_profile/run-xxxx --open
+```
+
+在 `http://127.0.0.1:8765` 查看可缩放的 CPU / TFACC 时间线、事件父子调用关系、形状和缓存详情、耗时排行及跨文件基线对照；也支持拖入多个 CSV 和导出 Chrome Trace。大文件按请求加载，时间线按视区聚合，不把父子或并行累计当成端到端时间。使用方法与计时口径见 [Profile Explorer](tools/profile_viewer/README.md)。
+
+需要独立桌面程序时，在 `TFLLM/tools/profile_viewer/desktop` 执行 `npm ci`，再用 `npm start` 开发运行或 `npm run dist` 打包。Electron 安装包内置 Python 后端，支持 macOS、Windows、Linux；详见 [桌面版与跨平台构建](tools/profile_viewer/desktop/README.md)。
+
 ### 独立的 prefill 优化路径
 
 公共接口保留 `RunFp16`；新增同步借用视图 `RunFp16Into`（行 stride、可选窗口行索引）、`QuantizedInput` 生产器和 `RunQuantizedInto`。CPU/第三方后端默认使用兼容路径；NPU 后端在 UINT8 执行空间补 K/M，INT32 反量化直接写有效 N 列和最终目标 stride。量化只扫描逻辑 K，填充值为零点 128；超长 K 继续在 FP32 中累加并最终缩窄一次。
@@ -362,7 +377,7 @@ Recorder 在请求执行前按事件上限预留数组容量，记录期间不�
 | `src/projection.cpp` | 分块投影、bias 和 FP16 边界 |
 | `src/dense_ffn.cpp` | 无 gate 的 up → 激活 → down 路径 |
 | `src/gated_ffn.cpp` | gate/up 共用一次输入量化；语言与视觉分别保留原激活舍入方式 |
-| `src/vision_attention.cpp` | 非因果全局/窗口视觉 Attention、直接写出、Softmax→AV 输入融合和 head 流水 |
+| `src/vision_attention.cpp` | 非因果全局/窗口视觉 Attention、真实维度 padding/mask、NPU INT32 融合后处理和双 head 并发 |
 | `src/tiled_attention.cpp` | 语言 causal/SWA/KV Attention，独立于视觉路径 |
 
 视觉融合仍把概率缩窄到 FP16（在寄存器中完成）后再量化，保持原 `Softmax → QuantizeRow` 的字节与 scale。支持并发的 NPU 后端默认最多两个 head 在途，进程内共用两个持久调度线程；这些线程独立于 CPU kernel 线程池，避免在 CPU pool 内等待 NPU。每个请求最多提交两个 head，按 FIFO 补充；底层继续以 pair 为调度单位。失败会等待所有已接受任务结束后再释放借用的输入/输出。Qwen3-VL 和其他 dense ViT 使用同一视觉 Attention 路径，预处理和各模型结构仍留在各自编码器中。
@@ -538,7 +553,9 @@ logits = session.Prefill(second_prompt_token_ids);
 
 TFLLM 以整颗芯片为单位管理 NPU。`CreateNpuPrefill()`、`CreateNpuLinear()` 和 `CreateNpuPrefillPool()` 都默认把物理 `0–7` 核加入调度，内部仍按 `0–1 / 2–3 / 4–5 / 6–7` 四组执行。不再提供 core 数量或 pair 列表；多芯片机器只通过 `NpuOptions::chip` 选择芯片，例如 `chip=1` 使用 `8–15`。八核参与调度不等于引擎空闲时长期独占芯片。
 
-每组有一个常驻 CPU 线程，在该线程上创建、使用、销毁 pair handler，遵守 SDK 的 core mutex 必须同线程加锁/解锁的要求。每个 MatMul 用 `MatMulSplitPolicy::Grid` 按整芯片切分，共享队列按就绪任务组公平分配 pair。空闲的组领取可执行分块，会话不永久绑定某一组。
+每组有一个常驻 CPU 线程，在该线程上创建、使用、销毁 pair handler，遵守 SDK 的 core mutex 必须同线程加锁/解锁的要求。普通 MatMul 用 `MatMulSplitPolicy::Grid` 按整芯片切分，共享队列按就绪任务组公平分配 pair。空闲的组领取可执行分块，会话不永久绑定某一组。
+
+原生 NPU FP16 attention 默认走专用路径：四个 pair 分别处理独立 query 行段，各自执行两核 Grid 的 QK→融合后处理→AV。一个有界任务默认最多处理四个 tile，期间保留 pair 租约，每次 CPU/NPU 数据交接仍完整 clean/invalidate；两个 slot 支持 CPU/NPU 重叠。K/V 和执行实例只在当前 head 内复用，返回前归还物理缓冲。以下逐 GEMM 的租约/后处理说明适用于普通 Linear 和通用 attention 回退路径；具体新行为及板端验收见 [AttentionTest](ATTENTION_TEST.md)。
 
 原生 FP16 任务边界是一次 `Linear::RunFp16`：投影/FFN/LM head，或者一个 QK/AV tile。内部超长 K/N 分块依次提交底层 MatMul，每个 MatMul 的 Grid 分块组成一个调度任务组。计划查找和输入量化不持驱动锁；需要新编译时临时取得整芯片进程锁。已有命令的执行只取得完整 pair，执行 launch/poll、两个 core 的 cache writeback/invalidate 和 cache 关闭，立即解锁。CPU cache 维护和反量化在解锁后完成，只读写该任务自己的内存。命令/工作区及编译缓存保留到淘汰或销毁，计划回收也纳入下述芯片协调。几何尺寸过小时可能只有一个 core 执行命令，执行期间仍取得完整 pair，保护共享高位地址寄存器。
 
@@ -667,13 +684,15 @@ llama decode 自己写入和发布其 KV；TFLLM prefill 则通过桥接器发�
 
 FP16 KV 位于 CPU 可访问内存；NPU 实际读的是独立 UINT8 执行缓冲，不是直接 DMA 读取 llama 的 malloc buffer。语言和视觉 attention 每次处理一个 KV head 时，先通过 `PrepareDynamic` 在普通主存生成不可变量化快照，提前准备完整 query 块和尾块需要的转置/列切分排布。K/N 需要补齐或分段时，同样提前准备每个 block；数值量化边界沿用原路径。
 
-换入执行空间只复制已准备的字节和尺度、完成 CPU cache 维护，不做量化或矩阵转置。槽内已有同一快照时连复制也跳过；并发会话使用各自快照及独占的在用槽，NPU 完成、cache 写回及 CPU 读取完成后槽才可复用。主存快照是运行时对象，不写入模型包。
+换入执行空间只复制已准备的字节和尺度、完成 CPU cache 维护，不做量化或矩阵转置。普通 GEMM 使用当次租用的动态工作区；新的原生融合 attention 在一个 head 内共享一份物理 K/V，不逐 tile 复制。并发会话使用各自快照及独占的在用槽，NPU 完成、cache 写回及 CPU 读取完成后槽才可复用。主存快照是运行时对象，不写入模型包。
 
 这版快照供一次 attention 的各个 query/GQA 块复用；追加 token 后仍重新准备有效历史。V 仍按输出 channel 沿历史长度计算 scale，未引入 per-token V scale 前移到 Softmax 输出的数值变化。因此当前不是永久增量 INT8 KV，也不是 UINT8 KV 零复制；llama decode 继续直接使用原来的 FP16 KV。
 
 ## FP16 激活与 CPU 内核
 
 原生 prefill 默认使用 `CreateFp16Prefill`：embedding、残差、Norm 输出、Q/K/V、RoPE 输出、QK scores、Softmax 概率、AV、FFN 和 LM head 输出均为 `Activation = vector<uint16_t>`，存储真实 IEEE FP16 位。`CreateNpuPrefill` 自动接入这条路径。`RunFp16` 从 Session 一直贯通 LinearPool、K/N 分块和 NPU adapter，普通路径没有整块 FP32 激活往返转换。
+
+融合 attention 是存储上的例外：保持 QK scores 和概率的 FP16 舍入语义，但不物化这两个完整 FP16 tile；直接从 INT32 经行级 FP32 scratch 生成 AV UINT8 输入。
 
 | 数据/阶段 | 类型 |
 |---|---|
@@ -757,7 +776,7 @@ cmake --build build/tfllm-board -j4
 
 - 投影/FFN/LM head：运行时逐行量化 A，直接调用 backend 编译 UINT8×UINT8→INT32，直接反量化为 FP16。
 - 多核：整芯片四个 pair 参与任务调度，以整芯片八核粒度复用 SDK 的 `MatMulSplitPolicy::Grid`，优先完全对齐的列切分，再考虑二维切分。静态 B 仅保存一份完整矩阵，各 shard 通过列偏移和原矩阵行步长读取。
-- Attention：按 KV head 组织 GQA，分块执行 QK、带 `past` 偏移及模型滑窗/softcap 的稳定 softmax、AV；不漏掉模型要求的 key。QK tile 的逻辑 INT32 预算 <=1 MiB；每个 tile 的 NPU 写回/CPU cache 维护完成后再消费。
+- Attention：按 KV head 组织 GQA，分块执行 QK、带 `past` 偏移及模型滑窗/softcap 的稳定 softmax、AV；不漏掉模型要求的 key。通用路径 QK tile 预算约 1 MiB；NPU FP16 专用路径默认四个 pair 合计 4 MiB/slot、至多双缓冲，融合 INT32 后处理并复用 head 级 K/V、命令和工作区。每个 tile 保留 CPU/NPU 交接所需的缓存维护。
 - 大矩阵：`CreateBlockedLinear` 将 K/N 超过 16384 的权重分块，尾部 K/N 补零到 64。K 分块的部分结果各自完成反量化后用 FP32 累加，N 分块散写回完整输出；bias 在完整 linear 结果上只加一次。UINT8 权重保留原输出通道 scale，输入逐块重新量化，因此误差可能与单块计算不同。
 - 单次底层 MatMul 仍要求 M<=1024、K/N 对齐 64、K<=16384。上层可处理更宽的 FFN 和大词表 LM head；没有丢弃 K 项或裁剪模型通道。NPU 路径的静态 host 分块权重保留到引擎析构，NPU 打包权重在行数/会话间共享；这些 host 数据及 llama 权重/KV 仍占普通 CPU 内存。
 - 本版 tiled Attention 上下文最多 16384，超限报错；不因模型支持 128K 就宣称已实现 NPU 128K。

@@ -1,5 +1,6 @@
 #pragma once
 #include "tfllm/activation.h"
+#include <utility>
 
 namespace tfllm {
 // Borrowed, synchronous views. Strides are in elements. Optional row indices
@@ -29,6 +30,17 @@ struct QuantizedInput {
     // leave this empty. Backends may use it to identify shared CPU preparation;
     // the NPU runtime slot still receives a copy on every execution.
     std::shared_ptr<const void> identity={};
+};
+// One KV head, with all its query/GQA rows expressed as indexed views. The
+// callback returns [first, end) visible keys for a logical query row. A backend
+// may consume INT32 scores directly; FP16 score/probability rounding remains
+// part of the contract. Returning false must leave output untouched.
+// K/V may contain physical zero padding. A shorter query.columns is padded
+// with zeros by the backend; only output.columns are written. The mask and
+// scale describe logical keys/head dimensions, never their padded sizes.
+struct AttentionMask {
+    float scale=1,soft_cap=0;
+    std::function<std::pair<size_t,size_t>(size_t)> interval;
 };
 // Snapshot shared by projections with the same input. Does not own NPU memory.
 QuantizedInput QuantizeInput(Fp16InputView);

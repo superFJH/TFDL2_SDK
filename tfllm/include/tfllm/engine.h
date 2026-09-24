@@ -80,6 +80,9 @@ public:
     // and never replays the failed operation on another device.
     virtual bool Healthy() const noexcept { return true; }
     virtual void Prepare(const Tensor&,size_t /*rows*/) {}
+    // Release cached static packing. Call after the owner's last invocation;
+    // in-flight backend jobs retain their own references.
+    virtual void Forget(const Tensor&) {}
     // Snapshot a dynamic operand for all query tile sizes before entering the
     // execution workspace. Backends may quantize/pack into ordinary host RAM.
     // Recreate after any KV change; the returned operand is immutable.
@@ -88,6 +91,11 @@ public:
     // bounded score working set; each completed task remains a scheduling
     // boundary. This does not change which keys are visible to a query.
     virtual size_t AttentionTileRows(size_t keys) const;
+    // Capability for physically padded K/V dimensions. Allows callers to
+    // avoid constructing padded snapshots when the fused path is unavailable.
+    virtual bool SupportsAttentionFp16(size_t /*keys*/,size_t /*head_dim*/) const {return false;}
+    virtual bool RunAttentionFp16(const Tensor&,const Tensor&,Fp16InputView,
+                                 Fp16OutputView,const AttentionMask&) {return false;}
     virtual std::vector<float> Run(const Tensor& weight, const std::vector<float>& input,
                                    size_t rows) = 0;
     // Production prefill uses binary16 end to end. The defaults are explicit
