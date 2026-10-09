@@ -61,6 +61,22 @@ python -m pip wheel . --no-deps -w /path/to/wheels
 [Python wheel 格式](https://packaging.python.org/en/latest/specifications/binary-distribution-format/)。
 该预编译安装树不支持 sdist 或 editable 安装。
 
+更新 SDK 后，已经通过 pip 安装的 `tfllm` 不会自动更新：wheel 在
+`tfllm_runtime/sdk` 内保存了独立副本。先完成新版 SDK 的 `cmake --install`，
+再在原 Python 环境重新安装，即使包版本仍为 `0.1.0`：
+
+```sh
+python3 -m pip install --force-reinstall --no-deps /path/to/SDK/tfllm
+hash -r
+```
+
+离线环境另加 `--no-build-isolation`，沿用前文的打包依赖。也可直接运行
+`/path/to/SDK/tfllm/bin/tfllm` 使用安装树。`type -a tfllm` 能查看当前 shell
+选中的命令；仅更新 SDK 中的库或 Python 文件不会更新旧 wheel。
+
 打包源码/原生 Torch 库必须配套；缺少任意一侧会直接报错。
+更新 Conv 对齐切分/stalling 诊断功能时，需要同步重建 `libNPU40T`（新增只读诊断接口）和 TFLLM，
+重新 `make install` 后再从安装树安装 Python 包；仅更新 `.py` 文件不生效。
+运行时可用 `TFLLM_NPU_DUMP_DIR=/path/to/debug` 指定故障文件目录，详见 [Torch 诊断说明](TORCH.md#npu-stalling--超时诊断文件)。
 从启用 Torch 切换到关闭 Torch 的构建时，CMake 不会删除旧安装产物，请安装到新的空 prefix，
 否则旧文件仍会被当作 SDK 的一部分。重复 wheel 构建会清理本包的生成目录，避免 build/ 残留进入新 wheel。

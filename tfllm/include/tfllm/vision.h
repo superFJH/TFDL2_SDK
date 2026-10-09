@@ -7,6 +7,8 @@ struct VisionConfig {
     size_t layers=0,hidden=0,intermediate=0,heads=0,output=0,patch=0,merge=2,position_side=0;
     size_t temporal=2,window=0,full_attention_period=0;
     bool rms=false;
+    bool position_align_corners=false;
+    size_t min_pixels=0,max_pixels=0;
     std::string activation="gelu";
     std::vector<size_t> feature_layers;
     float epsilon=1e-6f;

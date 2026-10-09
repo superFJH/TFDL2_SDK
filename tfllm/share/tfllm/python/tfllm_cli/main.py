@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -13,9 +14,22 @@ from .runtime import Engine, library_path
 from .server import make_server
 
 
+def npu_jit_cache_dir(cache_dir, manifest):
+    cache = Path(cache_dir).expanduser().resolve()
+    package = Path(manifest["package"]).resolve()
+    # Converted models already have a content/version-keyed cache directory.
+    if package.parent.parent == cache:
+        return str(package.parent / "npu-jit")
+    # A directly opened package may be read-only. Keep its recipes under the
+    # selected cache root too; recipes contain geometry, not model weights.
+    identity = json.dumps([str(package), manifest.get("mmproj") or ""])
+    key = hashlib.sha256(identity.encode()).hexdigest()
+    return str(cache / "npu-jit" / key)
+
+
 def main(profile_build=False):
     parser = argparse.ArgumentParser(prog="tfllm_profile" if profile_build else "tfllm", description="Native TFLLM NPU prefill with llama.cpp CPU decode")
-    parser.add_argument("command", choices=["serve", "chat"])
+    parser.add_argument("command", choices=["serve", "chat", "transcribe"])
     parser.add_argument("model", help="Transformers directory, GGUF file/directory, prepared cache directory, or repository ID")
     parser.add_argument("--model-source", choices=["huggingface", "modelscope"])
     parser.add_argument("--revision")
@@ -23,7 +37,11 @@ def main(profile_build=False):
     parser.add_argument("--cache-dir", default=os.environ.get("TFLLM_CACHE_DIR", "~/.cache/tfllm"))
     parser.add_argument("--backend", choices=["npu", "cpu"], default="npu", help="CPU is explicit host testing, never an automatic fallback")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
-    parser.add_argument("--mmproj", default="auto", help="Vision GGUF; auto discovers/converts it, none disables images/video")
+    parser.add_argument("--mmproj", default="auto", help="Vision/audio GGUF; auto discovers/converts it")
+    parser.add_argument("--audio", type=Path, help="Local audio file for transcribe (WAV/FLAC/MP3/OGG)")
+    parser.add_argument("--language", help="Transcription language (e.g. zh, en, Chinese); omitted means auto detection")
+    parser.add_argument("--response-format", choices=["text", "json", "verbose_json"], default="text")
+    parser.add_argument("--max-audio-seconds", type=int, default=120, help="Maximum audio duration per request (1..120)")
     parser.add_argument("--max-image-tokens", type=int, default=1024, help="Maximum merged visual tokens per image (1..4096)")
     parser.add_argument("--image", type=Path, action="append", default=[], help="Attach a local image to the first chat turn (repeatable)")
     parser.add_argument("--max-video-tokens", type=int, default=2048, help="Total merged visual tokens across videos per request (1..4096)")
@@ -31,6 +49,7 @@ def main(profile_build=False):
     parser.add_argument("--video-fps", type=float, default=2, help="Target sampling rate; frames cover the whole clip when capped (0..30]")
     parser.add_argument("--video", type=Path, action="append", default=[], help="Attach a local video to the first chat turn (repeatable, Qwen3-VL)")
     parser.add_argument("--chip", type=int, default=0)
+    parser.add_argument("--npu-jit-shapes", type=Path, help="Precompile additional GEMM/attention geometries from npu_jit_shapes.py before READY")
     parser.add_argument("--context", type=int, default=4096)
     parser.add_argument("--threads", type=int, default=4, help="total CPU decode threads shared by all sequences")
     parser.add_argument("--max-num-seqs", type=int, default=4)
@@ -57,6 +76,17 @@ def main(profile_build=False):
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, interrupt)
     try:
+        if not 1 <= args.max_audio_seconds <= 120:
+            raise ValueError("--max-audio-seconds must be in 1..120")
+        if args.command == "transcribe":
+            if not args.audio or args.image or args.video:
+                raise ValueError("transcribe requires --audio FILE")
+            from .asr import audio_dependencies, language_name, local_audio
+            language_name(args.language)
+            audio_dependencies()
+            audio_data = local_audio(args.audio)
+        elif args.audio or args.language:
+            raise ValueError("--audio and --language are for transcribe; serve accepts uploaded audio")
         if not 0<args.gpu_memory_utilization<=1 or not 1<=args.max_num_seqs<=64 or args.max_pending_requests<args.max_num_seqs:
             raise ValueError("Invalid memory utilization or concurrency limits")
         if args.context<64 or args.context%64 or not 1<=args.threads<=256 or not 0<=args.chip<=9 or not 0<=args.port<=65535:
@@ -90,21 +120,67 @@ def main(profile_build=False):
         installed = bin_dir.parent / "share" / "tfllm" / "llama"
         converter_dir = installed if installed.is_dir() else Path(os.environ["TFLLM_LLAMA_CONVERTER"])
         manifest = prepare(args, bin_dir, converter_dir)
+        if manifest.get("modality") == "audio":
+            from .asr import audio_dependencies
+            audio_dependencies()
         print(f"TFLLM decode: weights={manifest['decode_quantization']} threads={args.threads} gguf={manifest['gguf']}",
               file=sys.stderr, flush=True)
-        engine = Engine(library, dict(package=manifest["package"], gguf=manifest["gguf"], backend=args.backend,
+        engine_options = dict(package=manifest["package"], gguf=manifest["gguf"], backend=args.backend,
+                                     npu_jit_warmup=args.command == "serve",
                                      context=args.context, threads=args.threads, max_sequences=args.max_num_seqs,
                                      mmproj=manifest.get("mmproj") or "", max_image_tokens=args.max_image_tokens,
                                      max_video_tokens=args.max_video_tokens, video_max_frames=args.video_max_frames, video_fps=args.video_fps,
-                                     gpu_memory_utilization=args.gpu_memory_utilization, chip=args.chip, **profile_options))
+                                     max_audio_seconds=args.max_audio_seconds,
+                                     gpu_memory_utilization=args.gpu_memory_utilization, chip=args.chip, **profile_options)
+        if args.backend == "npu" and args.command == "serve":
+            engine_options["npu_jit_cache_dir"] = npu_jit_cache_dir(args.cache_dir, manifest)
+        if args.npu_jit_shapes:
+            if args.backend != "npu":
+                raise ValueError("--npu-jit-shapes requires --backend npu")
+            shape_file = json.loads(args.npu_jit_shapes.read_text())
+            if not isinstance(shape_file, dict) or shape_file.get("version") != 1:
+                raise ValueError("NPU JIT shape file requires version=1")
+            shapes = shape_file.get("shapes")
+            if not isinstance(shapes, list) or len(shapes) > 4096:
+                raise ValueError("NPU JIT shape file requires at most 4096 shapes")
+            for s in shapes:
+                if not isinstance(s, dict) or set(s) != {"m", "k", "n", "cores"} or any(type(v) is not int for v in s.values()):
+                    raise ValueError("Each NPU JIT shape requires integer m, k, n, cores")
+                if not (16 <= s["m"] <= 1024 and s["m"] % 16 == 0 and
+                        all(64 <= s[d] <= 16384 and s[d] % 64 == 0 for d in ("k", "n")) and s["cores"] in (2, 8)):
+                    raise ValueError("NPU JIT shape exceeds supported dimensions/alignment")
+            engine_options["npu_jit_shapes"] = shapes
+        template = args.chat_template.read_text() if args.chat_template else None
+        defaults = {k: getattr(args, k) for k in ("max_tokens", "temperature", "top_p", "top_k", "seed")}
+        if args.command == "transcribe":
+            from .asr import Transcriber, native_stdout_to_stderr, response_body
+            with native_stdout_to_stderr():
+                engine = Engine(library, engine_options)
+                try:
+                    chat = Chat(engine.info, manifest, template, defaults, kwargs)
+                    result = Transcriber(engine, chat).transcribe(audio_data, args.language, args.system)
+                    if "error" in result:
+                        raise RuntimeError(result["error"])
+                    if result.get("finish_reason") == "cancelled":
+                        raise RuntimeError("Transcription cancelled")
+                    print("TFLLM_REQUEST " + json.dumps({k: v for k, v in result.items() if k != "text"}), file=sys.stderr, flush=True)
+                finally:
+                    engine.close()
+            output = response_body(result, args.response_format)
+            print(output if isinstance(output, str) else json.dumps(output, ensure_ascii=False, allow_nan=False))
+            return 0
+        engine = Engine(library, engine_options)
         try:
-            template = args.chat_template.read_text() if args.chat_template else None
-            defaults = {k: getattr(args, k) for k in ("max_tokens", "temperature", "top_p", "top_k", "seed")}
+            # Direct ASR GGUF imports may not carry the HF modality manifest.
+            if "audio" in engine.info.get("modalities", []):
+                from .asr import audio_dependencies
+                audio_dependencies()
             chat = Chat(engine.info, manifest, template, defaults, kwargs)
             model = args.served_model_name or args.model.rstrip("/").split("/")[-1]
             print(f"TFLLM_READY model={model} architecture={engine.info['architecture']} modalities={','.join(engine.info['modalities'])} backend={engine.info['backend']} context={args.context} max_sequences={args.max_num_seqs} decode_scheduler={engine.info.get('decode_scheduler', 'unknown')} decode_threads={args.threads} profile_compiled={int(profile_build)} profiling={int(bool(profile_options))}", file=sys.stderr, flush=True)
             if args.command == "serve":
-                server = make_server(engine, chat, args.host, args.port, model, args.max_pending_requests, args.api_key)
+                server = make_server(engine, chat, args.host, args.port, model, args.max_pending_requests, args.api_key,
+                                     audio_prompt=args.system)
                 print(f"TFLLM listening http://{args.host}:{server.server_port}/v1", file=sys.stderr, flush=True)
                 try:
                     server.serve_forever(poll_interval=0.2)
@@ -113,6 +189,8 @@ def main(profile_build=False):
                 finally:
                     server.server_close()
             else:
+                if "audio" in engine.info.get("modalities", []):
+                    raise ValueError("Use tfllm transcribe MODEL --audio FILE or serve /v1/audio/transcriptions for ASR")
                 messages = [dict(role="system", content=args.system)] if args.system else []
                 print("TFLLM chat: /clear resets history, /exit quits.", file=sys.stderr)
                 attachments = list(args.image)

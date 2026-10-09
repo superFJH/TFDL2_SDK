@@ -9,6 +9,9 @@ Activation HalfActivation(const std::vector<float>&);
 std::vector<float> FloatActivation(const Activation&);
 namespace cpu {
 const char* KernelName();
+// TFLLM_CPU_ACTIVATION_LUT=0 keeps the arithmetic path for A/B tests.
+// The default lookup path preserves each unary operator's FP16 boundary.
+const char* ActivationKernelName();
 // Shared persistent CPU workers. Call before pinning NPU worker threads.
 void Initialize();
 // Grow the process-wide pool to at least max_workers-1 background threads.
@@ -39,10 +42,19 @@ void AccumulateRow(const int32_t*,float*,size_t,float,const float*);
 void Norm(const uint16_t*,uint16_t*,size_t rows,size_t width,const float* weight,float epsilon);
 void LayerNorm(const uint16_t*,uint16_t*,size_t rows,size_t width,const float* weight,const float* bias,float epsilon);
 void Gelu(uint16_t*,size_t,bool exact=false);
+enum class UnaryActivation {Gelu, Silu, QuickGelu, GeluErf};
+// GeluErf preserves the projector's x/sqrt(2), distinct from Gelu(exact=true).
+void Activate(uint16_t*,size_t,UnaryActivation);
+// CPU-only producer; reuses row-local scratch and never queues nested work.
+float ActivateQuantizeRow(const uint16_t*,uint8_t*,size_t,UnaryActivation,Activation& scratch);
 void Add(uint16_t*,const uint16_t*,size_t);
 // Projection BiasAdd is an FP16 boundary: both operands and the result are
 // binary16. Norm affine parameters remain FP32 and use LayerNorm/Norm above.
 void Bias(uint16_t*,size_t rows,size_t width,const uint16_t*);
+// NCHW channel bias, with FP32 addition and an FP16 boundary. The fused
+// variant applies exact-erf GELU to that rounded value in the same traversal.
+void BiasNchw(uint16_t*,size_t batch,size_t channels,size_t spatial,const uint16_t*);
+void BiasGeluNchw(uint16_t*,size_t batch,size_t channels,size_t spatial,const uint16_t*);
 void Gate(uint16_t*,const uint16_t*,size_t,bool gelu);
 void SigmoidMul(uint16_t* value,const uint16_t* gate,size_t);
 void Rope(uint16_t*,size_t rows,size_t heads,size_t dim,bool neox,const float* cosine,const float* sine);

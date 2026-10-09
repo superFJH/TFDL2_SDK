@@ -44,5 +44,8 @@ struct AttentionMask {
 };
 // Snapshot shared by projections with the same input. Does not own NPU memory.
 QuantizedInput QuantizeInput(Fp16InputView);
+// Activation -> FP16 -> complete-row quantization in one CPU row group.
+// Columns must be a multiple of four to preserve GELU's global SIMD tails.
+QuantizedInput QuantizeActivatedInput(Fp16InputView,cpu::UnaryActivation);
 void ValidateLinearViews(const Tensor&,Fp16InputView,Fp16OutputView);
 }

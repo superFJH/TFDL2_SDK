@@ -18,6 +18,7 @@ __all__ = [
 
 TEXT_MODEL_MAP: dict[str, str] = {
     "TFLLMLocateText": "tfllm_dense",
+    "TFLLMPaddleText": "tfllm_ocr",
     "AfmoeForCausalLM": "afmoe",
     "LagunaForCausalLM": "laguna",
     "ApertusForCausalLM": "llama",
@@ -289,6 +290,7 @@ MMPROJ_MODEL_MAP: dict[str, str] = {
     "TFLLMDenseVision": "tfllm_dense",
     "TFLLMInternVision": "tfllm_dense",
     "TFLLMLocateVision": "tfllm_dense",
+    "TFLLMPaddleVision": "tfllm_ocr",
     "AudioFlamingo3ForConditionalGeneration": "ultravox",
     "CogVLMForCausalLM": "cogvlm",
     "DeepseekOCR2ForCausalLM": "deepseek",

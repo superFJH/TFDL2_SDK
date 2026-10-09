@@ -224,6 +224,13 @@ class Qwen3ASRMmprojModel(Qwen3OmniMmprojModel):
     has_audio_encoder = True
     has_vision_encoder = False
 
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        c = self.get_audio_config()
+        self.gguf_writer.add_uint32("tfllm.audio.chunk_frames", c.get("n_window", 50) * 2)
+        self.gguf_writer.add_uint32("tfllm.audio.attention_frames", c.get("n_window_infer", 800))
+        self.gguf_writer.add_uint32("tfllm.audio.conv_chunks", c.get("conv_chunksize", 500))
+
 
 @ModelBase.register("Glm4vForConditionalGeneration", "Glm4vMoeForConditionalGeneration", "GlmOcrForConditionalGeneration")
 @ModelBase.example("zai-org/GLM-4.1V-9B-Thinking", "zai-org/GLM-4.5V")
@@ -352,11 +359,26 @@ class Qwen3ASRTextModel(Qwen3VLTextModel):
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
         self.gguf_writer.add_num_deepstack_layers(0)
+        self.gguf_writer.add_string("tfllm.source_architecture", "qwen3-asr")
 
     def set_vocab(self):
         super().set_vocab()
+        # TFLLM preserve an audio-aware template for standalone GGUF users.
+        template_path = self.dir_model / "chat_template.jinja"
+        template_json = self.dir_model / "chat_template.json"
+        with open(self.dir_model / "tokenizer_config.json", "r", encoding="utf-8") as f:
+            template_config = json.load(f)
+        if template_path.is_file():
+            template = template_path.read_text()
+        elif template_json.is_file():
+            template = json.loads(template_json.read_text())["chat_template"]
+        else:
+            template = template_config.get("chat_template")
+        if template:
+            self.gguf_writer.add_chat_template(template)
         # fix chat template, use correct chatml format
-        self.gguf_writer.add_chat_template("{% for message in messages %}{{'<|im_start|>' + message['role'] + '\\n' + message['content'] + '<|im_end|>' + '\\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{% endif %}")
+        if not template:
+            self.gguf_writer.add_chat_template("{% for message in messages %}{{'<|im_start|>' + message['role'] + '\\n' + message['content'] + '<|im_end|>' + '\\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{% endif %}")
         # correct BOS/EOS tokens
         with open(self.dir_model / "tokenizer_config.json", "r", encoding="utf-8") as f:
             tokenizer_config = json.load(f)

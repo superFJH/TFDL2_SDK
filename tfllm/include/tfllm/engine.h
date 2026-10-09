@@ -18,6 +18,12 @@ struct Policy {
     size_t short_threshold = 32, max_prefill = 1024, alignment = 64;
     Execution Next(size_t past, size_t remaining, size_t capacity) const;
 };
+// Lexical, thread-bound scope. Destroy on the creating thread in reverse
+// creation order, after all its synchronous operators/worker jobs drain.
+class LinearWorkspaceScope {
+public:
+    virtual ~LinearWorkspaceScope()=default;
+};
 class Backend {
 public:
     virtual ~Backend() = default;
@@ -28,6 +34,7 @@ public:
                                    const int32_t* tokens) = 0;
     virtual const char* Name() const = 0;
     virtual void Prepare(const Model&,size_t /*max_rows*/) {}
+    virtual std::unique_ptr<LinearWorkspaceScope> BeginWorkspaceReuse(){return {};}
 };
 // Metadata and visibility handoff for a cache shared with another engine.
 class CacheBridge {
@@ -73,9 +80,17 @@ private:
 };
 // A linear implementation may use NPU40T. Input/output are [rows, channels];
 // immutable weights are [output channels, input channels].
+class AttentionWorkspaceScope {
+public:
+    virtual ~AttentionWorkspaceScope()=default;
+};
 class Linear {
 public:
     virtual ~Linear() = default;
+    // Retain bounded private execution buffers during this call's graph.
+    // Nested scopes for the same backend may join the enclosing scope.
+    // Other caller threads never share mutable instances. CPU defaults no-op.
+    virtual std::unique_ptr<LinearWorkspaceScope> BeginWorkspaceReuse(){return {};}
     // False after an unrecoverable device failure. A pool retires this worker
     // and never replays the failed operation on another device.
     virtual bool Healthy() const noexcept { return true; }
@@ -96,6 +111,14 @@ public:
     virtual bool SupportsAttentionFp16(size_t /*keys*/,size_t /*head_dim*/) const {return false;}
     virtual bool RunAttentionFp16(const Tensor&,const Tensor&,Fp16InputView,
                                  Fp16OutputView,const AttentionMask&) {return false;}
+    // A caller-owned encode scope may retain at most a bounded number of
+    // idle private workspaces. Backends must pressure-evict them and refresh
+    // K/V on reuse. Destroy only after all scoped head jobs have drained.
+    virtual std::shared_ptr<AttentionWorkspaceScope> CreateAttentionWorkspaceScope(){return {};}
+    virtual bool RunAttentionFp16Scoped(const Tensor& k,const Tensor& v,Fp16InputView q,Fp16OutputView out,
+                                       const AttentionMask& mask,const std::shared_ptr<AttentionWorkspaceScope>&) {
+        return RunAttentionFp16(k,v,q,out,mask);
+    }
     virtual std::vector<float> Run(const Tensor& weight, const std::vector<float>& input,
                                    size_t rows) = 0;
     // Production prefill uses binary16 end to end. The defaults are explicit

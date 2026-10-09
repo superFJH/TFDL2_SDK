@@ -1202,6 +1202,18 @@ class ModelBase:
                 config = json.load(f)
             return config
 
+        # TFLLM OCR: AutoConfig migrates legacy VL configs and drops wrapper
+        # context overrides. These supported checkpoints are already complete.
+        if (dir_model / "config.json").is_file():
+            with open(dir_model / "config.json", "r", encoding="utf-8") as f:
+                original = json.load(f)
+            architectures = original.get("architectures") or original.get("text_config", {}).get("architectures") or []
+            if architectures and architectures[0] == "Qwen3ASRForConditionalGeneration" and "thinker_config" in original:
+                # TFLLM: expose decoder width to the mmproj converter too.
+                original["text_config"] = original["thinker_config"]["text_config"]
+            if architectures and architectures[0] in ("PaddleOCRVLForConditionalGeneration", "Qwen2VLForConditionalGeneration", "Qwen2_5_VLForConditionalGeneration", "Qwen3ASRForConditionalGeneration"):
+                return original
+
         try:
             # for security reason, we don't allow loading remote code by default
             # if a model need remote code, we will fallback to config.json
@@ -1277,9 +1289,17 @@ class TextModel(ModelBase):
         else:
             self.hf_arch = ""
 
+        # TFLLM: original Qwen3-ASR checkpoints nest text under thinker.
+        if self.hf_arch == "Qwen3ASRForConditionalGeneration" and "thinker_config" in self.hparams:
+            self.hparams = {**self.hparams, **self.hparams["thinker_config"]}
         if "text_config" in self.hparams:
             # move the text_config to the root level
+            # TFLLM: MinerU Pro declares its extended context at the wrapper
+            # level while retaining the old 8192 default in text_config.
+            top_context = self.hparams.get("max_position_embeddings", 0)
             self.hparams = {**self.hparams, **self.hparams["text_config"]}
+            if self.hf_arch in ("Qwen2VLForConditionalGeneration", "Qwen2_5_VLForConditionalGeneration") and top_context:
+                self.hparams["max_position_embeddings"] = max(top_context, self.hparams.get("max_position_embeddings", 0))
 
         self.block_count = self.find_hparam(["n_layers", "num_hidden_layers", "n_layer", "num_layers"])
         self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
@@ -2821,6 +2841,10 @@ def get_model_architecture(hparams: dict[str, Any], model_type: ModelType) -> st
     # TFLLM LocateAnything slow/AR mode uses its Qwen2 text sub-config.
     if model_type == ModelType.MMPROJ and arch == "LocateAnythingForConditionalGeneration":
         return "TFLLMLocateVision"
+
+    # TFLLM PaddleOCR: support original and native Transformers layouts.
+    if arch == "PaddleOCRVLForConditionalGeneration":
+        return "TFLLMPaddleVision" if model_type == ModelType.MMPROJ else "TFLLMPaddleText"
 
     # TFLLM dense HF wrappers; preserve the original checkpoint on disk.
     if model_type == ModelType.MMPROJ and arch in ("LlavaForConditionalGeneration", "LlavaNextForConditionalGeneration") and vision_config.get("model_type") in ("clip_vision_model", "siglip_vision_model"):

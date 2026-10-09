@@ -16,7 +16,9 @@ VISION_ARCHITECTURES = {"Qwen3VLForConditionalGeneration", "Qwen2VLForConditiona
                         "Qwen2_5_VLForConditionalGeneration", "LlavaForConditionalGeneration",
                         "LlavaNextForConditionalGeneration", "Mistral3ForConditionalGeneration",
                         "InternVLChatModel", "InternVLForConditionalGeneration",
-                        "Gemma3ForConditionalGeneration", "LocateAnythingForConditionalGeneration"}
+                        "Gemma3ForConditionalGeneration", "LocateAnythingForConditionalGeneration",
+                        "PaddleOCRVLForConditionalGeneration"}
+AUDIO_ARCHITECTURES = {"Qwen3ASRForConditionalGeneration"}
 
 
 def check_safetensors(files):
@@ -137,16 +139,20 @@ def source_files(path, gguf_file=None):
     config = read_json(path / "config.json")
     # Do not silently produce a llama fallback or load arbitrary Python model code.
     supported = {"LlamaForCausalLM", "Qwen2ForCausalLM", "Qwen3ForCausalLM", "Qwen3VLForConditionalGeneration",
-                 "GemmaForCausalLM", "Gemma2ForCausalLM", "Gemma3ForCausalLM"} | VISION_ARCHITECTURES
+                 "GemmaForCausalLM", "Gemma2ForCausalLM", "Gemma3ForCausalLM"} | VISION_ARCHITECTURES | AUDIO_ARCHITECTURES
     if not set(architectures(config)) & supported:
         raise ValueError("No native TFLLM importer for architectures=" + str(config.get("architectures")))
-    for cfg in (config, config.get("text_config", {}), config.get("llm_config", {}), config.get("vision_config", {})):
+    thinker = config.get("thinker_config", {})
+    if not isinstance(thinker, dict):
+        raise ValueError("Invalid thinker_config")
+    for cfg in (config, config.get("text_config", {}), config.get("llm_config", {}), config.get("vision_config", {}),
+                thinker, thinker.get("text_config", {}), thinker.get("audio_config", {})):
         if isinstance(cfg,dict) and any(cfg.get(k,0) for k in ("num_experts", "num_local_experts", "n_routed_experts", "num_experts_per_tok")):
             raise ValueError("TFLLM supports dense models only; MoE is unsupported")
     text_config = config.get("text_config", {})
     if not isinstance(text_config, dict):
         raise ValueError("Invalid text_config: expected an object")
-    if config.get("quantization_config") or text_config.get("quantization_config"):
+    if config.get("quantization_config") or text_config.get("quantization_config") or thinker.get("text_config", {}).get("quantization_config"):
         raise ValueError("Quantized safetensors import is not validated; use floating safetensors or a supported quantized GGUF")
     if "LocateAnythingForConditionalGeneration" in architectures(config):
         vision = config.get("vision_config", {})
@@ -168,7 +174,9 @@ def source_files(path, gguf_file=None):
     if index.is_file():
         for name in set(read_json(index)["weight_map"].values()):
             file = (path / name).resolve()
-            if not file.is_relative_to(path.resolve()) or not file.is_file():
+            # HF snapshot shards are legitimate symlinks into ../blobs.
+            # Reject path traversal in the index, rather than its link target.
+            if Path(name).name != name or not file.is_file():
                 raise ValueError("Missing/invalid weight shard: " + name)
     metadata = sorted(p for p in path.rglob("*") if p.is_file() and
                       p.suffix in {".json", ".jinja", ".model", ".txt", ".tiktoken"} and ".cache" not in p.relative_to(path).parts)
@@ -195,6 +203,13 @@ def prepare(args, bin_dir, converter_dir):
             raise ValueError("Model path does not exist: " + args.model)
         original = download(args.model, args.model_source or "huggingface", args.revision, args.gguf_file, selection)
     original = original.resolve()
+    if original.is_dir() and (original / "snapshots").is_dir() and not (original / "config.json").is_file():
+        ref = original / "refs/main"
+        choices = [original / "snapshots" / ref.read_text().strip()] if ref.is_file() else sorted((original / "snapshots").iterdir())
+        choices = [p for p in choices if (p / "config.json").is_file()]
+        if len(choices) != 1:
+            raise ValueError("Select one HF snapshot directory explicitly")
+        original = choices[0].resolve()
     if original.is_dir() and (original / "manifest.json").is_file():
         manifest = load_manifest(original)
         if selection == "none":
@@ -206,13 +221,14 @@ def prepare(args, bin_dir, converter_dir):
             manifest["mmproj"] = str(file)
         return manifest
     source, files, hf = source_files(original, args.gguf_file)
+    is_asr = hf and bool(set(architectures(read_json(source / "config.json"))) & AUDIO_ARCHITECTURES)
     mmproj = None
     export_vision = False
     directory = source if hf else source.parent
     if selection == "auto":
         if hf:
             config = read_json(source / "config.json")
-            export_vision = bool(set(architectures(config)) & VISION_ARCHITECTURES) and (
+            export_vision = bool(set(architectures(config)) & (VISION_ARCHITECTURES | AUDIO_ARCHITECTURES)) and (
                 (source / "preprocessor_config.json").is_file() or (source / "processor_config.json").is_file()
                 or "InternVLChatModel" in architectures(config))
         else:
@@ -235,7 +251,9 @@ def prepare(args, bin_dir, converter_dir):
         raise RuntimeError("Missing tfllm-convert; build/install with TFLLM_WITH_LLAMA=ON")
     revision_file = converter_dir / "REVISION"
     version = revision_file.read_text().strip() if revision_file.is_file() else "checkout"
-    key_data = [CACHE_VERSION, version, fingerprint(files), fingerprint([converter]), "u8-row-symmetric", "vision-dense-v2", export_vision, str(mmproj), "bf16-decode-q4_0-v1"]
+    key_data = [CACHE_VERSION, version, fingerprint(files), fingerprint([converter]), "u8-row-symmetric", "vision-dense-v2", export_vision, str(mmproj), "auto-decode-q4_0-v2"]
+    if is_asr:
+        key_data.append("asr-f16-source-q4_0-decode-v2")
     # Converter changes must invalidate already compiled HF packages too.
     if hf:
         key_data.append(fingerprint(sorted((converter_dir / "conversion").glob("*.py"))))
@@ -261,7 +279,9 @@ def prepare(args, bin_dir, converter_dir):
                     raise RuntimeError("Missing installed HF converter")
                 gguf = temporary / "source.gguf"
                 try:
-                    run([sys.executable, script, source, "--outtype", "auto", "--outfile", gguf])
+                    # ASR keeps its validated F16 source export for native
+                    # prefill; the converter creates an independent Q4 decode.
+                    run([sys.executable, script, source, "--outtype", "f16" if is_asr else "auto", "--outfile", gguf])
                 except subprocess.CalledProcessError as e:
                     raise RuntimeError("HF conversion failed (see converter output). Install its pinned dependencies with: "
                         f"{sys.executable} -m pip install -r {converter_dir / 'requirements/requirements-convert_hf_to_gguf.txt'}") from e
@@ -269,7 +289,9 @@ def prepare(args, bin_dir, converter_dir):
                 mmproj = temporary / "mmproj.gguf"
                 run([sys.executable, script, source, "--mmproj", "--outtype", "auto", "--outfile", mmproj])
             decode = temporary / "decode-q4_0.gguf"
-            run([converter, gguf, temporary / "model", "--require-native", "--decode-q4-if-bf16", decode])
+            run([converter, gguf, temporary / "model", "--require-native", "--decode-q4-auto", decode])
+            if is_asr and not decode.is_file():
+                raise RuntimeError("Qwen3-ASR import requires a paired Q4_0 decode GGUF")
             # If input changed while converting, do not publish this snapshot.
             if fingerprint(files) != key_data[2]:
                 raise RuntimeError("Source model changed during conversion; retry")
@@ -288,6 +310,8 @@ def prepare(args, bin_dir, converter_dir):
                             decode_quantization="q4_0" if decode.is_file() else "source",
                             source=str(source), source_fingerprint=key_data[2], generation_config=generation,
                             chat_template=template, mmproj="mmproj.gguf" if export_vision else str(mmproj) if mmproj else None)
+            if is_asr:
+                manifest["modality"] = "audio"
             (temporary / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2))
             if destination.exists():
                 shutil.rmtree(destination)  # An incomplete entry under this key's lock.

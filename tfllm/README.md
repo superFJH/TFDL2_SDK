@@ -17,7 +17,9 @@ PyTorch 的 `NpuAttention` 也可直接调用相同融合后端（支持 causal/
 | `qwen2` | Qwen2、Qwen2.5、对应 Qwen 蒸馏模型 | 原生，支持 Q/K/V bias |
 | `qwen3` | Qwen3 dense | 原生，支持 Q/K norm |
 | `qwen2vl` | Qwen2-VL、Qwen2.5-VL dense | 原生图文 prefill、连续分段三轴 MRoPE、共享 KV；配套 Qwen2/2.5 mmproj |
+| `paddleocr` | PaddleOCR-VL-1.6 | 原生动态分辨率视觉编码、2x2 projector、图文 MRoPE prefill、共享 KV decode |
 | `qwen3vl` | Qwen3-VL dense，如 Qwen3-VL-4B-Instruct | 原生图文/视频 prefill、三轴 MRoPE、DeepStack、共享 KV；配套 `qwen3vl_merger` mmproj |
+| `qwen3vl` + `tfllm.source_architecture=qwen3-asr` | Qwen3-ASR-1.7B / 0.6B dense | 原生音频 Conv2d/Linear/窗口 Attention、causal 音频 prefill、共享 KV decode；配套 `qwen3a` 音频 mmproj |
 | `gemma` | Gemma 1 | 原生，embedding 缩放、GELU、共享 embedding/LM head 权重 |
 | `gemma2` | Gemma 2 | 原生，额外 Norm、滑窗、attention/logits softcap |
 | `gemma3` | Gemma 3 文本 decoder | 原生，Q/K norm、额外 Norm、每层滑窗及 RoPE 参数 |
@@ -28,6 +30,10 @@ PyTorch 的 `NpuAttention` 也可直接调用相同融合后端（支持 causal/
 Qwen3-VL 纯文本的 T/H/W position 相同，三轴 interleaved MRoPE 等价于完整 head 的 NeoX RoPE；文本输入的 deepstack 附加 embedding 为零。导入保留 `qwen3vl` 架构身份、Q/K norm、独立的 head_dim 与共享 embedding/head 权重，prefill 使用原生 TFLLM，短 prefill/decode 使用对应 llama 图。仅接受合法的三轴全 head MRoPE；Qwen3-VL MoE 尚未加入原生路径。加载配套 mmproj 后，图像特征通过 `PromptInput` 注入 embedding/DeepStack；图像 chunk 强制走 TFLLM，后续文本短 prefill/decode 接力 llama。KV 物理槽位与 RoPE T/H/W 分离，追加/回滚按实际 token 槽位管理。
 
 这里的“原生”是已实现结构语义和转换，不代表表中每个真实 checkpoint 都已上板验收。
+
+最新 MinerU 4.0 的 `MinerU2.5-Pro-2605-1.2B` 和 PaddleOCR-VL-1.6 可通过 TFLLM 的 OpenAI 兼容服务接入各自文档管线。模型版本、启动命令、客户端配置与验证范围见 [OCR.md](OCR.md)。
+
+Qwen3-ASR 的文件转写、`/v1/audio/transcriptions` 服务、生命周期和验证范围见 [ASR.md](ASR.md)。1.7B 音频编码器的本机 W8A8 精度对照工具、量化范围和真实语音实验见 [ASR 量化验证](ASR_QUANTIZATION.md)。
 
 本轮不扩展 MoE。`serve`/`chat` 的 HF 导入拒绝 MoE，模型包要求 `--require-native`，不会因不支持的视觉或语言结构静默改用整模型 CPU。底层显式 llama fallback 接口保留原有行为。
 
@@ -52,6 +58,8 @@ cmake -S TFLLM -B build/tfllm-llama -DCMAKE_BUILD_TYPE=Release -DTFLLM_WITH_LLAM
 cmake --build build/tfllm-llama -j4
 ctest --test-dir build/tfllm-llama --output-on-failure
 ```
+
+Linux AArch64 的 NPU40T 构建默认给 ggml 设置 `GGML_CPU_ARM_ARCH=armv8.2-a+fp16+dotprod`，启用 Cortex-A77 的 FP16 / DOTPROD 内核；`GGML_CPU_REPACK` 默认 ON，让 Q4_0 权重使用运行时重排内核。已有构建缓存中空的 ARM_ARCH 也会更新。配置日志打印 `TFLLM llama CPU`，可核对生效的选项。macOS、本地 CPU 构建及 `GGML_CPU_ALL_VARIANTS=ON` 使用原来的架构选择；显式设置 `-DGGML_CPU_ARM_ARCH=...` 或 `-DGGML_CPU_REPACK=OFF` 可覆盖默认值。
 
 适配器给 `llama_kv_cache` 添加一个明确的 friend 声明，并修正固定版 CPU IMRoPE 的 Qwen3-VL 尾部坐标选择：`[24,20,20]` 的 H/W 交错区域之外继续使用 T，不能选第四个坐标。两处补丁由 [apply_bridge.py](adapters/llama/apply_bridge.py) 校验提交及源码锚点后幂等应用；构建时自动生效，无需手改 submodule。当前 TFLLM 编译的 llama 后端为 CPU，该修正不覆盖外部 llama GPU 后端。不依赖猜测 private 对象布局的强制转换。内部 API 不是 upstream 的稳定 C API，因此必须固定提交。
 
@@ -132,16 +140,31 @@ tfllm chat Qwen/Qwen3-VL-4B-Instruct --model-source modelscope --image /images/e
 `--revision` 固定仓库版本。下载复用 provider 自己的缓存；本地目录不访问下载 provider。
 
 首次自动执行 HF → 浮点 GGUF → 原生 UINT8 包；已有 GGUF 直接进入第二步。转换使用 `--require-native`，不支持的架构/配置直接报错，禁止生成整模型 CPU 回退包。
-对于未量化的 BF16 源模型，首次导入还通过内置 llama 量化 API 生成 CPU decode 专用 `decode-q4_0.gguf`，`serve/chat` 自动加载它，无需增加启动参数或单独安装 `llama-quantize`。NPU UINT8 权重仍直接从 BF16 源 GGUF 生成，不从 Q4_0 再次量化；两份文件的内容身份写入模型包，运行时只接受原始 GGUF 或对应的 decode GGUF，不能混用另一模型。默认选择 Q4_0（32 个权重一组），使用 llama 的量化与 CPU 重排实现，norm/bias 和不满足分块条件的张量采用 upstream 的浮点保留/回退，不能理解为所有张量都只有 4 bit。共享 KV 仍为 FP16。
-F16/F32 以及已经量化的 GGUF 保持原有 decode 格式（包括混合低比特/BF16 的 GGUF），不会自动重新量化；本策略也适用于直接输入未量化 BF16 GGUF 及其分片。mmproj 独立导入视觉 NPU 路径，不生成 CPU decode 副本。启动打印 `TFLLM decode: weights=q4_0 threads=... gguf=...`，用于确认选中的 decode 文件。Q4_0 会带来额外量化误差，实际模型需复测精度与速度。
+对于未量化的 BF16 源模型以及 Qwen3-ASR 的浮点语言源模型，首次导入还通过内置 llama 量化 API 生成 CPU decode 专用 `decode-q4_0.gguf`，`serve/chat/transcribe` 自动加载它，无需增加启动参数或单独安装 `llama-quantize`。NPU UINT8 权重直接从原始浮点 source GGUF 生成；两份文件的内容身份写入模型包，运行时只接受原始 GGUF 或对应的 decode GGUF，不能混用另一模型。默认选择 Q4_0（32 个权重一组），使用 llama 的量化与 CPU 重排实现，norm/bias 和不满足分块条件的张量采用 upstream 的浮点保留/回退，不能理解为所有张量都只有 4 bit。共享 KV 仍为 FP16。
+普通语言/视觉模型的 F16/F32 GGUF 以及已经量化的 GGUF 保持原有 decode 格式（包括混合低比特/BF16 的 GGUF）；Qwen3-ASR 的 F16/F32/BF16 浮点 decoder 均自动生成配对 Q4_0。本策略也适用于直接输入未量化 GGUF 及其分片。mmproj 独立导入原生视觉/音频编码路径，不生成 CPU decode 副本。ASR 默认 NPU 路径为 W8A8 音频、W8A8 语言 prefill、W4 llama CPU decode，详见 [ASR.md](ASR.md)。启动打印 `TFLLM decode: weights=q4_0 threads=... gguf=...`，用于确认选中的 decode 文件。Q4_0 会带来额外量化误差，实际模型需复测精度与速度。
 下表支持的 HF 多模态结构可直接传完整 snapshot 路径（包括 `.cache/huggingface/hub/.../snapshots/...`）。默认 `--mmproj auto`：有 `preprocessor_config.json` 或 `processor_config.json` 时，固定版转换器分别提取语言 GGUF 和视觉 mmproj GGUF，后者随缓存一起保存；原版 `InternVLChatModel` 没有 processor JSON 时采用其 ImageNet 归一化默认值。不修改下载目录，也不执行下载模型附带的 Python 代码。已下载的语言 GGUF 会自动发现同目录唯一的 `mmproj*.gguf`，有多个时必须指定 `--mmproj FILE`。`--mmproj none` 仅启用文本。图像模式启动显示 `modalities=text,image`；Qwen3-VL 配套视觉模型另显示 `video`。
 浮点 safetensors 导入在读取权重前检查分片、dtype、参数量（不超过 30B）；AWQ/GPTQ/FP8 等量化 safetensors 暂不接受，可以使用当前支持的量化 GGUF。
 GGUF 的 Q4/Q8/K-quant 先解码，再重新量化成 NPU UINT8 权重，因此存在额外量化误差及磁盘/内存开销，不等同于 NPU 直接执行 Q4。
 
 转换缓存默认 `~/.cache/tfllm`，可用 `--cache-dir` 或 `TFLLM_CACHE_DIR` 修改。缓存区与来源目录分离，使用进程锁、源文件身份/变更信息、转换器版本和临时目录原子发布；重复启动不重新转换。
 HF 缓存目录包含 `source.gguf`、`model.tfllm`、`model.weights`、`model.commands`、`manifest.json`，图像模式还有 `mmproj.gguf`，可以把整个目录复制到板端直接启动，无需保留原 HF 目录。GGUF 输入若保留原 decode 格式，缓存引用原 GGUF，必须保留源文件全部分片。
-BF16 导入的缓存另外包含 `decode-q4_0.gguf`，manifest 的 `gguf` 指向它、`source_gguf` 保留原始来源；运行配对 Q4_0 时不需要再加载 BF16 源文件，但保留它可做原始精度对照。新的缓存版本为 3，继续使用原模型路径启动会自动生成 Q4_0 新缓存，不命中旧 Q8_0 导入缓存，旧目录不覆盖；若直接传入版本 1/2 的准备目录，会提示从原模型路径重新导入。首次生成 Q4_0 增加转换耗时和磁盘占用，后续启动复用，量化失败或文件缺失会报错，不会静默回到 BF16。
-权重缓存不是完整离线硬件编译产物；NPU 仍按已有 JIT 机制创建、复用命令计划。
+BF16 和 Qwen3-ASR 浮点导入的缓存另外包含 `decode-q4_0.gguf`，manifest 的 `gguf` 指向它、`source_gguf` 保留原始来源；运行配对 Q4_0 时不需要再加载浮点 source 文件，但保留它可做原始精度对照。缓存版本为 3，新导入策略另有缓存键标记：继续使用原模型路径启动会自动生成 Q4_0 新缓存，不命中旧 Q8_0 或 ASR F16 导入缓存，旧目录不覆盖；若直接传入版本 1/2 的准备目录，会提示从原模型路径重新导入。显式传入已有版本 3 的准备目录按其 manifest 运行；切换 ASR 的新默认应传原模型路径。首次生成 Q4_0 增加转换耗时和磁盘占用，后续启动复用，量化失败或文件缺失会报错。
+权重缓存不是完整离线硬件编译产物。`serve` 在 READY 前为已准备的静态 Linear/FFN 编译 16～1024 行、步长 16 的 CPU 命令模板；只输出一行的 LM head 按其 Prepare 上限编译。ASR 同时预编译标准 100-frame 音频块经过三层 Conv 的几何。预热不执行推理、不分配执行工作区；未覆盖的动态 Attention/特殊 Conv 尺寸仍按需 JIT。
+
+`serve` 默认同时开启 **JIT 磁盘缓存**。首次编译的 GEMM（包含 Attention QK/AV）和 Spatial Conv 会自动保存完整 CPU 命令镜像、重定位表及 LUT/bias 初始化数据。启动先将兼容的磁盘模板载入内存，再补编缺少的预热尺寸；运行中遇到的新尺寸也会保存，下次启动命中后无需重新编译。
+转换模型存放于 `<cache-dir>/<模型缓存键>/npu-jit/<构建及策略键>/`；直接打开其他目录里的原生模型包时，存放于 `<cache-dir>/npu-jit/<模型路径键>/<构建及策略键>/`。日志 `NPU_JIT_CACHE dir=... loaded=... skipped=...` 给出实际位置和加载数量，`saved=...` 表示新模板已落盘。`TFLLM_NPU_JIT_CACHE_DIR=/path` 可指定目录，`TFLLM_NPU_JIT_CACHE=0` 关闭读写。
+构建版本、芯片编号或命令 cache 策略不同会隔离缓存；损坏文件跳过并在需要时重新编译。文件通过临时文件与原子 rename 发布。缓存只保留可重定位的 CPU 模板，工作区、物理地址绑定、命令空间申请和首次 materialize 仍在本次进程执行；它也不是 KV、音频特征或视觉特征缓存。
+
+`TFLLM_NPU_JIT_ROWS=64,128,256,512,1024` 可缩小启动预热表，`all` 覆盖全部 64 种行对齐，`0` 关闭自动预热，仍会加载已保存的磁盘模板。推理仍保持原有 16 行对齐，不为预热表额外补齐。CPU 模板会增加启动时间和主机内存，启动日志给出预热几何数、耗时及命令镜像字节数。`chat` / `transcribe` 默认不自动预热或设置磁盘目录，显式设置环境变量仍生效。
+
+可从已采集的 profile 补齐动态 Attention 等实际几何：
+
+```sh
+python3 TFLLM/tools/npu_jit_shapes.py /path/to/profile-run --output npu-jit-shapes.json
+tfllm serve MODEL --npu-jit-shapes npu-jit-shapes.json
+```
+
+JSON 只包含 M/K/N 和逻辑核数；更换 Attention score budget、切分策略或输入尺寸后，新几何仍可能触发 JIT。`TFLLM_NPU_JIT_ROWS=0` 搭配该文件可仅预热 profile 中的几何。实现分析及 workspace 分类见 [NPU_WORKSPACE_OPTIMIZATION.md](NPU_WORKSPACE_OPTIMIZATION.md)。
 
 默认后端是 NPU。启动应显示 `TFLLM_READY ... backend=npu40t-chip-fp16`；SDK 没有编译 NPU adapter、设备初始化或内存预留失败都会报错，不会自动切成 CPU。
 本地功能测试可以显式使用 `--backend cpu`，其日志会显示 CPU prefill 后端。长 prefill 使用 NPU MatMul 和 CPU 算子，默认不超过 32 token 的短块及 decode 仍按既定策略走 llama CPU。
@@ -346,7 +369,7 @@ mkdir -p perf
 - `.csv`：所有原始 span，包含父子 ID、线程、NPU pair、M/K/N、补齐后的 M、计划命中、descriptor 数、分配/输出字节数、淘汰数。每次 Append 计算结束后写盘。
 - `.md`：端到端和精度对照、按成本排序的算子/层、各 NPU 阶段、逐算子阶段归属、计划命中/失配、队列/worker 汇总；分别统计 `first`、`warmup`、`measured`，显示调用均值、p50/p90、每次 Append 累计耗时和占比。
 
-覆盖投影/FFN/LM head、Norm、RoPE 表生成/应用、残差、激活乘法、KV 写入/交接/历史整理、QK/Softmax/AV、gather/scatter。NPU Linear 分为 `plan_lookup`、`jit`、`input_quantize`、`cpu_cache_before`、`lease_wait`、`pair_prepare`、`npu_execute`、`pair_release_writeback`、`cpu_cache_dequant`；JIT 进一步记录 chip gate 等待、arena/淘汰、权重量化/打包、SDK 编译绑定。超长 K/N 的权重块打包和最终 narrowing 也有单独记录。NPU FP16 路径不再分配补齐用的 FP16 输入/输出中间缓冲。
+覆盖投影/FFN/LM head、Norm、RoPE 表生成/应用、残差、激活乘法、KV 写入/交接/历史整理、QK/Softmax/AV、gather/scatter。NPU Linear 分为 `plan_lookup`、`jit`、`input_quantize`、`cpu_cache_before`、`lease_wait`、`pair_prepare`、`npu_execute`、`pair_release_writeback`、`cpu_cache_dequant`；开启异步写回时，`cpu_cache_dequant` 内另记录 `pair_writeback_wait` 和 `pair_release_finalize`，分别表示 ACK 等待与关闭 cache/解锁。JIT 进一步记录 chip gate 等待、arena/淘汰、权重量化/打包、SDK 编译绑定。超长 K/N 的权重块打包和最终 narrowing 也有单独记录。NPU FP16 路径不再分配补齐用的 FP16 输入/输出中间缓冲。
 
 K/V 预处理新增 `kv_host_prepare`（普通主存快照、完整 `[K][N]` 排布）与其子阶段 `kv_host_quantize`、`kv_host_transpose`。转置使用 32×32 分块、AArch64 NEON 8×8 字节内核，非 ARM 使用分块标量实现；不改变量化尺度、舍入或输出字节。执行槽换入记录 `kv_stage_copy`，`bytes` 是实际复制的量化字节数，`cache_hit=1` 表示槽内已有同一快照，本次跳过复制。`plan_weight_rebind` 现在位于 pair worker 内，只更新实际执行的大小核描述符；核类型迁移时再更新另一份。其子事件 `rebind_chip_gate_wait` 记录共享生命周期屏障的锁等待，`rebind_sdk_calls` 记录该 pair 实际修改的描述符（当前 ACP-only 实验版含命令修改与屏障，不执行 CPU cache clean）。后者的 `descriptors` 是调用数量。它们现在是可重叠的 worker-time，不能与旧版启动线程上的串行累计直接作为端到端收益比较。`plan_window_evict` 记录执行计划分配时的批量淘汰数，`weight_placement_evict` 记录新权重放置失败后的回收；这些指标仍只在 `_profile` 构建中存在。
 
@@ -469,7 +492,108 @@ pair cache 控制默认使用两核并行请求：prepare 先向两核发出 typ
 新 SDK 首次使用 pair cache 时输出 `NPU_PAIR_CACHE version=1 mode=parallel`。
 环境变量 `TFDL_NPU40T_PAIR_CACHE_SERIAL=1` 可切回原来的逐核串行流程，启动时读取，
 日志标记 `mode=serial`；用于同一二进制的 A/B 比较，不会跳过 cache 维护。
-本轮保留原来的 yield 轮询方式，没有同时引入短自旋或跨任务持锁，便于归因。
+需要 CPU 等 ACK 的同步路径仍使用 yield 轮询，没有引入短自旋或跨任务持锁。
+
+`TFLLM_USE_CACHE` 控制 TFLLM 的 **NPU 硬件 cache**，启动时读取，只接受 `0/1`，
+默认 `1`。设为 `0` 时，普通 linear、空间 Conv 和融合 Attention 都将两个核配置为
+uncached 地址映射，直接读写内存。命令完成仍通过 `tfaccSync(...,0)` 确认，CPU/device
+内存屏障、pair 进程锁和高位地址所有权仍保留；命令、工作区和 KV 缓存独立管理。
+
+统一进程交接约定：所有使用相同 NPU 驱动锁的软件，包括 TFDL 和其他 TFLLM 进程，
+都必须在释放锁前完成命令，并自行确保需要保留的输出已写回 DDR。写回责任属于
+释放锁的一方，下一任使用者不代为完成。cached TFLLM 默认对两核全 cache 做
+同步 clean/invalidate，确认完成、关闭 cache 后再归还锁；uncached TFLLM 直接写入内存。
+
+cached 执行默认使用异步 prepare：同时向两核发 `type=7`（只失效、不写回），
+发布 MMIO 请求、配置 cache 后立即返回，`pair_prepare` 不读取或轮询 ACK。
+复用计算命令中已有的 cache 同步/`SyncAll`，确保首次访问操作数前完成失效，
+不新增计算命令。如果某核没有完成过计算命令，则释放或 cache handoff 前先等
+incoming 失效，避免用 writeback 请求覆盖它。
+启动预留内存和命令池扩容仍使用同步 prepare。
+
+`TFLLM_NPU_CACHE_PREPARE_ASYNC` 启动时读取，只接受 `0/1`，默认 `1`；设为 `0`
+恢复执行阶段的 CPU ACK 轮询，便于对照。关闭 NPU cache 时此选项不参与执行。
+cached 启动日志标记 `prepare_wait=command_syncall` 或 `prepare_wait=cpu_ack`。
+这项优化需要一起重新构建、安装 NPU40T SDK 和 TFLLM；沿用当前驱动。
+比较相同录音的请求总延迟及 `pair_prepare`、`npu_execute`：硬件失效等待仍然存在，
+可能计入计算命令的同步时间，实际净收益需要板端 profile 验证。
+
+另有默认关闭的 `TFLLM_NPU_CACHE_IN_COMMAND=1` 模板级策略，共用原 Helper，将安全输出块的
+异步写回插入计算命令，并在命令末尾完整清理。开启方式、TFDL 隔离范围与限制见
+[NPU_COMMAND_CACHE.md](NPU_COMMAND_CACHE.md)。该新路径尚待板端验证。
+
+PaddleOCR 板端范围写回出现过 `non-finite FP16 activation`；切换 LOW32 地址后仍有
+`non-finite attention score`，关闭旧版异步范围写回后恢复正常。根因尚未确认，不能
+仅凭 ACK 或错误位置变化认定地址域已经修复。因此默认恢复全量同步写回，并把范围
+选择与 ACK 等待位置分开。以下变量均在启动时读取，只接受 `0/1`，默认均为 `0`：
+
+| WRITEBACK_ASYNC | WRITEBACK_RANGE | 行为 / 启动日志 |
+| --- | --- | --- |
+| 0 | 0 | 两核全 cache 同步写回，释放时等 ACK；`writeback=all_sync` |
+| 1 | 0 | 两核提交 `type=6`，反量化前等 ACK；`writeback=all_async` |
+| 1 | 1 | 活跃核提交输出范围 `type=0`，反量化前等 ACK；`writeback=output_range_async` |
+
+表中变量都有 `TFLLM_NPU_CACHE_` 前缀。`RANGE=1` 要求 `ASYNC=1`。关闭 NPU cache
+时这两个选项不参与执行。融合 Attention 的中途 handoff 和最终 pair 释放都维持
+全量同步写回，使其不再随这些实验开关一起变化。
+
+异步路径的 `pair_release_writeback` 记录提交，`pair_writeback_wait` 在首次读取
+INT32 输出前等待 ACK，`pair_release_finalize` 随后关闭 cache、归还锁。输出内存和
+operand HIGH 一直保留到完成。只执行一个 shard 时，全量模式需要先 drain 未执行
+核的 prepare，才能覆盖它的请求寄存器。ACK 等待是反量化事件的子事件，不要重复相加。
+
+范围候选仍用完整输出 view（含硬件 padding）的 LOW32、请求 HIGH=0；这一地址
+匹配方案仍待板端确认。`TFLLM_NPU_CACHE_WRITEBACK_CHECK=1` 要求 cached + ASYNC +
+RANGE，在范围 ACK 后保持 pair/HIGH 所有权，保存输出，再做全量写回并逐字节比较。
+不一致立即报 `NPU_WRITEBACK_MISMATCH`，包含 core、地址、长度、首个差异位置及
+`range_i32/full_i32`；`changed_before_full=1` 表示在补全量写回之前输出就已经变化。
+诊断会增加读内存、复制与全量写回开销，不用于性能测量；失败保留锁与缓冲。
+若诊断请求通过，仍不能证明范围模式独立正确，因为额外全量清理改变了后续任务的
+缓存状态。下一步需结合纯全量异步模式区分范围匹配、ACK 时序和缓存交接问题。
+
+一起重建 SDK 和 TFLLM 后，在原服务启动命令前设置下面变量，再跑同一张 digits 图：
+
+```sh
+export TFLLM_USE_CACHE=1
+export TFLLM_NPU_CACHE_WRITEBACK_ASYNC=1
+export TFLLM_NPU_CACHE_WRITEBACK_RANGE=1
+export TFLLM_NPU_CACHE_WRITEBACK_CHECK=1
+# 接原来的 tfllm serve 命令；日志应有 writeback_check=range_vs_all。
+# 全量异步对照：RANGE=0 CHECK=0，保持 ASYNC=1。
+# 已知可用的同步对照：ASYNC=0 RANGE=0 CHECK=0。
+```
+
+本轮未做本机编译或测试，由板端验证。
+
+关闭模式下，每次取得 pair 都直接重写两核的 uncached 映射；即使前任留下 cached
+或未知配置，也只关闭 cache，不发 clean/invalidate 请求、不等待 cache ACK。
+首次配置后记录两核实际映射上限读回值，寄存器的保留位或未实现位不要求读回
+`0xffffffff`。记录的是硬件对全范围映射的表示，并非当前 cache 模式；之后仍读取
+真实寄存器验证本次配置。执行期间跳过 Attention 的 cache handoff；释放时确认
+命令完成且仍为 uncached 后归还 pair，不再写回/失效。命令失败或映射验证失败，
+都保留锁和 DMA 缓冲并隔离芯片。
+首次配置输出 `NPU_UNCACHED_MAPPING ... source=hardware_readback`。若映射验证失败，
+输出 `NPU_CACHE_MAPPING` 的实际/期望寄存器值；启动清理错误同时保留 pair、模式、
+SDK 状态和原因，便于区分映射变化与配置失败。
+
+此开关需要一起重新构建、安装 `NPU40T` SDK 库和 TFLLM，沿用当前驱动。
+启动日志应包含 `TFLLM_NPU_CACHE enabled=0 mode=direct_memory incoming_cleanup=none writeback_owner=outgoing`。
+profile 中关闭模式的释放事件为 `pair_release_uncached`，不出现执行期间的
+`pair_release_writeback` 和 `attention_cache_handoff`；`pair_prepare` 只包含 uncached
+配置和映射读回检查。
+
+```sh
+# NPU cache 关闭；保持相同的模型、线程数和请求录音做对照。
+TFLLM_USE_CACHE=0 tfllm serve Qwen3-ASR-1.7B/ \
+  --served-model-name qwen3-asr --host 0.0.0.0 --port 8119 --threads 32
+# 重新启动时设为 1，或不设置这个变量，即恢复默认 cached 模式。
+```
+
+本地 `tfllm-npu-cache-test` 检查 cached→uncached→cached 的 MMIO 顺序、cached 模式
+的双核 ACK/超时、uncached 模式首次与后续交接的零维护请求/ACK 等待，以及映射
+读回和失败检查；`tfllm-npu-cache-disabled[_profile]` 用注入 SDK
+检查 GEMM/Conv/Attention 的数值、输入刷新、工作区复用和无 cache handoff；真实 NPU
+读写一致性和 cached/uncached 的耗时对照需在板端验证。
 
 ```sh
 # 先检查请求顺序、失败后的持锁行为以及真实板端数值/跨进程交接。
@@ -557,7 +681,7 @@ TFLLM 以整颗芯片为单位管理 NPU。`CreateNpuPrefill()`、`CreateNpuLine
 
 原生 NPU FP16 attention 默认走专用路径：四个 pair 分别处理独立 query 行段，各自执行两核 Grid 的 QK→融合后处理→AV。一个有界任务默认最多处理四个 tile，期间保留 pair 租约，每次 CPU/NPU 数据交接仍完整 clean/invalidate；两个 slot 支持 CPU/NPU 重叠。K/V 和执行实例只在当前 head 内复用，返回前归还物理缓冲。以下逐 GEMM 的租约/后处理说明适用于普通 Linear 和通用 attention 回退路径；具体新行为及板端验收见 [AttentionTest](ATTENTION_TEST.md)。
 
-原生 FP16 任务边界是一次 `Linear::RunFp16`：投影/FFN/LM head，或者一个 QK/AV tile。内部超长 K/N 分块依次提交底层 MatMul，每个 MatMul 的 Grid 分块组成一个调度任务组。计划查找和输入量化不持驱动锁；需要新编译时临时取得整芯片进程锁。已有命令的执行只取得完整 pair，执行 launch/poll、两个 core 的 cache writeback/invalidate 和 cache 关闭，立即解锁。CPU cache 维护和反量化在解锁后完成，只读写该任务自己的内存。命令/工作区及编译缓存保留到淘汰或销毁，计划回收也纳入下述芯片协调。几何尺寸过小时可能只有一个 core 执行命令，执行期间仍取得完整 pair，保护共享高位地址寄存器。
+原生 FP16 任务边界是一次 `Linear::RunFp16`：投影/FFN/LM head，或者一个 QK/AV tile。内部超长 K/N 分块依次提交底层 MatMul，每个 MatMul 的 Grid 分块组成一个调度任务组。计划查找和输入量化不持驱动锁；需要新编译时临时取得整芯片进程锁。已有命令的执行只取得完整 pair，执行 launch/poll 后默认完成两核全量同步写回、关闭 cache 并解锁，再进入反量化。开启异步写回时，ACK 等待、关闭 cache 和解锁移到反量化首次读输出之前。CPU cache 维护和数值转换在解锁后完成，只读写该任务自己的内存。命令/工作区及编译缓存保留到淘汰或销毁，计划回收也纳入下述芯片协调。几何尺寸过小时可能只有一个 core 执行命令，执行期间仍取得完整 pair，保护共享高位地址寄存器。
 
 同进程、同芯片的原生 NPU 引擎共用 JIT/执行协调锁：编译、计划淘汰和析构使用独占锁，取得 pair 到完成缓存清理使用共享锁。已有计划的四组计算仍可并行，CPU 量化/反量化不占此锁。HugePage 启动预留和 SDK 命令编译还会临时取得四个 pair 的驱动进程锁，因为底层物理分配会对整颗芯片发出范围失效。固定池中的普通操作数分配只做用户态子分配；它不再触发物理池增长。外部 TFDL 若自行在未持锁时调用会影响整芯片的分配接口，仍需它或驱动侧协调，这不在 TFLLM 调度器控制范围内。
 
@@ -604,7 +728,9 @@ auto stats = pool.scheduler->Stats();
 
 `NpuOptions::gpu_memory_utilization` 和 CLI 的 `--gpu-memory-utilization` 范围为 `(0,1]`，默认 0.8。按目标 chip 注册的 HugePage 总容量计算，向下取整到完整 1 GiB 单元：32 GiB × 0.8 → **25 GiB**。不足 1 GiB、没有 HugePage、空闲块不足均明确报错，不回退到额外 DDR 或悄悄提高上限。
 
-通过新的 SDK 私有池 API 一次预留，在多个 4 GiB 地址窗口中管理；25 GiB 连续地址空间通常对应 7 个窗口。TFDL 原有可扩容 arena 不受影响，也不能分配这块 TFLLM 私有池。模型初始化检查非 KV 权重/workspace 下限，实际 NPU 分配按对齐字节计费。每个 HIGH 窗口的高地址端保留运行区，其余低地址空间放静态权重；当前默认运行区 1 GiB、权重区 3 GiB，严格按实际预留段裁剪，两区不能互相借用。静态权重驻留，运行数据在执行后归还。空闲模板可按 CPU 模板数量上限淘汰。
+通过新的 SDK 私有池 API 一次预留，在多个 4 GiB 地址窗口中管理；25 GiB 连续地址空间通常对应 7 个窗口。TFDL 原有可扩容 arena 不受影响，也不能分配这块 TFLLM 私有池。模型初始化检查非 KV 权重/workspace 下限，实际 NPU 分配按对齐字节计费。每个 HIGH 窗口的高地址端保留运行区，其余低地址空间放静态权重；当前默认运行区 1 GiB、权重区 3 GiB，严格按实际预留段裁剪，两区不能互相借用。静态权重驻留，运行数据在请求/编码作用域结束后归还。空闲模板可按 CPU 模板数量上限淘汰。
+
+普通投影、FFN 和 projector 默认在单次 prefill 请求（含分块）或图片/音频编码内复用执行工作区。同形状、同 HIGH 的静态层更新权重绑定和输入/尺度后沿用 A/C、scratch 和命令；不同请求线程各自持有私有实例。音频 Conv 的同一权重与几何也跨分块复用私有实例，稳定地址下只更新量化参数与 bias，详见 [ASR.md](ASR.md)。`TFLLM_NPU_WORKSPACE_REUSE=0` 可关闭；`TFLLM_NPU_WORKSPACE_CACHE_MIB` 默认 `1024`，范围 `1..4096`，限制每作用域的空闲 GEMM/Conv 工作区＋命令字节，最多 32 个实例，按需保留。命令连续空间不足时先在固定预算和 256 MiB 上限内增长，增长失败再回收空闲实例；其他容量不足仍先回收。请求结束归还该作用域的全部操作数和命令租用，底层命令池容量保留供后续请求使用；不会预先分配缓存预算。JIT 模板仍可跨请求缓存。实现、profile 阶段和验收见 [NPU_RUNTIME_SLOTS.md](NPU_RUNTIME_SLOTS.md)。
 
 1 GiB 是注册页和预算取整的单位，`TF_MODEL_POOL_ALLOC` 返回的连续段可以更小。驱动在窗口低地址零处保留 1 MiB，IOVA 也可能跨窗口；预留按实际返回字节累计，在窗口剩余不足 1 GiB 时缩小申请，直到凑齐预算。不能要求每段恰好 1 GiB，否则连续 32 GiB 的八个窗口可能最多只收集到 24 GiB。`--gpu-memory-utilization 1` 也可能因保护区或已有占用而失败；不会降低实际预算来假装成功。
 
@@ -633,7 +759,13 @@ export TFLLM_NPU_RUNTIME_MIB=512
 
 Session 初始化转换、打包并上传静态矩阵；`Prepare(1024)` 不预编译 1024 行命令。首个 M/K/N 编译不可变 CPU 配方，包含命令图像、相对布局和地址补丁。每次执行先租用一块完整操作数工作区与一块独立 direct 命令区，再把命令直接写入最终缓冲并修正 A/B/C/HIGH。内部 LUT/scratch 和输入输出只是偏移视图，不逐项分配，不克隆 `MatMulHelper`。全部 pair 写回和 CPU 读取完成后归还两块空间。
 
-**空闲实例池、LRU 和 `TFLLM_NPU_IDLE_INSTANCES` 已删除。** 最多 4 个准备/在用任务共享运行区；每个同时执行的任务仍持有独立可修改命令、A/C 和临时 K/V。CPU 配方缓存不保留运行时物理地址。编译、打包、命令生成在各查询/申请锁之外；真实物理扩容仍独占 chip gate。详细生命周期、主机测试与板端验收见 [NPU_RUNTIME_SLOTS.md](NPU_RUNTIME_SLOTS.md)。
+**跨请求的全局空闲实例池和 `TFLLM_NPU_IDLE_INSTANCES` 已删除。** 请求/编码作用域内保留有界空闲实例。最多 4 个准备/在用任务共享运行区；每个同时执行的任务仍持有独立可修改命令、A/C 和临时 K/V。CPU 配方缓存不保留运行时物理地址。编译、打包、命令生成在各查询/申请锁之外；真实物理扩容仍独占 chip gate。详细生命周期、主机测试与板端验收见 [NPU_RUNTIME_SLOTS.md](NPU_RUNTIME_SLOTS.md)。
+
+原生视觉 attention 每个 scope 可保留最多两套空闲私有工作区，复用命令并刷新 K/V 与尺度；Dense 和 Qwen3 vision 均覆盖整次编码，跨 head、跨层复用匹配几何，Qwen3 的每张静态图片或每个视频帧对分别使用独立 scope。命令 miss 优先有界增长，增长失败或运行区不足时回收空闲实例；scope 结束后全部归还。普通 GEMM 在请求/编码作用域内复用。`TFLLM_NPU_ATTENTION_SCORE_MIB=1..16` 调整每 slot 的 QK INT32 score 预算（默认 4 MiB），`TFLLM_NPU_ATTENTION_FUSE_WORKERS=1..32` 调整每 lane 的 CPU 参与线程数（默认 16）。变量在 scheduler 创建时覆盖 SDK 参数，非法值在 NPU 初始化前报错；更改需重启。激活查表和工作区复用的 A/B 开关及测试方法见 [OCR.md](OCR.md#vision-优化与-score-budget-调优)。
+
+融合 Attention（语言 prefill、音频和视觉共用）按 score 预算和额外 padding 上限选择 1..4 个 pair lane。`TFLLM_NPU_ATTENTION_PADDING_PERCENT=0..100` 控制额外计算比例，默认 25：所有 lane 的所有 tile（包括尾块）实际执行的 query 行数不能超过 `RoundUp(query_rows,16) × 1.25`。超过上限就减少 lane；单 lane 的尾块仍超限时缩小 M。16 行硬件对齐属于基准开销，`0` 表示切分不能增加该基准以外的 padding。score 预算不足以容纳每 lane 至少 16 行时也减少 lane，不再把内存预算向上放大。
+
+例如 73 行、128 keys 的音频 Attention：原来 4 lane × M32 执行 128 行；默认选择 3 lane × M32，执行 96 行（比 80 行对齐基准多 20%）。设置 `TFLLM_NPU_ATTENTION_PADDING_PERCENT=0` 则选择 1 lane × M80，执行 80 行。182 行的语言 GQA Attention 仍选择 4 lane × M48，执行 192 行。启动日志打印上限，profile 中 `attention_pair_pipeline.padded_m` 记录整次 head 的实际执行行数；各 GEMM 的 M 可查看子事件。这个限制针对融合 Attention 共享 M 模板造成的 padding；普通 GEMM 的 Grid 已按真实 M 尾部和 64 列对齐切分，不按 256 列 tile 大小添加虚假的 padding 成本。
 
 新增 `tfaccGetGemmExecutionSize`、`tfaccCreateGemmExecution`、`tfaccMemoryView`、`tfaccCommandMemAlloc`；必须一起重编安装 NPU40T SDK 和 TFLLM，驱动 ABI 未变。SDK 旧 GEMM/clone API 仍保留，TFLLM 不再使用 clone。
 

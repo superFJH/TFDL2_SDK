@@ -1,4 +1,4 @@
-"""Qwen3-VL still-image preprocessing. C++ owns all vision/decoder execution."""
+"""Model-specific still-image preprocessing; C++ owns vision/decoder execution."""
 import base64
 import io
 import math
@@ -43,7 +43,19 @@ def prepare_image(part, config):
         return dict(height=h,width=w,encoding="rgb8",pixels=base64.b64encode(image.tobytes()).decode("ascii"))
     factor=config["patch"]*config["merge"]
     budget=config["max_image_tokens"]
+    max_pixels=min(config.get("max_pixels",budget*factor*factor),budget*factor*factor)
+    min_pixels=min(config.get("min_pixels",factor*factor),max_pixels)
+    if max_pixels<factor*factor:
+        raise ValueError("max_pixels is smaller than one merged image token")
+    pixel_budget=max_pixels//(factor*factor)
     locate = config.get("projector") == "locateanything"
+    if config.get("projector")=="paddleocr":
+        # Paddle grows a sub-patch axis together with the other axis before
+        # rounding, preserving the shape of tiny document crops.
+        if h<factor:
+            w=round(w*factor/h);h=factor
+        if w<factor:
+            h=round(h*factor/w);w=factor
     if locate:
         # MoonViT-SO: first bound unmerged patches, then resize UP to full
         # merge cells. Preserve the official two bicubic resizes; the CLI's
@@ -58,16 +70,22 @@ def prepare_image(part, config):
     rounding=math.ceil if locate else round
     rw=max(factor,rounding(w/factor)*factor)
     rh=max(factor,rounding(h/factor)*factor)
-    if (rw//factor)*(rh//factor)>budget:
-        scale=math.sqrt(w*h/(budget*factor*factor))
+    if rw*rh>max_pixels:
+        scale=math.sqrt(w*h/max_pixels)
         rw=max(factor,math.floor(w/scale/factor)*factor)
         rh=max(factor,math.floor(h/scale/factor)*factor)
         # Extreme aspect ratios plus a one-cell minimum can exceed the budget.
-        if (rw//factor)*(rh//factor)>budget:
+        if (rw//factor)*(rh//factor)>pixel_budget:
             if rw>rh:
-                rw=factor*max(1,budget//(rh//factor))
+                rw=factor*max(1,pixel_budget//(rh//factor))
             else:
-                rh=factor*max(1,budget//(rw//factor))
+                rh=factor*max(1,pixel_budget//(rw//factor))
+    elif rw*rh<min_pixels:
+        scale=math.sqrt(min_pixels/(w*h))
+        rw=math.ceil(w*scale/factor)*factor
+        rh=math.ceil(h*scale/factor)*factor
+    if rw*rh>budget*factor*factor:
+        raise ValueError("min_pixels resize exceeds --max-image-tokens; increase the server image budget")
     if locate and max(rw,rh)//config["patch"]>=512:
         raise ValueError("LocateAnything image exceeds its 512-patch position grid")
     image=image.resize((rw,rh), Image.Resampling.BICUBIC)

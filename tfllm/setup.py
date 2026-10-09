@@ -18,7 +18,7 @@ from setuptools.command.sdist import sdist as _sdist
 HERE = Path(__file__).resolve().parent
 SDK = HERE.parent
 SDK_SUBDIRS = ("bin", "lib", "include", "schema", "llama", "share")
-SDK_FILES = ("README.md", "TORCH.md", "PIP.md")
+SDK_FILES = ("README.md", "TORCH.md", "PIP.md", "OCR.md", "ASR.md", "ASR_QUANTIZATION.md")
 DRIVERS = ("libNPU40T.so", "libNPU40T.dylib")
 PYTHON_TREE = HERE / "share" / "tfllm" / "python"
 
@@ -111,7 +111,8 @@ setup(
     cmdclass={"build_py": build_py, "bdist_wheel": bdist_wheel, "sdist": sdist},
     entry_points={"console_scripts": console_scripts()},
     install_requires=["jinja2>=3.1,<4"],
-    extras_require={"torch": ["torch>=2.4", "safetensors>=0.4"]},
+    extras_require={"torch": ["torch>=2.4", "safetensors>=0.4"],
+                    "audio": ["numpy>=1.26,<3", "soundfile>=0.13,<1", "scipy>=1.11,<2"]},
     python_requires=">=3.9",
     include_package_data=False,
     zip_safe=False,

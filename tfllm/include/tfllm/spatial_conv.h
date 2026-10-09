@@ -14,6 +14,10 @@ struct AffineU8 {float scale=1; uint8_t zero=0;};
 AffineU8 AffineRange(const uint16_t* data,size_t count);
 void QuantizeAffine(const uint16_t*,uint8_t*,size_t,AffineU8);
 void DequantizeSpatial(const int32_t*,uint16_t*,size_t,float scale);
+// Round channel bias into the INT32 accumulator domain; reject nonfinite
+// values and reserve headroom for every possible UINT8 convolution dot.
+std::vector<int32_t> QuantizeSpatialBias(const uint16_t*,size_t channels,size_t kernel,
+                                       float input_scale,const float* weight_scales);
 struct SpatialConvWeight {
     SpatialConvSpec spec;
     std::vector<uint8_t> bytes;
@@ -23,5 +27,6 @@ struct SpatialConvWeight {
 };
 std::shared_ptr<SpatialConvWeight> QuantizeSpatialWeight(const SpatialConvSpec&,const uint16_t*);
 // Explicit host integer oracle, not an implicit NPU fallback.
-void ReferenceSpatialConv(const SpatialConvWeight&,const uint16_t*,uint16_t*,size_t batch,size_t height,size_t width);
+void ReferenceSpatialConv(const SpatialConvWeight&,const uint16_t*,uint16_t*,size_t batch,size_t height,size_t width,
+                          const uint16_t* bias=nullptr);
 }

@@ -7,3 +7,6 @@ Pillow>=10,<12
 numpy>=1.26,<3
 # Video file decoding only; inference still uses native TFLLM / llama.
 av>=14,<17
+# Audio file decoding/resampling only; the encoder and decoder are native.
+soundfile>=0.13,<1
+scipy>=1.11,<2

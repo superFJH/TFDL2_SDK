@@ -4,13 +4,15 @@
 
 namespace tfllm {
 using Position3 = std::array<int32_t,3>; // T, H, W, independently of the KV slot.
+enum class InputModality {Image,Audio};
 struct VisualTokens {
     size_t height=0,width=0,hidden=0;
     Activation embedding;
     std::vector<Activation> deepstack;
-    // Stable content identity including preprocessing and vision model.
+    // Stable content identity including preprocessing and encoder model.
     // Callers must not reuse this identity after modifying any feature.
     std::string identity;
+    InputModality modality=InputModality::Image;
     size_t Rows() const {return height*width;}
 };
 struct VisualSpan {size_t first=0; std::shared_ptr<const VisualTokens> image;bool bidirectional=false;};

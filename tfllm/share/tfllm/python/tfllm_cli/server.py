@@ -1,5 +1,7 @@
 """Text Chat Completions transport. NPU execution stays in the shared C++ engine."""
 import hmac
+from email import policy
+from email.parser import BytesParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import select
@@ -17,7 +19,39 @@ def usage(result):
                 prompt_tokens_details=dict(cached_tokens=result.get("cached_tokens", 0)))
 
 
-def make_server(engine, chat, host, port, model, max_pending=64, api_key=None):
+def audio_form(content_type, raw):
+    if not isinstance(content_type, str) or not content_type.lower().startswith("multipart/form-data;"):
+        raise ValueError("Audio transcription requires multipart/form-data with a file field")
+    message = BytesParser(policy=policy.default).parsebytes(
+        b"Content-Type: " + content_type.encode("ascii") + b"\r\nMIME-Version: 1.0\r\n\r\n" + raw)
+    if not message.is_multipart() or message.defects:
+        raise ValueError("Invalid multipart audio body/boundary")
+    fields, data = {}, None
+    for i, part in enumerate(message.iter_parts()):
+        if i >= 16 or part.is_multipart() or part.defects or part.get_content_disposition() != "form-data":
+            raise ValueError("Invalid multipart audio field")
+        name = part.get_param("name", header="content-disposition")
+        if name in fields or (name == "file" and data is not None):
+            raise ValueError("Duplicate audio field: " + str(name))
+        payload = part.get_payload(decode=True)
+        if name == "file":
+            if not part.get_filename() or not payload:
+                raise ValueError("file must contain an audio upload")
+            data = payload
+        elif name in {"model", "language", "prompt", "response_format", "temperature"}:
+            if len(payload) > 16384:
+                raise ValueError("Audio field exceeds 16384 bytes")
+            fields[name] = payload.decode("utf-8")
+        else:
+            raise ValueError("Unsupported audio field: " + str(name))
+    if data is None:
+        raise ValueError("Missing audio file")
+    if "temperature" in fields:
+        fields["temperature"] = float(fields["temperature"])
+    return fields, data
+
+
+def make_server(engine, chat, host, port, model, max_pending=64, api_key=None, audio_prompt=""):
     admission = threading.BoundedSemaphore(max_pending)
 
     class Handler(BaseHTTPRequestHandler):
@@ -44,6 +78,39 @@ def make_server(engine, chat, host, port, model, max_pending=64, api_key=None):
                 return False
             return True
 
+        def disconnected(self):
+            readable, _, _ = select.select([self.connection], [], [], 0)
+            return bool(readable) and not self.connection.recv(1, socket.MSG_PEEK)
+
+        def transcribe(self, raw):
+            from .asr import Transcriber, response_body
+            fields, data = audio_form(self.headers.get("Content-Type"), raw)
+            if fields.get("model", model) != model:
+                self.error(404, "Unknown model")
+                return
+            format = fields.get("response_format", "json")
+            if format not in {"json", "text", "verbose_json"}:
+                raise ValueError("response_format must be json, text or verbose_json; timestamps are not supported")
+            result = Transcriber(engine, chat).transcribe(data, fields.get("language"),
+                        fields.get("prompt", audio_prompt), fields.get("temperature"), self.disconnected)
+            if result.get("finish_reason") == "cancelled":
+                self.close_connection = True
+                return
+            if "error" in result:
+                self.error(result.get("status", 500), result["error"])
+                return
+            print("TFLLM_REQUEST " + json.dumps({k: v for k, v in result.items() if k != "text"}), file=sys.stderr, flush=True)
+            output = response_body(result, format)
+            if format != "text":
+                self.json(200, output)
+                return
+            encoded = output.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+
         def do_GET(self):
             if not self.authorized():
                 return
@@ -58,7 +125,7 @@ def make_server(engine, chat, host, port, model, max_pending=64, api_key=None):
             if not self.authorized():
                 return
             started = False
-            if self.path != "/v1/chat/completions":
+            if self.path not in {"/v1/chat/completions", "/v1/audio/transcriptions"}:
                 self.close_connection = True
                 self.error(404, "Unknown endpoint")
                 return
@@ -70,11 +137,14 @@ def make_server(engine, chat, host, port, model, max_pending=64, api_key=None):
                 length = int(self.headers.get("Content-Length", "0"))
                 if length<=0 or length>32*1024*1024 or self.headers.get("Transfer-Encoding"):
                     self.close_connection = True
-                    self.error(413, "Provide Content-Length with a JSON body of at most 32 MiB")
+                    self.error(413, "Provide Content-Length with a body of at most 32 MiB")
                     return
                 raw = self.rfile.read(length)
                 if len(raw)!=length:
                     raise ValueError("Incomplete request body")
+                if self.path == "/v1/audio/transcriptions":
+                    self.transcribe(raw)
+                    return
                 body = json.loads(raw)
                 if not isinstance(body, dict):
                     raise ValueError("Request must be a JSON object")
@@ -108,10 +178,7 @@ def make_server(engine, chat, host, port, model, max_pending=64, api_key=None):
                     if stream:
                         begin()
                         sse(chunk(dict(content=text)))
-                def disconnected():
-                    readable, _, _ = select.select([self.connection], [], [], 0)
-                    return bool(readable) and not self.connection.recv(1, socket.MSG_PEEK)
-                result = engine.generate(request, output, disconnected)
+                result = engine.generate(request, output, self.disconnected)
                 if result.get("finish_reason") == "cancelled":
                     self.close_connection = True
                     return

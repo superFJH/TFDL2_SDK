@@ -3,6 +3,7 @@
 
 namespace tfllm {
 class VisionEncoder;
+struct AudioTokens;
 struct RgbImage {size_t height=0,width=0;std::vector<uint8_t> pixels;};
 class LlamaVision {
 public:
@@ -40,6 +41,9 @@ public:
     std::array<int32_t,3> MropeSections() const;
     size_t DeepstackLayers() const;
     bool IsLocateAnything() const;
+    bool IsQwen3Asr() const;
+    std::pair<std::vector<int32_t>,std::shared_ptr<PromptInput>> AudioPrompt(
+        const std::vector<int32_t>& tokens,const std::vector<std::shared_ptr<const AudioTokens>>&) const;
     std::pair<std::vector<int32_t>,std::shared_ptr<PromptInput>> ImagePrompt(
         const std::vector<int32_t>& tokens,const std::vector<std::shared_ptr<const VisualTokens>>& images) const;
     // Ordered image / video-pair spans; timestamp text is already tokenized.
@@ -74,6 +78,12 @@ std::string GgufIdentity(const std::string& path);
 Config ConvertGguf(const std::string& source,const std::string& prefix,
                    bool f32=false,bool require_native=false,
                    const std::string& decode_q4_if_bf16={});
+// CLI auto policy also pairs floating Qwen3-ASR F16/F32 sources with Q4_0.
+// Already-quantized GGUFs are preserved; native tensors still read source.
+enum class DecodeQ4Policy { Bf16Only, Auto };
+Config ConvertGguf(const std::string& source,const std::string& prefix,
+                   bool f32,bool require_native,const std::string& decode_q4,
+                   DecodeQ4Policy policy);
 class GgufSession {
 public:
     GgufSession(const std::string& gguf,size_t capacity,int threads=4,

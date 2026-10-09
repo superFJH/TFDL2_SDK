@@ -38,7 +38,7 @@ class Chat:
         from .video_adapters import VideoPreprocessor
         self.videos = VideoPreprocessor()
         generation = manifest.get("generation_config") or {}
-        default_temperature = 0 if info.get("generation_mode") == "slow" else 0.8
+        default_temperature = 0 if info.get("generation_mode") == "slow" or info.get("architecture") == "qwen3-asr" else 0.8
         self.defaults = dict(max_tokens=generation.get("max_new_tokens", 256),
                              temperature=generation.get("temperature", default_temperature) if generation.get("do_sample", True) else 0,
                              top_p=generation.get("top_p", 0.95), top_k=generation.get("top_k", 40),
@@ -54,7 +54,8 @@ class Chat:
     def request(self, body):
         supported = {"model", "messages", "stream", "stream_options", "max_tokens", "max_completion_tokens",
                      "temperature", "top_p", "top_k", "repetition_penalty", "frequency_penalty", "presence_penalty",
-                     "seed", "stop", "n", "chat_template_kwargs", "user", "tools", "tool_choice", "parallel_tool_calls"}
+                     "seed", "stop", "n", "chat_template_kwargs", "user", "tools", "tool_choice", "parallel_tool_calls",
+                     "vllm_xargs", "no_repeat_ngram_size", "priority", "skip_special_tokens", "mm_processor_kwargs"}
         unknown = set(body) - supported
         if unknown:
             raise ValueError("Unsupported request fields: " + ", ".join(sorted(unknown)))
@@ -78,6 +79,19 @@ class Chat:
         if not isinstance(options, dict) or set(options) - {"include_usage"} or type(options.get("include_usage", False)) is not bool:
             raise ValueError("Unsupported stream_options")
         messages = body.get("messages")
+        paddle = self.info.get("architecture")=="paddleocr"
+        processor = body.get("mm_processor_kwargs", {})
+        if not isinstance(processor, dict) or set(processor)-{"min_pixels", "max_pixels"}:
+            raise ValueError("Unsupported mm_processor_kwargs")
+        if any(type(v) is not int or not 1<=v<=32*1024*1024 for v in processor.values()):
+            raise ValueError("Image pixel limits must be integers in 1..33554432")
+        if processor:
+            config = self.info.get("vision", {})
+            if config.get("projector") not in {"paddleocr", "qwen2vl_merger", "qwen2.5vl_merger", "qwen3vl_merger"}:
+                raise ValueError("mm_processor_kwargs requires a supported OCR/Qwen vision model")
+            maximum=min(processor.get("max_pixels",config.get("max_pixels",32*1024*1024)),config["max_image_tokens"]*(config["patch"]*config["merge"])**2)
+            if processor.get("min_pixels",0)>maximum:
+                raise ValueError("min_pixels exceeds max_pixels or the server image budget")
         if not isinstance(messages, list) or not messages or len(messages)>4096:
             raise ValueError("messages must be a nonempty list")
         video_count = sum(p.get("type")=="video_url" for m in messages if isinstance(m,dict)
@@ -107,17 +121,21 @@ class Chat:
                             raise ValueError("Images are limited to 16 user content parts")
                         from .images import prepare_image
                         config = dict(self.info["vision"])
+                        if processor:
+                            config.update(processor,input_encoding="fp16_chw")
                         if video_count:
                             config["input_encoding"]="fp16_chw"
                         images.append(prepare_image(part,config))
                         if video_count:
                             media.append(dict(images[-1],kind="image",frames=1))
                             parts.append(dict(type="text",text="<|vision_start|><|image_pad|><|vision_end|>"))
+                        elif paddle:
+                            parts.append(dict(type="image"))
                         elif self.info["vision"].get("projector")=="locateanything":
                             # The official processor numbers images globally,
                             # then inserts one span per image (no MRoPE).
                             parts.append(dict(type="text",text=f"<image {len(images)}><img><IMG_CONTEXT></img>"))
-                        elif self.info["vision"].get("input_encoding")=="rgb8":
+                        elif config.get("input_encoding")=="rgb8":
                             parts.append(dict(type="text",text="<__media__>"))
                         else:
                             parts.append(dict(type="image"))
@@ -137,6 +155,8 @@ class Chat:
                 content = parts if any(p["type"]=="image" for p in parts) else "".join(p["text"] for p in parts)
             if not isinstance(content,(str,list)):
                 raise ValueError("Message content must be text or content parts")
+            if paddle and isinstance(content,str):
+                content=[dict(type="text",text=content)]
             normalized.append(dict(role=m["role"], content=content))
         kwargs = body.get("chat_template_kwargs", {})
         if not isinstance(kwargs, dict) or set(kwargs) & {"messages", "bos_token", "eos_token", "add_generation_prompt", "tools", "tool_choice", "parallel_tool_calls"}:
@@ -145,12 +165,29 @@ class Chat:
         values.update(messages=normalized, bos_token=self.info["bos_token"], eos_token=self.info["eos_token"], add_generation_prompt=True,
                       tools=None, tool_choice="none", parallel_tool_calls=False)
         result = dict(self.defaults)
+        xargs = body.get("vllm_xargs", {})
+        if not isinstance(xargs, dict) or set(xargs)-{"no_repeat_ngram_size", "debug"}:
+            raise ValueError("Unsupported vllm_xargs")
+        if "debug" in xargs and type(xargs["debug"]) is not bool:
+            raise ValueError("vllm_xargs.debug must be boolean")
+        ngram = body.get("no_repeat_ngram_size", xargs.get("no_repeat_ngram_size", 0))
+        if "no_repeat_ngram_size" in body and "no_repeat_ngram_size" in xargs and ngram!=xargs["no_repeat_ngram_size"]:
+            raise ValueError("Conflicting no_repeat_ngram_size")
+        if type(ngram) is not int or not 0<=ngram<=16384:
+            raise ValueError("no_repeat_ngram_size must be an integer in 0..16384")
+        priority = body.get("priority", 0)
+        if type(priority) is not int or not -(2**31)<=priority<2**31:
+            raise ValueError("priority must be an int32")
+        skip = body.get("skip_special_tokens", True)
+        if type(skip) is not bool:
+            raise ValueError("skip_special_tokens must be boolean")
+        result.update(no_repeat_ngram_size=ngram, priority=priority, skip_special_tokens=skip)
         for key in ("max_tokens", "temperature", "top_p", "top_k", "repetition_penalty", "frequency_penalty", "presence_penalty", "seed"):
             if key in body:
                 result[key] = body[key]
         if "max_completion_tokens" in body:
-            if "max_tokens" in body:
-                raise ValueError("Specify only one of max_tokens and max_completion_tokens")
+            if "max_tokens" in body and (type(body["max_tokens"]) is not int or body["max_tokens"]!=body["max_completion_tokens"]):
+                raise ValueError("Conflicting max_tokens and max_completion_tokens")
             result["max_tokens"] = body["max_completion_tokens"]
         for key in ("max_tokens", "top_k", "seed"):
             if key in result and (type(result[key]) is not int):

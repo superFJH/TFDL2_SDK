@@ -183,6 +183,9 @@ SDPA、量化层、自定义子类或 CUDA 专属代码；带 hooks 的层明确
 
 第一版空间卷积限制：Conv2d/NCHW/OIHW、groups=1、dilation=1、两方向相同 stride 1..7，
 kernel 每边 1..7、padding 每边 0..7、Cin×Kh×Kw≤4608；输入宽度超过 1024 必须为 32 的倍数。
+空间分片的 halo 后输入起始偏移必须按 4 字节对齐（Conv 命令的低两位是控制位）。
+切分器选择合法的输出行边界；stride/padding 无合法分界时减少高度分片，不移动像素、不额外改 padding。
+仍使用缓存命令模板和每次执行重定位。172×114 等非 4 倍数宽度已加入回归。
 不支持的配置明确报错，不隐式回退。尚无 Conv3d、ConvTranspose、depthwise/group convolution。
 仅支持 CPU FP16 激活；BF16/FP32、非连续输入的 dtype 转换必须由调用方明确处理，非连续布局会 contiguous。
 无 backward/autograd；应在 `torch.inference_mode()` 下使用。注册了 FakeTensor 形状函数，
@@ -299,6 +302,10 @@ sample 交替运行旧 Torch softmax 路径与融合路径，输出延迟、加�
 
 一个 runtime 预留一份物理内存池，使用 TFLLM 原有四个核对线程管理八个 TFACC。
 GEMM 由已有 Grid 策略按 M/N 切分；原生 Conv 按输出通道与高度分片，包含正确输入 halo。
+高度分片要求每个输出行带的 `Hs × Wout` 都是 128 的倍数（同时满足 64 对齐），
+并保持 halo 后输入起始地址 4 字节对齐；无法完整覆盖时只切输出通道，不切高度。
+例如 `140×140`、`172×114` 的 `3×3 / stride=1 / pad=1` Conv，48 输出通道使用三个整幅分片，12 输出通道使用一个。
+这不改变逻辑 H/W，也不进行图像 padding；整幅及分片缓冲仍使用安全的物理通道间距。
 每个分片准备 16/8 MAU 变体，任务在核对之间调度。能否同时用满八核取决于形状和竞争，
 不会为不足以有效拆分的小算子伪造八路工作。多个 module 不能各创建一套 runtime。
 
@@ -315,6 +322,40 @@ state_dict 保存 CPU 权重，不保存物理地址；加载后显式 prepare()
 工作区及命令空间按配方的实际需求申请，执行结束回收，不保留空闲物理工作区。新形状或 CPU 模板被 LRU 淘汰后仍会冷编译。
 原有原生卷积形状限制不变；例如部分超宽 stride-2 形状仍受 SDK 输出地址对齐限制。
 没有板端吞吐、延迟和模型质量实测前不承诺性能。
+
+## NPU stalling / 超时诊断文件
+
+原生 runtime 在核对准备、提交、轮询、cache handoff 或释放阶段抛出错误，以及轮询超时
+（默认 30000 ms）时，先隔离芯片并保留在途 DMA/lease，再尽力导出当前核对的现场。
+正常运行不写文件；Conv、Linear 和融合 attention 的底层 GEMM 共用这条路径，不要求开启 profile。
+
+```sh
+# 在测试包目录运行，不需要修改 Python 脚本：
+TFLLM_NPU_DUMP_DIR="$PWD/npu-debug" python test_tfllm_npu.py \
+  --backend npu --mode all_tfllm --samples woman --output results/woman.json
+```
+
+默认目录是进程工作目录下的 `./tfllm_npu_dumps/`；目录不存在时创建。
+`TFLLM_NPU_DUMP_DIR=0` 关闭导出。C++ 也可用 `NpuOptions::failure_dump_dir` 覆盖，
+环境变量在 runtime 初始化时读取。启动输出 `NPU_CONV split_revision=3 layout_revision=3 ... split_spatial_alignment=128 input_base_alignment=4 ...`
+可确认已加载修复版本。
+
+故障时 stderr 输出 `TFLLM_NPU_FAILURE_DUMP path=...`。文件名包含 PID/chip/pair 和随机后缀，
+不覆盖已有文件，权限为 0600；多个核对失败可能各生成一个文件，请一并保留。文本内容包括：
+
+- 原始错误、阶段、执行核、超时配置、提交/完成状态。
+- Conv 的完整几何、batch 序号、输入量化参数、全部分片的 halo/偏移/stride；GEMM 的 M/K/N。
+- 当前核对执行的分片、8/16 MAU 变体、命令 DMA 地址、operand HIGH、命令数量及十六进制命令字。
+  每核最多输出 1 MiB 原始命令对应的文本，超出会标记 `truncated=1`。
+
+只读取 CPU 持有的不可变命令与元数据，**不读取可能仍被 NPU 写入的输出/工作区，不执行额外 cache
+维护或寄存器读写，也不导出原始激活/权重**。仍应按内部调试资料处理这些文件。
+这不是完整数值回放包，也不包含 Python 层名；可用几何和分片定位算子。
+写文件失败会打印警告，但不会替换原始错误、自动重跑或释放隔离资源。
+若进程被强制终止/断电，或 SDK 调用本身永久阻塞而不返回，不能保证导出。
+
+本次新增 SDK 只读接口 `tfaccGetCommandDebugInfo`，**必须一起重建安装 `libNPU40T`、TFLLM
+及 `libtfllm-torch`**。pip 使用者还需从新的 CMake 安装树重新安装 wheel/包，避免旧库与新代码混用。
 
 ## 验证
 
@@ -335,6 +376,10 @@ FP16 分阶段路径逐 bit 相等、模板复用、申请失败回滚和零空�
 命令容量/绑定失败回滚、常驻权重释放、零空闲 workspace、核对 lease 及失败隔离；不模拟真实硬件缓存。
 `tfllm-npu-command-test` 使用真实 SDK 编译器，将重定位结果与独立重编译结果逐字节对比，
 覆盖 8/16 MAU、padding zero-point、输入偏移、HIGH、LUT、原生通道/宽度分块及临时 bias，验证 CPU 模板/实例化不申请 DMA 内存。
+`tfllm-spatial-split` 覆盖 64512 组行切分几何；真实命令测试检查 woman 分片不会污染输入控制位，
+并拒绝未对齐模板。原生注入测试对 woman 的 3→48、48→48、48→12 卷积做完整未分片量化参考对比。
+`tfllm-failure-dump-*` 覆盖持续 BUSY、驱动异常、错误状态、不可写路径、禁用导出和 GEMM，验证
+文件字段/权限、原错误传播、在途资源隔离和禁止失败后重放。
 板端仍需对比 PyTorch 整模型误差，并分别测量 packing/量化/命令准备/NPU/dequant/CPU 算子的耗时。
 
 本次主机验证使用 macOS arm64：独立构建及 CTest、ASan/UBSan、安装后自动找库均通过。
