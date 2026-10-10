@@ -1096,7 +1096,8 @@ class OnnxConvertor(TFConvertor):
             else:
                 self.outputs.append(output.name)
                 
-        self.outputs = list(set(self.outputs))
+        # Preserve ONNX graph-output order, especially detection + mask proto.
+        self.outputs = list(dict.fromkeys(self.outputs))
         removeParams = []
         for name in self.params.keys():
             ifremove = True

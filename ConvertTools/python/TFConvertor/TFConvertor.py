@@ -205,8 +205,9 @@ class TFConvertor(object):
 
             
         
-        print("output : ",list(tfoutputname.values()))
-        context.SetOutputs(list(tfoutputname.values()))
+        ordered_outputs = [tfoutputname[name] for name in self.outputs]
+        print("output : ", ordered_outputs)
+        context.SetOutputs(ordered_outputs)
 
         print("Finished!!")
 
@@ -269,4 +270,3 @@ class TFConvertor(object):
             calibration.Quantize(inputtype,MergeConcate=MergeConcate,stopquanttensors=stopquanttensors,avoidtensors=avoidtensors)
         else:
             calibration.Quantize(quant_input,MergeConcate=MergeConcate,stopquanttensors=stopquanttensors,avoidtensors=avoidtensors)
-

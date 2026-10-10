@@ -140,10 +140,14 @@ python ConvertTools/python/example/yolov8_tfdl.py \
 
 注意：
 
-- `--detectOnly` 用于普通检测模型；pose、segment 等多输出模型不要照搬检测模型的 stop/avoid tensor 配置。
-- 专用脚本中已经根据不同 YOLO 版本配置了 `stoptensor`、`avoidtensors` 或 `stopquanttensors`。这些 tensor 名称依赖具体导出图，模型版本变化后需要重新核对。
+- 脚本保留 `--detectOnly` 以兼容旧命令；实际保护节点由 ONNX 图结构自动识别。检测和分割图会分别保护其存在的检测头分支，DFL 投影卷积也由 Softmax→Transpose→Conv 结构识别。
+- 对 YOLO26 的 `nms=False` 或图内 NMS 输出，脚本在框与类别分数进入筛选前截断，交给部署端后处理。推荐以 `nms=None, simplify=False` 导出原始预测图；新版 Ultralytics 的 `nms=False` 会选择另一套检测头，输出语义不同。部署端应读取实际 FB 输出形状。
+- 量化校准目录须包含 JPEG 或 PNG 图片；`--check` 会先做 ONNX/TFDL 数值校验，失败时不生成量化 FB。
+- 分割 FB 的输出顺序与 ONNX 一致：先检测张量，后 mask 原型。mask 原型可能是 UINT8；`Example/AnnotationStudio/check_fb.py` 生成的元数据记录其量化 `scale` 和 `zero_point`，部署端需据此还原浮点值。
 - 一些 NMS、解码或 DFL 后处理在 ONNX 中较慢，也不适合放到 NPU。可以只转换主干和检测头，在 C++ 侧完成后处理。
-- 如果 ONNX 节点名称与脚本内预设名称不同，应先通过 Netron 查看输出节点，再调整对应 YOLO 脚本。
+- 如果遇到未识别的导出布局，脚本会报告具体错误并提示重新导出；可以用 Netron 查看 ONNX 输出，再在 `yolo_tfdl_common.py` 中增加对应布局规则。
+
+已用 Ultralytics `8.4.148` 导出的 YOLOv5u、YOLOv8、YOLO11、YOLO26 检测图及后三者的分割图，完成 ONNX 数值校验、校准量化和 TFDL 软件执行；另验证了 `8.4.66` 的 YOLO26 筛选输出，以及 `8.4.168` 的原始输出和 YOLO26 `nms=False` 分割输出。图结构识别不会按版本号分支，但未覆盖的未来输出布局仍须实际验证。
 
 ## 3. Transformer 和 timm 预训练模型转换
 
