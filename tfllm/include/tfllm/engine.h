@@ -15,7 +15,9 @@ struct Execution {
     size_t VisibleKeys(size_t query_row) const;
 };
 struct Policy {
-    size_t short_threshold = 32, max_prefill = 1024, alignment = 64;
+    // Zero submits the complete logical suffix. Operator backends tile their
+    // physical matrices independently; a nonzero cap is an explicit override.
+    size_t short_threshold = 32, max_prefill = 0, alignment = 64;
     Execution Next(size_t past, size_t remaining, size_t capacity) const;
 };
 // Lexical, thread-bound scope. Destroy on the creating thread in reverse

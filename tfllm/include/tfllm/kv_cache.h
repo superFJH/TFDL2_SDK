@@ -4,11 +4,21 @@
 #include <functional>
 
 namespace tfllm {
+// Packed rows use adapter-provided codecs, keeping the core independent of ggml.
+struct KvCodec {
+    size_t block_elements=0, block_bytes=0;
+    size_t rotation_elements=0;
+    // Map canonical, unrotated float rows to/from the physical packed format.
+    std::function<void(const float*,uint8_t*,size_t)> encode;
+    std::function<void(const uint8_t*,float*,size_t)> decode;
+};
 // Explicit byte strides support llama.cpp's token-major K and either V layout.
 // K contains Q/K-normalized, RoPE-applied values; cache stores KV heads only.
 struct KvView {
     uint8_t* data = nullptr;
     size_t bytes = 0, token_stride = 0, head_stride = 0, dim_stride = 2;
+    // For packed rows, dim_stride addresses blocks rather than scalar elements.
+    std::shared_ptr<const KvCodec> codec=nullptr;
 };
 struct LayerKv { KvView key, value; };
 struct DeltaState;
@@ -23,6 +33,7 @@ public:
     std::vector<std::shared_ptr<DeltaState>>& Recurrent() {return recurrent_;}
     float Read(bool key, size_t layer, size_t token, size_t head, size_t dim) const;
     void Write(bool key, size_t layer, size_t token, size_t head, size_t dim, float value);
+    void WriteFloat(size_t layer,size_t past,size_t rows,const std::vector<float>& key,const std::vector<float>& value);
     void WriteFp16(size_t layer,size_t past,size_t rows,const Activation& key,const Activation& value);
     Activation HeadFp16(bool key,size_t layer,size_t tokens,size_t head,size_t padded_tokens,bool transpose) const;
 private:

@@ -52,6 +52,8 @@ def main(profile_build=False):
     parser.add_argument("--npu-jit-shapes", type=Path, help="Precompile additional GEMM/attention geometries from npu_jit_shapes.py before READY")
     parser.add_argument("--context", type=int, default=4096)
     parser.add_argument("--threads", type=int, default=4, help="total CPU decode threads shared by all sequences")
+    parser.add_argument("--kv-cache-type", choices=["auto", "q8_0", "f16"], default="auto",
+                        help="persistent K/V storage; auto uses Q8_0 for head dimensions divisible by 32, otherwise F16")
     parser.add_argument("--max-num-seqs", type=int, default=4)
     parser.add_argument("--max-pending-requests", type=int, default=64)
     parser.add_argument("--chat-template", type=Path)
@@ -67,7 +69,7 @@ def main(profile_build=False):
     parser.add_argument("--served-model-name")
     parser.add_argument("--api-key", default=os.environ.get("TFLLM_API_KEY"))
     if profile_build:
-        parser.add_argument("--profile", type=Path, help="Capture operator spans; create a run subdirectory here with one CSV per request")
+        parser.add_argument("--profile", type=Path, help="Capture native and llama cb_eval operator spans; save CSV and JSONL per request in a run subdirectory")
         parser.add_argument("--profile-max-events", type=int, default=100000, help="Bound each request's trace (default: 100000 events)")
     elif any(a.split("=", 1)[0] in ("--profile", "--profile-max-events") for a in sys.argv[1:]):
         parser.error("profiling is not compiled in; use tfllm_profile with --profile")
@@ -128,6 +130,7 @@ def main(profile_build=False):
         engine_options = dict(package=manifest["package"], gguf=manifest["gguf"], backend=args.backend,
                                      npu_jit_warmup=args.command == "serve",
                                      context=args.context, threads=args.threads, max_sequences=args.max_num_seqs,
+                                     kv_cache_type=args.kv_cache_type,
                                      mmproj=manifest.get("mmproj") or "", max_image_tokens=args.max_image_tokens,
                                      max_video_tokens=args.max_video_tokens, video_max_frames=args.video_max_frames, video_fps=args.video_fps,
                                      max_audio_seconds=args.max_audio_seconds,

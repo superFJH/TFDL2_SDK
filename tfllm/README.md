@@ -140,7 +140,7 @@ tfllm chat Qwen/Qwen3-VL-4B-Instruct --model-source modelscope --image /images/e
 `--revision` 固定仓库版本。下载复用 provider 自己的缓存；本地目录不访问下载 provider。
 
 首次自动执行 HF → 浮点 GGUF → 原生 UINT8 包；已有 GGUF 直接进入第二步。转换使用 `--require-native`，不支持的架构/配置直接报错，禁止生成整模型 CPU 回退包。
-对于未量化的 BF16 源模型以及 Qwen3-ASR 的浮点语言源模型，首次导入还通过内置 llama 量化 API 生成 CPU decode 专用 `decode-q4_0.gguf`，`serve/chat/transcribe` 自动加载它，无需增加启动参数或单独安装 `llama-quantize`。NPU UINT8 权重直接从原始浮点 source GGUF 生成；两份文件的内容身份写入模型包，运行时只接受原始 GGUF 或对应的 decode GGUF，不能混用另一模型。默认选择 Q4_0（32 个权重一组），使用 llama 的量化与 CPU 重排实现，norm/bias 和不满足分块条件的张量采用 upstream 的浮点保留/回退，不能理解为所有张量都只有 4 bit。共享 KV 仍为 FP16。
+对于未量化的 BF16 源模型以及 Qwen3-ASR 的浮点语言源模型，首次导入还通过内置 llama 量化 API 生成 CPU decode 专用 `decode-q4_0.gguf`，`serve/chat/transcribe` 自动加载它，无需增加启动参数或单独安装 `llama-quantize`。NPU UINT8 权重直接从原始浮点 source GGUF 生成；两份文件的内容身份写入模型包，运行时只接受原始 GGUF 或对应的 decode GGUF，不能混用另一模型。默认选择 Q4_0（32 个权重一组），使用 llama 的量化与 CPU 重排实现，norm/bias 和不满足分块条件的张量采用 upstream 的浮点保留/回退，不能理解为所有张量都只有 4 bit。共享 KV 默认采用 Q8_0（head_dim 可被 32 整除时），与 decode 权重量化类型独立。
 普通语言/视觉模型的 F16/F32 GGUF 以及已经量化的 GGUF 保持原有 decode 格式（包括混合低比特/BF16 的 GGUF）；Qwen3-ASR 的 F16/F32/BF16 浮点 decoder 均自动生成配对 Q4_0。本策略也适用于直接输入未量化 GGUF 及其分片。mmproj 独立导入原生视觉/音频编码路径，不生成 CPU decode 副本。ASR 默认 NPU 路径为 W8A8 音频、W8A8 语言 prefill、W4 llama CPU decode，详见 [ASR.md](ASR.md)。启动打印 `TFLLM decode: weights=q4_0 threads=... gguf=...`，用于确认选中的 decode 文件。Q4_0 会带来额外量化误差，实际模型需复测精度与速度。
 下表支持的 HF 多模态结构可直接传完整 snapshot 路径（包括 `.cache/huggingface/hub/.../snapshots/...`）。默认 `--mmproj auto`：有 `preprocessor_config.json` 或 `processor_config.json` 时，固定版转换器分别提取语言 GGUF 和视觉 mmproj GGUF，后者随缓存一起保存；原版 `InternVLChatModel` 没有 processor JSON 时采用其 ImageNet 归一化默认值。不修改下载目录，也不执行下载模型附带的 Python 代码。已下载的语言 GGUF 会自动发现同目录唯一的 `mmproj*.gguf`，有多个时必须指定 `--mmproj FILE`。`--mmproj none` 仅启用文本。图像模式启动显示 `modalities=text,image`；Qwen3-VL 配套视觉模型另显示 `video`。
 浮点 safetensors 导入在读取权重前检查分片、dtype、参数量（不超过 30B）；AWQ/GPTQ/FP8 等量化 safetensors 暂不接受，可以使用当前支持的量化 GGUF。
@@ -187,14 +187,14 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 兼容客户端在普通聊天中附带的空工具字段：`tools: []/null` 配合省略、`null`、`"none"` 或 `"auto"` 的 `tool_choice` 可正常使用；显式 `tool_choice: "none"` 时工具定义不会进入模型提示。`parallel_tool_calls` 可为布尔值或 `null`，在工具禁用时不生效。非空工具配合自动选择、`"required"` 或指定函数仍明确报错，不能将纯文本输出当成工具调用成功。Chatbox 使用本服务时只启用 Vision，需要关闭工具调用/MCP/联网搜索；若旧历史含工具消息，应新建普通对话。
 
 一个服务共享一份 TFLLM 模型、llama 模型实例和整芯片 NPU 调度器。decode 使用一个多序列 llama context、一个持久 CPU 线程池和按步合批的调度器；`--threads 32` 是整个 decode 的线程预算，2/4 路并发不会各自再创建 32 个计算线程。空闲线程睡眠，NPU prefill 的 pair 调度保持独立。
-`--max-num-seqs`（默认 4）限制同时生成数量；每个槽位有独立 FP16 KV stream，与 TFLLM native prefill 共享地址。所有槽位的 KV 和公共 llama 工作区在启动时分配，普通内存占用会随最大并发数增加；物理 KV 容量向上对齐到 llama 的 256 token 边界，用户可见的 `--context` 上限不变。
+`--max-num-seqs`（默认 4）限制同时生成数量；每个槽位有独立 KV stream，与 TFLLM native prefill 共享地址。`--kv-cache-type auto` 默认在 head_dim 可被 32 整除时使用 Q8_0，否则使用 F16；可显式传 `--kv-cache-type q8_0` 或 `--kv-cache-type f16`。显式 Q8_0 遇到不满足分块要求的 head_dim 会报错。两种类型均开启 llama.cpp CPU Flash Attention，量化 V 必须使用该路径。启动日志及 chat info 的 `kv_cache_type` 返回实际类型。所有槽位的 KV 和公共 llama 工作区在启动时分配，普通内存占用会随最大并发数增加；物理 KV 容量向上对齐到 llama 的 256 token 边界，用户可见的 `--context` 上限不变。
 空闲会话槽位按真实可复用前缀选择，同时检查图片身份与 RoPE 位置；仅当匹配前缀不少于该槽位将丢弃的后缀时，优先续用它。否则先用空槽，槽位用满后淘汰最近最少使用的空闲槽，避免 Chatbox 搜索判断等不同 system prompt 仅凭几个公共 token 就覆盖主对话。`TFLLM_REQUEST` 的 `session_slot`、`cache_selection`（`prefix/empty/lru`）、`cache_previous_tokens`、`cache_match_tokens` 可用于诊断；最终实际复用量仍看 `cached_tokens`。槽位有限，系统提示发生变化的请求不能复用变化位置之后的语言 KV。
 已准备好的 decode token/CPU 短 prefill 在同一次 `llama_decode` 中提交，各自携带序列 ID 和位置、分别提取 logits。收集批次最多等待 200 μs，不等待仍在 prefill 的会话；单槽配置直接执行。当前固定版 llama 会把长度不同或编号不连续的序列拆为内部 ubatch，因此一次提交不保证只有一个计算图。启动日志应出现 `decode_scheduler=continuous_batch decode_threads=32`。
 空闲槽位优先复用最长相同 token 前缀；HTTP 多轮请求仍需携带完整 messages，复用不依赖客户端会话 ID。`--max-pending-requests`（默认 64，包含正在执行的请求）限制准入，满时返回 429，等待槽位超过 60 秒也返回 429。
 连接断开后在队列等待/解码边界取消；已提交的 NPU 工作完成后再释放资源。SIGINT/SIGTERM 停止服务时等待正在执行的请求退出。
 `--context` 默认 4096，必须是 64 的倍数且不超过模型配置；prompt 加最大生成长度超限会报错，用户无需补齐 token。
 每次请求打印 `TFLLM_REQUEST`，含 backend、native_tokens、llama_short_tokens、cached_tokens、prefill_ms、total_ms 和实际生成数；缓存命中后的短请求可能不提交新的 NPU 工作。
-`--gpu-memory-utilization` 继续控制 NPU HugePage 池，不是整个进程的内存上限；llama 权重、CPU 工作区和各会话 FP16 KV 需另行计入。
+`--gpu-memory-utilization` 继续控制 NPU HugePage 池，不是整个进程的内存上限；llama 权重、CPU 工作区和各会话 KV 需另行计入。
 
 `chat` 支持 `/clear` 清空聊天历史、`/exit` 退出，以及 `--system`、`--max-tokens`、`--temperature` 等参数。
 
@@ -349,7 +349,7 @@ SDK=/workspaces/NPU40T/TFDL2_SDK
 - 默认只报告误差，结束为 `status=COMPLETE accuracy=reported_no_acceptance_limits`。可按模型验收标准传 `--max-abs` / `--min-cosine`，任一检查超限退出 2；非有限值、设备失败或路由不符退出 1。源 GGUF 与 UINT8 包之间的重新量化误差也会计入，不承诺逐 bit 对齐。
 - `--verify-i32` 可抽样核对反量化前的原始 INT32，但会增加计时内工作，日志标记 `diagnostic_timing=1 speed_comparable=0`；定位数值错误后应去掉该开关测速。
 
-这是单会话端到端延迟对照，两条路径顺序执行、按轮交替先后次序；参考 llama batch 上限 1024，候选 `--chunk` 默认 1024，两个 llama context 都使用 `--threads` 指定的 CPU 线程数。TFLLM CPU 算子使用至多 8 个参与线程的共享池。NPU 现在对每个底层 GEMM 使用整芯片 Grid 切分，再把两块一组的任务交给四个 pair worker；单请求可同时使用 8 核，多请求在分块边界公平分享。`--gpu-memory-utilization` 默认 0.8，控制整个引擎的 HugePage 预留；`--max-plans` 默认为 0，执行计划只受内存预算约束；正数设置额外数量上限（参数乘 4 为整芯片上限）。预留、静态权重转换与上传计入 setup；首次遇到新行数的命令编译仍计入 candidate。模型包、llama context/GGUF、FP16 KV 的普通 CPU 内存另行使用，不能把 HugePage 上限当成整个进程 RSS 上限。
+这是单会话端到端延迟对照，两条路径顺序执行、按轮交替先后次序；参考 llama batch 上限 1024，候选 `--chunk` 默认 1024，两个 llama context 都使用 `--threads` 指定的 CPU 线程数。TFLLM CPU 算子使用至多 8 个参与线程的共享池。NPU 现在对每个底层 GEMM 使用整芯片 Grid 切分，再把两块一组的任务交给四个 pair worker；单请求可同时使用 8 核，多请求在分块边界公平分享。`--gpu-memory-utilization` 默认 0.8，控制整个引擎的 HugePage 预留；`--max-plans` 默认为 0，执行计划只受内存预算约束；正数设置额外数量上限（参数乘 4 为整芯片上限）。预留、静态权重转换与上传计入 setup；首次遇到新行数的命令编译仍计入 candidate。模型包、llama context/GGUF、持久 KV 的普通 CPU 内存另行使用，不能把 HugePage 上限当成整个进程 RSS 上限。
 
 ## 逐算子性能日志与报告
 
@@ -631,9 +631,9 @@ TFDL_NPU40T_PAIR_CACHE_SERIAL=0 "$SDK/tfllm/test/tfllm-npu-llama-benchmark_profi
 "$SDK/tfllm/bin/tfllm_profile" chat /models/Qwen3-8B --profile perf/chat
 ```
 
-记录在请求推理完成后写盘，包含算子名、父子 ID、线程、shape、pair 和各阶段时长；`--profile-max-events` 限制每个请求的事件数。CSV 的 `dropped` 列非零代表截断，服务请求日志也标明 `profile_status=TRUNCATED`。这里的请求 CSV 没有 benchmark 的 llama 精度对照/Markdown 汇总，保存成本会进入用户观察到的响应延迟，使用普通版做正式服务测速。`tfllm-run_profile` / `tfllm-run-concurrent_profile` 的 `--profile PREFIX` 则输出一份 `PREFIX.csv`。
+记录在请求推理完成后写盘，包含算子名、父子 ID、线程、shape、pair 和各阶段时长；`--profile-max-events` 限制每个请求的事件数。每个请求同时输出 CSV 和 JSONL，服务日志包含 `profile_file`、`profile_jsonl_file`。CSV 的 `dropped` 列非零代表截断，服务请求日志也标明 `profile_status=TRUNCATED`。这里的请求 CSV 没有 benchmark 的 llama 精度对照/Markdown 汇总，保存成本会进入用户观察到的响应延迟，使用普通版做正式服务测速。`tfllm-run_profile` / `tfllm-run-concurrent_profile` 的 `--profile PREFIX` 则输出 `PREFIX.csv` 和 `PREFIX.jsonl`。
 
-连续 decode 新增 `llama_decode_queue_wait`（等待合批/CPU 的时间）和 `cpu_batch/llama_decode_batch`（执行加复制 logits）事件。后者 `M` 是本次提交的总 token 数，`K` 是参与的会话数，`N` 是词表大小，`head` 是该请求的会话槽号；`session_slot_wait` 记录进入生成槽位前的等待。一次共享批次会分别写入参与请求的 CSV，跨文件相加会重复计算，且这些子事件已包含在 `llama_short_decode` 中。普通版由宏完全移除这些采样代码。
+连续 decode 记录 `llama_decode_queue_wait`（等待合批/CPU 的时间）和 `cpu_batch/llama_decode_batch`（执行加复制 logits）事件。后者 `M` 是本次提交的总 token 数，`K` 是参与的会话数，`N` 是词表大小；queue wait 的 `head` 是该请求的会话槽号。batch 内进一步记录准备、图执行、同步、logits 复制，以及通过 llama 原生 `cb_eval` 采集的 `ggml_op` 节点。输出带 batch ID、输入/输出类型、四维 shape/stride；现有 Electron 查看器可展示新字段。一次共享批次会写入各参与请求的 CSV，同一 recorder 仅记录一份，跨文件按 batch ID 去重。回调分段会影响执行融合和同步，标记 `measurement=cb_eval_segment`，不可用该采集结果代替普通版 TPOT。普通版不注册回调，采样代码由宏移除。格式与使用详见 [Decode profile](docs/DECODE_PROFILE.md)。
 
 SDK 调用方链接 `tfllm_profile`（NPU/llama adapter 同样使用 `_profile` target）后也可按请求开启采集，`SessionExecutor` 和 `LinearPool` 自动传递上下文：
 
@@ -669,7 +669,7 @@ logits = session.Prefill(second_prompt_token_ids);
 
 `Append` 输入仅为新增 token；`Prefill` 输入完整前缀，会比较 token ID 并截断分歧之后的 KV。调用方负责 tokenizer、chat template、采样及停止条件。返回最后一个真实 token 的 logits。只有实际执行过的 token 才计入 cache，刚采样但尚未 Append 的 token 不在 cache 中。
 
-默认调度：本次块长 <=32 走 llama.cpp，其他走 TFLLM prefill；最大块长 1024，逻辑计算档位按 64 向上对齐。阈值可用 `Policy` 配置，尚未根据具体板卡测得最优值。NPU 内部 MatMul 可进一步按 16 行处理尾块。真实长度、档位和 cache 容量独立；补齐 token 永不提交到 KV。
+默认调度：全部新增 token 作为一次逻辑执行；长度 <=32 走 llama.cpp，其他走 TFLLM prefill。`Policy::max_prefill=0` 表示不设外层块长上限，非零值保留显式分块以做诊断对照。逻辑计算档位按 64 向上对齐，真实 token 不要求补齐。投影、FFN 在内部拆成最多 1024 行的执行块，attention 按 score 工作集拆 query；这些内部 tile 不重新运行整个 decoder，也不重复为同一层/head 构建 KV 快照。初始化按内部 tile 准备，不按整段提示词分配 NPU 单次工作区。1024 是当前 adapter 的执行块选择，不是 NPU 命令字统一的提示词长度限制。真实长度、档位和 cache 容量独立；补齐 token 永不提交到 KV。现有 attention 历史 key 数 <=16384 的限制仍保留，详见 [逻辑 prefill 与物理切片](docs/LOGICAL_PREFILL.md)。
 
 一个 `Session` 内的调用串行执行。不同会话分别持有 KV；TFLLM 模型权重通过 `shared_ptr<const Model>` 共享。`LlamaModel(gguf, config)` 只加载/校验一次，通过其 `CreateContext(capacity, threads)` 创建共享 llama 权重的独立上下文；单独调用此 API 仍获得独占 context/线程池。chat/serve 改用 `CreateBatchContexts(capacity, sequences, threads)`，返回的各组 components 必须各绑定一个独占 Session；它们共享 context 和持久 decode 线程池，分别持有 KV stream。旧 `CreateLlama` 便利函数仍按调用创建独立模型。批量入口的 KV 按最大并发在启动时分配，公共 context 工作区另计。
 
@@ -755,7 +755,7 @@ export TFLLM_NPU_RUNTIME_MIB=512
 
 静态权重按一次 K×N 分配及 16 KiB 对齐计算，不均匀 Grid 和新 M 不增加权重副本。一次 GEMM 的所有操作数与内部 LUT/scratch 必须在同一 HIGH，运行槽选择静态 B 所在窗口；动态 K/V 从有空闲容量的运行区申请。某窗口暂时不足时，在生成命令之前回滚部分租用，再等待在途任务归还；没有在用实例仍放不下时明确报错。全池预算、分区容量和最大连续段都需要满足，不依靠把权重挤入运行区解决。
 
-命令队列受硬件 direct-fetch 限制，仍使用 reserved-DDR，独立于上述操作数布局。池内命令缓冲按 16 KiB 对齐复用，物理缓存默认每次至少增长 4 MiB、总计最多 256 MiB，整个缓存容量计入同一非 KV 预算。空闲时运行区租用归零；整池 `used_bytes` 仍包含静态权重与匿名 direct 命令池的物理预留量。FP16 持久 KV 仍由 llama/CPU 分配；该预算不限制持久 KV 或全部进程内存。
+命令队列受硬件 direct-fetch 限制，仍使用 reserved-DDR，独立于上述操作数布局。池内命令缓冲按 16 KiB 对齐复用，物理缓存默认每次至少增长 4 MiB、总计最多 256 MiB，整个缓存容量计入同一非 KV 预算。空闲时运行区租用归零；整池 `used_bytes` 仍包含静态权重与匿名 direct 命令池的物理预留量。持久 KV 仍由 llama/CPU 分配；该预算不限制持久 KV 或全部进程内存。
 
 Session 初始化转换、打包并上传静态矩阵；`Prepare(1024)` 不预编译 1024 行命令。首个 M/K/N 编译不可变 CPU 配方，包含命令图像、相对布局和地址补丁。每次执行先租用一块完整操作数工作区与一块独立 direct 命令区，再把命令直接写入最终缓冲并修正 A/B/C/HIGH。内部 LUT/scratch 和输入输出只是偏移视图，不逐项分配，不克隆 `MatMulHelper`。全部 pair 写回和 CPU 读取完成后归还两块空间。
 
@@ -801,9 +801,11 @@ xargs ./build/tfllm-board/tfllm-run-concurrent models/qwen3-8b source.gguf 4 < p
 
 ## KV 的所有权与接力
 
-未接 llama 时，`KvCache` 自己分配内存。接 llama 时，**llama.cpp 分配 FP16 K/V，TFLLM 直接引用这些 buffer 的地址与 stride**，不通过保存/恢复 session 文件搬运 KV。引用拥有 context 的生命周期，避免 context 先释放。当前限定 CPU FP16 KV、单 sequence 0、连续位置、无 cache shift/MLA/量化 KV；拒绝不兼容布局。Gemma 2/3 支持 llama 的 dense/SWA 双 cache，按全局层号映射，并分别发布/校验元数据。设置 `swa_full=true` 保留整个会话容量的 KV，因此能回退到较早前缀；这里没有使用只保留窗口长度的环形缓存节省内存。
+未接 llama 时，`KvCache` 自己分配 FP16 内存。接 llama 时，**llama.cpp 分配持久 K/V，TFLLM 直接引用这些 buffer 的地址、stride 和行编码器**，不通过保存/恢复 session 文件搬运 KV。默认使用 Q8_0，head_dim 不满足 32 元素分块要求时 auto 选择 F16；可显式指定类型。引用拥有 context 的生命周期，避免 context 先释放。每个 sequence 使用独立、连续的物理 stream，限定 CPU 可访问的 F16/Q8_0 KV、连续位置、无 cache shift/MLA；拒绝不兼容布局。Gemma 2/3 支持 llama 的 dense/SWA 双 cache，按全局层号映射，并分别发布/校验元数据。设置 `swa_full=true` 保留整个会话容量的 KV，因此能回退到较早前缀；这里没有使用只保留窗口长度的环形缓存节省内存。
 
-K 存储 Q/K norm 和 RoPE 之后的值；按 KV head 数保存，不复制成 query head 数。V 支持当前 llama 非 Flash Attention 的转置布局，也检查非转置布局。KV 的物理 token 槽位等于绝对 token 位置。
+K 的逻辑值为 Q/K norm 和 RoPE 之后的值；按 KV head 数保存，不复制成 query head 数。F16 接口兼容转置/非转置 V；当前 context 开启 Flash Attention，Q8_0 的 K/V 均沿 head_dim 分块、按 token/head 存放。量化 KV 若启用 llama 的 Hadamard 旋转，桥接在编码前执行相同旋转、解码后执行逆旋转；K 使用 llama 选择的旋转长度，V 使用 64。KV 的物理 token 槽位等于绝对 token 位置。
+
+Q8_0 每 32 个值使用 32 字节整数和 2 字节 FP16 scale，占 F16 的 53.125%。`WriteFp16` 只转换本块新增 K/V，使用逐 head 的小段 FP32 scratch 并调用 ggml CPU 行量化函数，不维护完整 FP16 副本、不重新量化旧前缀。`HeadFp16` 在 native prefill 需要历史时，按 head 反量化为临时 FP16 attention 输入；llama decode 直接读写自己的 Q8_0 cache。标量 `Write` 仅支持 F16，量化缓存必须通过整行 `WriteFloat`/`WriteFp16` 写入，以免反复改变量化 scale。
 
 每个块遵循：
 
@@ -814,11 +816,11 @@ K 存储 Q/K norm 和 RoPE 之后的值；按 KV head 数保存，不复制成 q
 
 llama decode 自己写入和发布其 KV；TFLLM prefill 则通过桥接器发布 llama 的 cell 元数据。只共享一个内存指针、却不更新这些元数据，是不够的。
 
-FP16 KV 位于 CPU 可访问内存；NPU 实际读的是独立 UINT8 执行缓冲，不是直接 DMA 读取 llama 的 malloc buffer。语言和视觉 attention 每次处理一个 KV head 时，先通过 `PrepareDynamic` 在普通主存生成不可变量化快照，提前准备完整 query 块和尾块需要的转置/列切分排布。K/N 需要补齐或分段时，同样提前准备每个 block；数值量化边界沿用原路径。
+持久 KV 位于 CPU 可访问内存；NPU 实际读的是独立 UINT8 执行缓冲，不是直接 DMA 读取 llama 的 malloc buffer。语言和视觉 attention 每次处理一个 KV head 时，先通过 `PrepareDynamic` 在普通主存生成不可变量化快照，提前准备完整 query 块和尾块需要的转置/列切分排布。K/N 需要补齐或分段时，同样提前准备每个 block；数值量化边界沿用原路径。
 
 换入执行空间只复制已准备的字节和尺度、完成 CPU cache 维护，不做量化或矩阵转置。普通 GEMM 使用当次租用的动态工作区；新的原生融合 attention 在一个 head 内共享一份物理 K/V，不逐 tile 复制。并发会话使用各自快照及独占的在用槽，NPU 完成、cache 写回及 CPU 读取完成后槽才可复用。主存快照是运行时对象，不写入模型包。
 
-这版快照供一次 attention 的各个 query/GQA 块复用；追加 token 后仍重新准备有效历史。V 仍按输出 channel 沿历史长度计算 scale，未引入 per-token V scale 前移到 Softmax 输出的数值变化。因此当前不是永久增量 INT8 KV，也不是 UINT8 KV 零复制；llama decode 继续直接使用原来的 FP16 KV。
+这版快照供一次 attention 的各个 query/GQA 块复用；追加 token 后仍重新准备有效历史。V 仍按输出 channel 沿历史长度计算 scale，未引入 per-token V scale 前移到 Softmax 输出的数值变化。NPU 的 UINT8 执行快照与持久 Q8_0 KV 是两种独立格式；当前不是 UINT8 KV 零复制，llama decode 直接使用持久 Q8_0/F16 KV。当前固定版本的 CPU Flash Attention 对 Q8_0 使用量化路径，F16/F32 的 split-KV 和 tiled 优化不用于 Q8_0；减少持久存储并不保证同比例减少 TPOT，板端速度与模型精度需实测。
 
 ## FP16 激活与 CPU 内核
 
@@ -828,7 +830,8 @@ FP16 KV 位于 CPU 可访问内存；NPU 实际读的是独立 UINT8 执行缓�
 
 | 数据/阶段 | 类型 |
 |---|---|
-| 算子间激活与共享 KV | FP16，单元素 2 字节 |
+| 算子间激活 | FP16，单元素 2 字节 |
+| llama 共享持久 KV | 默认 Q8_0（32 值 / 34 字节），兼容 F16 |
 | NPU 工作输入 / MatMul 累加 | UINT8 / INT32 |
 | Projection BiasAdd | FP16 bias + FP16 activation，FP16 输出 |
 | Norm、LayerNorm beta、DeltaNet 参数、RoPE 因子、量化 scale | FP32 小张量或系数 |
@@ -846,7 +849,7 @@ CPU 热点按当前 TFDL 实现的做法整理为独立内核，不引入 TFCont
 - Softmax 使用 `internal/SoftmaxEval.h` 的稳定最大值归约、向量 exp、FP32 求和与 FP16 输出；exp 多项式来自 `Common/Utils.h` 的 Cephes 实现。FP32 scratch 限于每个 CPU 任务的一行，不是完整 scores 张量。
 - SiLU/GELU 与乘 up 融合，一次输出 FP16；残差、bias、embedding 转换均有 NEON 路径。GELU 保持各原生模型要求的 tanh 近似公式。
 - RoPE 的 sin/cos 每个位置/维度计算一次，供 Q/K、所有 heads 和相同配置的层复用；旋转使用 NEON，支持 NEOX/交错布局。
-- KV 写入和历史读取直接复制 FP16 位；连续行走 memcpy，V 转置按小块处理，两种 llama stride 布局均不经过逐元素 FP32 中转。
+- F16 KV 写入和历史读取直接复制 FP16 位；连续行走 memcpy，V 转置按小块处理。Q8_0 KV 使用适配器提供的 ggml 行编码器及旋转，在 native prefill 的写入/快照边界使用逐 head 的 FP32 scratch。
 
 CPU 内核共享一个常驻池，最多 7 个后台线程，加上当前调用线程；小任务直接执行。不同会话/不同 NPU pair 共用这些后台线程，不为每个算子创建线程。池在 NPU worker 绑定 CPU 前初始化；后台线程继承首次初始化调用者的 affinity，不要在创建引擎前把主线程限制到单个 CPU。线程池回调只运行 CPU 内核，不能在其中等待 NPU 或嵌套并行任务。
 

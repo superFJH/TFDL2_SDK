@@ -19,12 +19,13 @@ struct LlamaComponents {
     std::shared_ptr<Backend> decode;
     std::shared_ptr<CacheBridge> bridge;
 };
-// Immutable llama weights/vocabulary shared by FP16 KV contexts.
+enum class LlamaKvType { Auto, Fp16, Q8_0 };
+// Immutable llama weights/vocabulary shared by KV contexts.
 // Load and validate once per engine, not once per conversation.
 class LlamaModel {
 public:
     LlamaModel(const std::string& gguf, const Config& config);
-    LlamaComponents CreateContext(size_t capacity, int threads = 4) const;
+    LlamaComponents CreateContext(size_t capacity, int threads = 4,LlamaKvType kv_type=LlamaKvType::Auto) const;
     // One context, one persistent CPU pool, separate fixed KV streams. Bind
     // each returned component to exactly one Session. Ready short/decode jobs
     // are combined at step boundaries; native prefill writes its own stream.
@@ -33,7 +34,8 @@ public:
     // Experimental qwen35 uses private contexts per sequence for recurrent
     // cells; threads is per context and decode jobs are not coalesced yet.
     std::vector<LlamaComponents> CreateBatchContexts(size_t capacity, size_t sequences,
-                                                    int threads = 4, unsigned batch_wait_us = 200) const;
+                                                    int threads = 4, unsigned batch_wait_us = 200,
+                                                    LlamaKvType kv_type=LlamaKvType::Auto) const;
     std::vector<int32_t> Tokenize(const std::string& text, bool add_special = true) const;
     std::string Piece(int32_t token, bool special = false) const;
     bool IsEnd(int32_t token) const;
@@ -60,12 +62,13 @@ private:
     struct Impl;
     std::shared_ptr<Impl> impl_;
 };
-// Creates an exclusively owned CPU llama context, sequence 0, FP16 KV, no
+// Auto uses Q8_0 for heads divisible by 32, otherwise FP16. Both use CPU FA.
+// Creates an exclusively owned CPU llama context, sequence 0, no
 // cache shifting, full-capacity SWA, no MLA. Returned KV views alias its actual cache buffers.
 // Separate calls create independent sessions; the caller never receives a raw
 // llama context that could bypass Session's execution lock.
 LlamaComponents CreateLlama(const std::string& gguf, const Config& config,
-                            size_t capacity, int threads = 4);
+                            size_t capacity, int threads = 4,LlamaKvType kv_type=LlamaKvType::Auto);
 // Stable content identity of the source GGUF. Used by conversion and binding
 // to reject a same-shaped but different model. Not a cryptographic signature.
 std::string GgufIdentity(const std::string& path);
@@ -87,7 +90,7 @@ Config ConvertGguf(const std::string& source,const std::string& prefix,
 class GgufSession {
 public:
     GgufSession(const std::string& gguf,size_t capacity,int threads=4,
-                const std::string& expected_identity={});
+                const std::string& expected_identity={},bool flash_attention=false);
     ~GgufSession();
     std::vector<float> Append(const std::vector<int32_t>& tokens);
     std::vector<float> Prefill(const std::vector<int32_t>& prompt);

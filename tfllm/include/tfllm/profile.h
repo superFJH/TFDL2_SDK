@@ -7,6 +7,7 @@
 #define TFLLM_ENABLE_PROFILE 0
 #endif
 #if TFLLM_ENABLE_PROFILE
+#include <array>
 #define TFLLM_PROFILE(...) __VA_ARGS__
 #else
 #define TFLLM_PROFILE(...)
@@ -34,6 +35,20 @@ namespace tfllm {
 // Host wall spans. Parent spans INCLUDE their children; never sum all kinds.
 // A recorder belongs to one request, not to a process-global profiling switch.
 struct ProfileShape {size_t m=0,k=0,n=0;};
+struct ProfileTensor {
+    std::string name,type;
+    std::array<int64_t,4> ne{};
+    std::array<size_t,4> nb{};
+    int slot=-1;
+};
+// Optional metadata; ordinary prefill events do not allocate this payload.
+struct ProfileDecode {
+    std::string batch_id,measurement,ggml_op;
+    int node_index=-1;
+    ProfileTensor output;
+    std::vector<ProfileTensor> inputs;
+    std::vector<size_t> sequence_ids,past_lengths,token_counts;
+};
 struct ProfileEvent {
     uint64_t id=0,parent=0,thread=0;
     std::string kind,name,operation;
@@ -43,6 +58,7 @@ struct ProfileEvent {
     size_t first_row=0;
     size_t padded_m=0,descriptors=0,bytes=0,evictions=0;
     bool failed=false;
+    std::shared_ptr<const ProfileDecode> decode;
 };
 class ProfileRecorder {
 public:
@@ -50,6 +66,7 @@ public:
     explicit ProfileRecorder(size_t max_events=100000);
     std::vector<ProfileEvent> Events() const;
     size_t Dropped() const noexcept {return dropped_.load();}
+    void Drop() noexcept {++dropped_;}
     // Also used for queue intervals whose endpoints are on different threads.
     void Record(ProfileEvent event,Clock::time_point begin,Clock::time_point end) noexcept;
     uint64_t NextId() noexcept {return next_.fetch_add(1);}
@@ -98,5 +115,7 @@ private:
 // Snapshot only after all request workers have completed. File I/O is outside
 // recorded operator spans; the caller controls request/file naming.
 void WriteProfileCsv(const ProfileRecorder& recorder,const std::string& path);
+// IDs are JSON strings so JavaScript does not lose 64-bit precision.
+void WriteProfileJsonl(const ProfileRecorder& recorder,const std::string& path);
 }
 #endif
