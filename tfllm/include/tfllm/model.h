@@ -8,6 +8,8 @@
 
 namespace tfllm {
 constexpr uint64_t MaxModelParameters = 30000000000ULL;
+constexpr uint64_t MaxMoeModelParameters = 40000000000ULL;
+uint64_t ModelParameterLimit(const std::string& architecture);
 size_t CheckedMul(size_t a, size_t b);
 size_t RoundUp(size_t value, size_t alignment);
 uint16_t ToHalf(float value);
@@ -33,11 +35,15 @@ struct Config {
     uint32_t rotary_dim=0, linear_key_heads=0, linear_value_heads=0;
     uint32_t linear_key_dim=0, linear_value_dim=0, linear_conv_kernel=0;
     bool IsRecurrent(size_t layer) const {return !recurrent_layers.empty() && recurrent_layers.at(layer)!=0;}
+    uint32_t experts=0, experts_used=0, shared_intermediate=0;
+    float expert_weights_scale=1;
+    bool IsHybrid() const {return architecture=="qwen35" || architecture=="qwen35moe";}
+    bool HasMoe() const {return experts!=0;}
     void Validate() const;
     size_t FirstKey(size_t layer, size_t visible) const;
     float AttentionScore(float dot) const;
 };
-enum class Encoding : uint8_t { F32, F16, U8RowSymmetric };
+enum class Encoding : uint8_t { F32, F16, U8RowSymmetric, Q4RowBlocks };
 // Runtime-only, immutable backend preparation. Never serialized in a package.
 struct TensorPreparation { virtual ~TensorPreparation() = default; };
 struct Tensor {

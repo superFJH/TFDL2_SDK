@@ -17,11 +17,11 @@ VISION_ARCHITECTURES = {"Qwen3VLForConditionalGeneration", "Qwen2VLForConditiona
                         "LlavaNextForConditionalGeneration", "Mistral3ForConditionalGeneration",
                         "InternVLChatModel", "InternVLForConditionalGeneration",
                         "Gemma3ForConditionalGeneration", "LocateAnythingForConditionalGeneration",
-                        "PaddleOCRVLForConditionalGeneration"}
+                        "PaddleOCRVLForConditionalGeneration", "MiniCPMV4_7ForConditionalGeneration"}
 AUDIO_ARCHITECTURES = {"Qwen3ASRForConditionalGeneration"}
 
 
-def check_safetensors(files):
+def check_safetensors(files, limit=30_000_000_000):
     parameters, names = 0, set()
     for file in files:
         with file.open("rb") as f:
@@ -50,8 +50,8 @@ def check_safetensors(files):
             if begin<0 or end-begin!=count*item_size or end>file.stat().st_size-size-8:
                 raise ValueError("Truncated/invalid tensor payload: " + name)
             parameters += count
-            if parameters>30_000_000_000:
-                raise ValueError("Model exceeds 30B total parameters")
+            if parameters>limit:
+                raise ValueError("Model exceeds total parameter limit")
     return parameters
 
 
@@ -145,10 +145,12 @@ def source_files(path, gguf_file=None):
     thinker = config.get("thinker_config", {})
     if not isinstance(thinker, dict):
         raise ValueError("Invalid thinker_config")
+    minicpm47 = "MiniCPMV4_7ForConditionalGeneration" in architectures(config)
     for cfg in (config, config.get("text_config", {}), config.get("llm_config", {}), config.get("vision_config", {}),
                 thinker, thinker.get("text_config", {}), thinker.get("audio_config", {})):
         if isinstance(cfg,dict) and any(cfg.get(k,0) for k in ("num_experts", "num_local_experts", "n_routed_experts", "num_experts_per_tok")):
-            raise ValueError("TFLLM supports dense models only; MoE is unsupported")
+            if not (minicpm47 and cfg is config.get("text_config") and cfg.get("model_type") == "qwen3_5_moe_text"):
+                raise ValueError("No native TFLLM adapter for this MoE architecture")
     text_config = config.get("text_config", {})
     if not isinstance(text_config, dict):
         raise ValueError("Invalid text_config: expected an object")
@@ -169,7 +171,10 @@ def source_files(path, gguf_file=None):
     weights = sorted(path.glob("*.safetensors"))
     if not weights:
         raise ValueError("Missing safetensors weights")
-    check_safetensors(weights)
+    if minicpm47:
+        if text_config.get("model_type") != "qwen3_5_moe_text" or config.get("mrope_mode", "canvas") != "canvas":
+            raise ValueError("MiniCPM-V 4.7 requires Qwen3.5 MoE text and canvas MRoPE")
+    check_safetensors(weights, 40_000_000_000 if minicpm47 else 30_000_000_000)
     index = path / "model.safetensors.index.json"
     if index.is_file():
         for name in set(read_json(index)["weight_map"].values()):
@@ -281,7 +286,7 @@ def prepare(args, bin_dir, converter_dir):
                 try:
                     # ASR keeps its validated F16 source export for native
                     # prefill; the converter creates an independent Q4 decode.
-                    run([sys.executable, script, source, "--outtype", "f16" if is_asr else "auto", "--outfile", gguf])
+                    run([sys.executable, script, source, "--outtype", "f16" if is_asr else "auto", "--outfile", gguf, "--no-mtp"])
                 except subprocess.CalledProcessError as e:
                     raise RuntimeError("HF conversion failed (see converter output). Install its pinned dependencies with: "
                         f"{sys.executable} -m pip install -r {converter_dir / 'requirements/requirements-convert_hf_to_gguf.txt'}") from e

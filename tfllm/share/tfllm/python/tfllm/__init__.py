@@ -1,1 +1,1 @@
-"""TFLLM native inference adapters (PyTorch is imported only by tfllm.torch)."""
+"""TFLLM inference adapters; Torch is loaded by optional torch/vision subpackages."""

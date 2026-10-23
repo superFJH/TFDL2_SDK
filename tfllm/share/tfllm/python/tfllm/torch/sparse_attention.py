@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 
 import torch
 from torch import nn
+from .runtime import _attention_tensors, _module_autocast
 
 
 @dataclass(frozen=True)
@@ -48,6 +49,7 @@ class NpuBlockSparseAttention(nn.Module):
             expected = (query.shape[0], query.shape[1], (query.shape[2]+bq-1)//bq, (key.shape[2]+bk-1)//bk)
             if mask._dense_shape != expected:
                 raise ValueError(f"block_mask shape {mask._dense_shape} differs from Q/K blocks {expected}")
+        query, key, value = _module_autocast(*_attention_tensors(query, key, value, contiguous=False))
         return self.runtime.attention_blocks(query, key, value, mask.row_offsets, mask.column_indices,
             query_block_size=mask.query_block_size, kv_block_size=mask.kv_block_size,
             scale=scale, enable_gqa=enable_gqa)

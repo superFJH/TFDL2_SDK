@@ -3,13 +3,14 @@ import copy
 import importlib
 import inspect
 import threading
+import types as _function_types
 
 import torch
 from torch.nn import functional as F
 from torch.overrides import TorchFunctionMode
 
 from .optimize import Unsupported
-from .routing import AttentionRoute, DeferredMask, IntervalMask, materialize_mask
+from .routing import AttentionRoute, DeferredMask, IntervalMask, materialize_mask, attention_fallback
 
 _registration_lock = threading.Lock()
 
@@ -59,9 +60,10 @@ def _hf_attention(module, query, key, value, attention_mask, dropout=0., scaling
         return fallback(module, query, key, value, mask, dropout=dropout, scaling=scaling, **kwargs)
     forbidden = ("output_attentions", "position_bias", "softcap", "soft_cap", "sliding_window")
     if module.training or any(kwargs.get(k) is not None and kwargs[k] is not False for k in forbidden):
-        return state.fallback(path, "training/attention weights/bias/softcap/window require original attention", original)
+        return attention_fallback(state,path,"training/attention weights/bias/softcap/window require original attention",original)
     if isinstance(attention_mask, DeferredMask):
-        return state.fallback(path, attention_mask.reason, original)
+        if getattr(state.runtime,"attention_fast",False):attention_mask=materialize_mask(attention_mask,key.shape[-2])
+        else:return state.fallback(path, attention_mask.reason, original)
     # The registered mask builder preserves absolute query/KV offsets. None is
     # only interpreted like HF SDPA when callers intentionally bypass it.
     causal = bool(kwargs.get("is_causal", getattr(module, "is_causal", True))) and query.shape[2] > 1 and attention_mask is None
@@ -72,14 +74,32 @@ def _hf_attention(module, query, key, value, attention_mask, dropout=0., scaling
 
 
 class _SDPAMode(TorchFunctionMode):
-    def __init__(self, route):
+    def __init__(self, route, *, unused_mha_weights=False):
         super().__init__()
         self.route, self.calls = route, 0
+        self.unused_mha_weights = unused_mha_weights
 
     def __torch_function__(self, func, types, args=(), kwargs=None):
         if func is F.scaled_dot_product_attention:
             self.calls += 1
             return self.route(*args, **(kwargs or {}))
+        # Packed MHA helpers dispatch the entire helper through TorchFunctionMode,
+        # otherwise hiding their inner SDPA while the mode is temporarily popped.
+        packed = (func is F.multi_head_attention_forward or
+                  (getattr(func,"__module__",None)=="sam3.model.model_misc" and
+                   getattr(func,"__name__",None)=="multi_head_attention_forward"))
+        if packed and getattr(self.route.state.runtime,"attention_fast",False):
+            bound=inspect.signature(func).bind_partial(*args,**(kwargs or {}))
+            need=bound.arguments.get("need_weights",inspect.signature(func).parameters["need_weights"].default)
+            if need and not self.unused_mha_weights:
+                raise Unsupported("FAST attention does not materialize attention weights; pass need_weights=False")
+            if need:
+                bound.arguments['need_weights']=False
+                args,kwargs=bound.args,bound.kwargs
+            local=_function_types.FunctionType(func.__code__,dict(func.__globals__,has_torch_function=lambda values:False),
+                func.__name__,func.__defaults__,func.__closure__)
+            local.__kwdefaults__=func.__kwdefaults__
+            with _SDPAMode(self.route,unused_mha_weights=self.unused_mha_weights):return local(*args, **(kwargs or {}))
         return func(*args, **(kwargs or {}))
 
 
@@ -89,7 +109,7 @@ class _DiffusersProcessor:
 
     def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None, temb=None, *args, **kwargs):
         if attn.training:
-            return self.route.state.fallback(self.route.path, "attention is in training mode", self.original,
+            return attention_fallback(self.route.state,self.route.path,"attention is in training mode",self.original,
                 attn, hidden_states, encoder_hidden_states, attention_mask, temb, *args, **kwargs)
         # Keep upstream normalization, layout, residual, projections and masks.
         # Only this invocation's SDPA is intercepted; no process-global patch.
@@ -100,6 +120,49 @@ class _DiffusersProcessor:
         return out
 
 
+def install_fast_sam3_decoder(state,path,module):
+    """This audited SAM3 layer consumes only MHA output [0], never weights."""
+    if "forward" in module.__dict__:
+        raise Unsupported(f"{path}: custom SAM3 decoder forward requires an explicit adapter")
+    original=module.forward
+    route=AttentionRoute(state,path)
+    def forward(this,*args,**kwargs):
+        with _SDPAMode(route,unused_mha_weights=True):return original(*args,**kwargs)
+    module.forward=_function_types.MethodType(forward,module)
+    state.undo.append(lambda:module.__dict__.pop("forward",None))
+    state.report.add(path,"attention","routed","SAM3 decoder discards MHA weights; use SDPA output")
+
+
+def install_fast_sam3_mha(state,path,module,allow_override=False):
+    """Keep SAM3 helper kwargs before its TorchFunction dispatch drops bias.
+
+    Function copies keep the provider's mask/layout code and its original
+    globals; only the outer override-dispatch check is disabled locally.
+    """
+    if not allow_override and "forward" in module.__dict__:
+        raise Unsupported(f"{path}: custom SAM3 MHA forward requires an explicit adapter")
+    original,had=module.forward,"forward" in module.__dict__
+    vendor=type(module).forward;helper=vendor.__globals__["multi_head_attention_forward"]
+    local_helper=_function_types.FunctionType(helper.__code__,dict(helper.__globals__,has_torch_function=lambda values:False),
+        helper.__name__,helper.__defaults__,helper.__closure__)
+    local_helper.__kwdefaults__=helper.__kwdefaults__
+    local_forward=_function_types.FunctionType(vendor.__code__,dict(vendor.__globals__,multi_head_attention_forward=local_helper),
+        vendor.__name__,vendor.__defaults__,vendor.__closure__)
+    local_forward.__kwdefaults__=vendor.__kwdefaults__
+    route=AttentionRoute(state,path)
+    def forward(this,*args,**kwargs):
+        bound=inspect.signature(vendor).bind_partial(this,*args,**kwargs)
+        if bound.arguments.get("need_weights",False):
+            raise Unsupported("FAST attention does not materialize attention weights; pass need_weights=False")
+        with _SDPAMode(route):return local_forward(this,*args,**kwargs)
+    module.forward=_function_types.MethodType(forward,module)
+    def undo():
+        if had:module.forward=original
+        else:module.__dict__.pop("forward",None)
+    state.undo.append(undo)
+    state.report.add(path,"attention","routed","FAST packed MHA; original mask/bias/layout preserved")
+
+
 def plan_attention(model, modules, state, operators, predicate):
     if "attention" not in operators:
         return [], set()
@@ -108,6 +171,16 @@ def plan_attention(model, modules, state, operators, predicate):
     families = {"llama": "LlamaAttention", "qwen2": "Qwen2Attention", "qwen3": "Qwen3Attention"}
     for path, module in modules:
         cls = type(module)
+        if getattr(state.runtime,"attention_fast",False) and (cls.__module__,cls.__name__)==("sam3.model.decoder","TransformerDecoderLayer"):
+            if predicate is None or predicate(path,module):
+                handled.add(id(module))
+                plans.append(lambda path=path,module=module:install_fast_sam3_decoder(state,path,module))
+            continue
+        if getattr(state.runtime,"attention_fast",False) and (cls.__module__,cls.__name__)==("sam3.model.model_misc","MultiheadAttention"):
+            if predicate is None or predicate(path,module):
+                handled.add(id(module))
+                plans.append(lambda path=path,module=module:install_fast_sam3_mha(state,path,module))
+            continue
         if cls.__module__.startswith("transformers.models.") and "attention" in cls.__name__.lower():
             hf.append((path, module))
         if cls.__module__ == "diffusers.models.attention_processor" and cls.__name__ == "Attention":

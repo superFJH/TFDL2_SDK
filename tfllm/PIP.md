@@ -10,12 +10,16 @@ cd /path/to/SDK/tfllm
 python -m pip install .
 # 如需同时安装 PyTorch/safetensors 依赖：
 python -m pip install '.[torch]'
+# SAM / Depth Anything 的通用图像与 HF 依赖（官方模型包按 VISION.md 另装）：
+python -m pip install '.[vision]'
+tfllm-vision list
 ```
 
 `.[torch]` 只选择 Python 依赖，不能给缺少 Torch 产物的 SDK 补编译。
 已有板端专用 PyTorch 时可沿用现有安装；离线部署先准备好 setuptools>=77、
 jinja2 及所需运行依赖，再使用 `python -m pip install . --no-build-isolation --no-deps`。
-Transformers/Diffusers、视觉/视频及模型转换依赖仍按对应功能文档另装，不强制所有 CLI 用户安装 Torch。
+SAM/Depth Anything 的加载、推理及覆盖边界见 [VISION.md](VISION.md)。
+其它 Transformers/Diffusers、视频及模型转换依赖仍按对应功能文档另装，不强制所有 CLI 用户安装 Torch。
 
 安装后的布局：
 

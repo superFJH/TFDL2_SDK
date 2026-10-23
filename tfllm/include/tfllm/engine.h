@@ -111,16 +111,32 @@ public:
     // Capability for physically padded K/V dimensions. Allows callers to
     // avoid constructing padded snapshots when the fused path is unavailable.
     virtual bool SupportsAttentionFp16(size_t /*keys*/,size_t /*head_dim*/) const {return false;}
+    virtual bool AttentionFastEnabled() const noexcept {return false;}
     virtual bool RunAttentionFp16(const Tensor&,const Tensor&,Fp16InputView,
                                  Fp16OutputView,const AttentionMask&) {return false;}
+    // Independent noncausal windows; false leaves output untouched. Optional
+    // strides are B/H/row strides for Q,K,V; channels and output are contiguous.
+    virtual bool RunWindowAttentionFp16(const uint16_t*,const uint16_t*,const uint16_t*,uint16_t*,
+                                       size_t /*jobs*/,size_t /*queries*/,size_t /*dim*/,float,
+                                       size_t /*keys*/=64,size_t /*heads*/=1,const size_t* =nullptr) {return false;}
+    // FP32 windows retain the same FP16 rounding. Input strides contain B/H/Q
+    // strides for Q, K and V; channel stride is one. Output is contiguous.
+    virtual bool RunWindowAttentionFp32(const float*,const float*,const float*,float*,
+                                       size_t,size_t,size_t,size_t,float,const size_t*) {return false;}
+    virtual bool RunWindowAttentionFp32Native(const float*,const float*,const float*,float*,
+                                       size_t,size_t,size_t,size_t,float,const size_t*,size_t /*keys*/=64) {return false;}
     // A caller-owned encode scope may retain at most a bounded number of
     // idle private workspaces. Backends must pressure-evict them and refresh
     // K/V on reuse. Destroy only after all scoped head jobs have drained.
+    // A backend may join the current LinearWorkspaceScope to reuse storage
+    // across attention layers of the same prefill/encode request.
     virtual std::shared_ptr<AttentionWorkspaceScope> CreateAttentionWorkspaceScope(){return {};}
     virtual bool RunAttentionFp16Scoped(const Tensor& k,const Tensor& v,Fp16InputView q,Fp16OutputView out,
                                        const AttentionMask& mask,const std::shared_ptr<AttentionWorkspaceScope>&) {
         return RunAttentionFp16(k,v,q,out,mask);
     }
+    virtual bool RunAttentionFp32Scoped(const Tensor&,const Tensor&,Fp32InputView,Fp32OutputView,
+                                       const AttentionMask&,const std::shared_ptr<AttentionWorkspaceScope>&) {return false;}
     virtual std::vector<float> Run(const Tensor& weight, const std::vector<float>& input,
                                    size_t rows) = 0;
     // Production prefill uses binary16 end to end. The defaults are explicit
@@ -129,9 +145,17 @@ public:
     // A shorter logical K is zero-padded; only output.columns are written.
     // Defaults preserve compatibility with existing CPU/third-party backends.
     virtual void RunFp16Into(const Tensor&,Fp16InputView,Fp16OutputView);
+    // Equivalent to Narrow(input) -> RunFp16Into -> Widen(output), without
+    // requiring complete intermediate FP16 tensors on accelerated backends.
+    virtual void RunFp32BridgeInto(const Tensor&,Fp32InputView,Fp32OutputView);
+    // External Torch FP32 contract. Never narrows activations to FP16.
+    virtual void RunFp32Into(const Tensor&,Fp32InputView,Fp32OutputView);
+    virtual size_t LinearTileRows(size_t /*k*/,size_t /*n*/) const {return 1024;}
     virtual void AccumulateFp16View(const Tensor&,Fp16InputView,float* sum,size_t stride);
     virtual bool SupportsQuantizedInput(size_t /*columns*/) const {return false;}
     virtual void RunQuantizedInto(const Tensor&,const QuantizedInput&,Fp16OutputView);
+    // UINT8 producer -> unrounded FP32 result, optionally planar NCHW.
+    virtual void RunQuantizedFp32Into(const Tensor&,const QuantizedInput&,Fp32OutputView);
     // Only backends supporting simultaneous calls opt into head pipelining.
     virtual size_t VisionAttentionConcurrency() const {return 1;}
     // Internal long-K reduction: add unrounded FP32 partials into operator

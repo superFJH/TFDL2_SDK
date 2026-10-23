@@ -1,5 +1,10 @@
 # TFLLM
 
+MiniCPM-V 4.7 35B-A3B 的原生 MoE、视觉压缩、canvas MRoPE 与 CPU decode 接力见 [MiniCPM-V 4.7](MINICPM_V47.md)。
+
+SAM/SAM2/SAM3/EfficientTAM 与 Depth Anything V1/V2/V3 的 Python 模型加载、图像/视频/多视图入口、
+TFLLM 算子覆盖和验证边界见 [视觉任务接入](VISION.md)。
+
 原生 NPU prefill / vision 的融合 Attention 与板端 `AttentionTest` / `VisionAttentionTest` 使用方法见 [Attention 测试说明](ATTENTION_TEST.md)。
 PyTorch 的 `NpuAttention` 也可直接调用相同融合后端（支持 causal/cross/GQA，不生成 Torch score/probability tile），用法与板端 sample 见 [PyTorch 模块](TORCH.md)。
 现有模型可通过 `tfllm.torch.optimize()` 自动接管受支持的 Linear/Conv2d 和 Transformers/Diffusers attention，保留原 Parameter/state_dict；函数式代码另提供 `make_backend()` 编译后端。支持范围、严格模式、覆盖报告及 `torch_auto.py` sample 见 [自动接管](TORCH.md#自动接管现有模型)。
@@ -9,12 +14,13 @@ PyTorch 的 `NpuAttention` 也可直接调用相同融合后端（支持 causal/
 
 ## 模型支持范围
 
-按 **GGUF architecture 和实际张量/超参数** 选择实现，不仅匹配文件名。导入时统计所有 GGUF 分片的张量元素，总参数上限为 **30,000,000,000**，MoE 计入全部专家，而非每 token 激活参数量；超过上限在加载权重前拒绝。模型名中标称的“30B”若实际超过此数也会拒绝。
+按 **GGUF architecture 和实际张量/超参数** 选择实现，不仅匹配文件名。导入时统计所有 GGUF 分片的张量元素，dense 总参数上限为 **30,000,000,000**；新增 `qwen35moe`（MiniCPM-V 4.7 35B-A3B）上限为 **40,000,000,000**，计入全部专家，而非每 token 激活参数量；超过对应上限在加载权重前拒绝。模型名中标称的“30B”若实际超过此数也会拒绝。
 
 | GGUF 结构 | 代表模型族（限上述参数范围） | 当前执行路径 |
 |---|---|---|
 | `llama` | Llama 2/3；以 llama 结构保存的 Mistral、Llama 蒸馏模型 | 原生 TFLLM prefill + 共享 KV llama decode |
 | `qwen2` | Qwen2、Qwen2.5、对应 Qwen 蒸馏模型 | 原生，支持 Q/K/V bias |
+| `qwen35moe` | MiniCPM-V 4.7 35B-A3B | 原生 routed/shared MoE、DeltaNet/full Attention、canvas MRoPE，视觉 NPU + prefill NPU + CPU decode；见 [说明](MINICPM_V47.md) |
 | `qwen3` | Qwen3 dense | 原生，支持 Q/K norm |
 | `qwen2vl` | Qwen2-VL、Qwen2.5-VL dense | 原生图文 prefill、连续分段三轴 MRoPE、共享 KV；配套 Qwen2/2.5 mmproj |
 | `paddleocr` | PaddleOCR-VL-1.6 | 原生动态分辨率视觉编码、2x2 projector、图文 MRoPE prefill、共享 KV decode |
@@ -23,7 +29,7 @@ PyTorch 的 `NpuAttention` 也可直接调用相同融合后端（支持 causal/
 | `gemma` | Gemma 1 | 原生，embedding 缩放、GELU、共享 embedding/LM head 权重 |
 | `gemma2` | Gemma 2 | 原生，额外 Norm、滑窗、attention/logits softcap |
 | `gemma3` | Gemma 3 文本 decoder | 原生，Q/K norm、额外 Norm、每层滑窗及 RoPE 参数 |
-| 其余官方版本支持的普通自回归文本结构 | 如 Phi3、MoE、混合结构 | 整模型 llama.cpp CPU 回退；不标记为 NPU 已编译 |
+| 其余官方版本支持的普通自回归文本结构 | 如 Phi3、其他 MoE、其他混合结构 | 整模型 llama.cpp CPU 回退；不标记为 NPU 已编译 |
 
 原生路径支持标准/linear RoPE、normal/NEOX 排列和 Llama 的频率因子张量。YaRN/LongRoPE、非统一层维度、原生实现未消费的额外张量等会明确回退。回退仍取决于固定版本 llama.cpp 的 CPU 模型支持和内存要求；不保证所有 GGUF、视觉输入、encoder-decoder 或依赖另一个模型的 draft/assistant 文件均可执行。
 
@@ -35,7 +41,7 @@ Qwen3-VL 纯文本的 T/H/W position 相同，三轴 interleaved MRoPE 等价于
 
 Qwen3-ASR 的文件转写、`/v1/audio/transcriptions` 服务、生命周期和验证范围见 [ASR.md](ASR.md)。1.7B 音频编码器的本机 W8A8 精度对照工具、量化范围和真实语音实验见 [ASR 量化验证](ASR_QUANTIZATION.md)。
 
-本轮不扩展 MoE。`serve`/`chat` 的 HF 导入拒绝 MoE，模型包要求 `--require-native`，不会因不支持的视觉或语言结构静默改用整模型 CPU。底层显式 llama fallback 接口保留原有行为。
+`serve`/`chat` 的 HF 导入已支持 MiniCPM-V 4.7 的 Qwen3.5 MoE，其他 MoE 结构仍明确拒绝。模型包要求 `--require-native`，不会因不支持的视觉或语言结构静默改用整模型 CPU。底层显式 llama fallback 接口保留原有行为。
 
 **当前是可构建、可验证的第一版，不是已完成板端性能验收的 Qwen3-8B 产品。** 本地已验证真实 llama.cpp 共享 KV 接力。NPU40T 路径已实现并做编译检查，尚需在板上运行数值回归和模型精度/性能测试。
 
@@ -518,13 +524,41 @@ cached 启动日志标记 `prepare_wait=command_syncall` 或 `prepare_wait=cpu_a
 比较相同录音的请求总延迟及 `pair_prepare`、`npu_execute`：硬件失效等待仍然存在，
 可能计入计算命令的同步时间，实际净收益需要板端 profile 验证。
 
-另有默认关闭的 `TFLLM_NPU_CACHE_IN_COMMAND=1` 模板级策略，共用原 Helper，将安全输出块的
-异步写回插入计算命令，并在命令末尾完整清理。开启方式、TFDL 隔离范围与限制见
-[NPU_COMMAND_CACHE.md](NPU_COMMAND_CACHE.md)。该新路径尚待板端验证。
+`TFLLM_NPU_CACHE_IN_COMMAND=1` 默认开启，共用原 Helper，在计算命令内维护 cache，
+在 CPU 读取前完成输出发布。`TFLLM_NPU_CACHE_IN_COMMAND=0` 恢复统一的外部 cache 维护。
+
+静态权重的 INT32 Linear 单独使用 `TFLLM_NPU_LINEAR_CACHE_POLICY=auto`（默认）：
+当平均每个计算核的 INT32 输出达到 1.5 MiB 时，生成 KeepResident 命令，计算完成后
+在持有 pair 锁期间统一写回，等待完成再释放、反量化；小矩阵沿用命令内发布。
+这样避免大输出被命令内多次回写。NPU cache、输入失效和权重锁继续使用，
+量化参数、INT32 累加及 FP16/FP32 输出精度均不变。
+融合 attention（含 FAST）的 QK/softmax/PV 流水线和 Conv 仍使用原策略。
+
+该变量在创建 NPU runtime 时读取：`command` 恢复原 Linear 行为，`external` 强制
+所有静态 INT32 Linear 使用外部发布，便于对照；两者都遵守总开关
+`TFLLM_NPU_CACHE_IN_COMMAND` / `TFLLM_USE_CACHE`。启动日志 `TFLLM_NPU_LINEAR`
+显示选择，`TFLLM_NPU_TRACE_SPLIT=1` 可查看实际 GEMM 策略。发布方式纳入内存与磁盘
+模板键，同一形状的 Linear 和 attention 可同时缓存；升级后旧磁盘模板自动失效。
+
+跨层复用 Linear 工作区时，换权重只更新本次目标；每个执行 worker 在获取 NPU pair
+之前绑定自己实际使用的 full/lite 命令。不同 worker 准备不同命令，可并行进行。
+未使用的命令继续持有旧权重，迁移到另一种核心执行前再更新，避免悬空地址；
+绑定失败时等待已提交的其他任务退出，再回收该工作区。
+
+普通静态 Linear 另可通过 `TFLLM_NPU_LINEAR_LAYOUT=xw|wxt|wxt15|wxt20|auto`
+对照物理布局与 full/lite 通道比例；默认仍为 XW。布局进入模板、执行实例和磁盘缓存键，
+不改变 attention/Conv 的分块。具体含义见 [Torch 诊断开关](TORCH.md)。
+`TFLLM_NPU_LINEAR_AUTOTUNE=1` 配合 `TFLLM_NPU_LINEAR_LAYOUT=auto`，可在首次遇到
+形状时联合测量布局、核数、网格和行块，以原量化精度选择完整调用较快的配置。
+校准默认关闭；首次搜索需额外时间，应在服务预热阶段完成，并单独评估并发 QPS。
+可用 `TFLLM_NPU_LINEAR_TUNE_CONCURRENCY=2|4` 按目标并发吞吐校准；默认 `1` 按单次耗时。
+适用视图、冷调用开销和板端数据见 [Linear 测试报告](artifacts/torch-linear-tuning-20261019-server65/REPORT.md)。
+CPU LRU 淘汰模板后，仍存活的执行实例可继续共享它持有的不可变模板，避免大命令
+超过模板预算时每次调用重新编译；弱引用索引不延长模板或设备缓冲的生命周期。
 
 PaddleOCR 板端范围写回出现过 `non-finite FP16 activation`；切换 LOW32 地址后仍有
 `non-finite attention score`，关闭旧版异步范围写回后恢复正常。根因尚未确认，不能
-仅凭 ACK 或错误位置变化认定地址域已经修复。因此默认恢复全量同步写回，并把范围
+仅凭 ACK 或错误位置变化认定地址域已经修复。因此外部维护路径默认采用全量同步写回，并把范围
 选择与 ACK 等待位置分开。以下变量均在启动时读取，只接受 `0/1`，默认均为 `0`：
 
 | WRITEBACK_ASYNC | WRITEBACK_RANGE | 行为 / 启动日志 |

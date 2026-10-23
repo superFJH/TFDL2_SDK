@@ -79,6 +79,12 @@ def materialize_mask(mask, keys):
     return mask
 
 
+def attention_fallback(state, path, reason, original, *args, **kwargs):
+    if getattr(state.runtime, "attention_fast", False):
+        raise Unsupported(f"{path or '<root>'}: FAST attention: {reason}")
+    return state.fallback(path, reason, original, *args, **kwargs)
+
+
 class AttentionRoute:
     def __init__(self, state, path):
         self.state, self.path = state, path
@@ -91,8 +97,13 @@ class AttentionRoute:
         try:
             if torch.is_grad_enabled() or dropout_p != 0:
                 raise Unsupported("attention requires no_grad()/inference_mode() and dropout=0")
-            if any(x.device.type != "cpu" or x.dtype != torch.float16 for x in (query, key, value)):
-                raise Unsupported("attention activations must be CPU float16")
+            precision = getattr(self.state, "precision", "auto")
+            allowed = (torch.float16,) if precision == "strict" else (torch.float16, torch.float32)
+            if precision == "fp16": allowed += (torch.bfloat16,)
+            if any(x.device.type != "cpu" or x.dtype not in allowed for x in (query, key, value)):
+                raise Unsupported("attention requires supported CPU dtypes (auto: float16/float32)")
+            if key.dtype != query.dtype or value.dtype != query.dtype:
+                raise Unsupported("attention Q/K/V must have the same dtype")
             try:
                 b, heads, _, length, keys, dim, out_dim = _attention_geometry(query, key, value, enable_gqa)
             except ValueError as error:
@@ -102,15 +113,29 @@ class AttentionRoute:
                 raise Unsupported("fused attention shape/scale is unsupported")
             if isinstance(attn_mask, DeferredMask):
                 raise Unsupported(attn_mask.reason)
-            bounds = None if attn_mask is None else interval_tensor(attn_mask, b, heads, length, keys, is_causal)
+            dtype = torch.get_autocast_dtype("cpu") if torch.is_autocast_enabled("cpu") else query.dtype
+            if dtype not in allowed: raise Unsupported("autocast output dtype is not supported")
+            # Explicit policy selection, never replay of a failed NPU call.
+            if self.state.runtime.backend == "npu" and self.state.runtime.attention_backend(
+                    query,key,value,attn_mask=attn_mask,is_causal=is_causal,dtype=dtype) == "torch":
+                self.state.report.record(self.path,"cpu_sdpa",self.state.runtime.attention_policy+" attention policy")
+                return original()
+            direct_mask = attn_mask if getattr(self.state.runtime,"attention_fast",False) and isinstance(attn_mask,torch.Tensor) else None
+            bounds = None if attn_mask is None or direct_mask is not None else interval_tensor(attn_mask, b, heads, length, keys, is_causal)
         except Unsupported as error:
+            if getattr(self.state.runtime,"attention_fast",False):
+                raise Unsupported(f"{self.path}: FAST attention: {error}") from error
             return self.state.fallback(self.path, str(error), original)
         if self.state.runtime.backend == "cpu":
             self.state.report.record(self.path, "cpu_reference")
             return original()
-        if bounds is None:
+        execution_dtype = torch.float16 if dtype == torch.bfloat16 else dtype
+        query, key, value = (x if x.dtype == execution_dtype else x.to(execution_dtype) for x in (query, key, value))
+        if direct_mask is not None:
+            result = self.state.runtime.attention(query,key,value,attn_mask=direct_mask,is_causal=is_causal,scale=scale,enable_gqa=enable_gqa)
+        elif bounds is None:
             result = self.state.runtime.attention(query, key, value, is_causal=is_causal, scale=scale, enable_gqa=enable_gqa)
         else:
             result = self.state.runtime.attention_intervals(query, key, value, bounds, scale=scale, enable_gqa=enable_gqa)
-        self.state.report.record(self.path, "npu_fused")
-        return result
+        self.state.report.record(self.path, "npu_fast" if getattr(self.state.runtime,"attention_fast",False) else "npu_fused")
+        return result if result.dtype == dtype else result.to(dtype)

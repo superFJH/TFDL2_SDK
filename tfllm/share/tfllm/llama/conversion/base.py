@@ -2856,6 +2856,9 @@ def get_model_architecture(hparams: dict[str, Any], model_type: ModelType) -> st
     if model_type == ModelType.MMPROJ and arch == "InternVLForConditionalGeneration":
         return "TFLLMInternVision"
 
+    if arch == "MiniCPMV4_7ForConditionalGeneration":
+        return arch
+
     # if "architectures" is found in the sub-config, use that instead
     if model_type == ModelType.TEXT and text_config.get("architectures") is not None:
         arch = text_config["architectures"][0]

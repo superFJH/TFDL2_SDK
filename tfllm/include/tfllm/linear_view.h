@@ -17,7 +17,29 @@ struct Fp16OutputView {
     uint16_t* data=nullptr;
     size_t rows=0,columns=0,stride=0;
     const size_t* indices=nullptr;
+    // Planar output: stride=1, no indices, channel_stride>=rows. This lets
+    // GEMM dequantize directly into NCHW without an NHWC activation tensor.
+    size_t channel_stride=1;
+    bool Planar() const {return channel_stride!=1;}
+    bool ValidStrides() const {
+        return Planar() ? stride==1 && !indices && channel_stride>=rows : stride>=columns;
+    }
     uint16_t* Row(size_t r) const {return data+(indices ? indices[r]:r)*stride;}
+};
+struct Fp32InputView {
+    const float* data=nullptr;
+    size_t rows=0,columns=0,stride=0;
+    size_t column_stride=1;
+    const float* Row(size_t r) const {return data+r*stride;}
+};
+struct Fp32OutputView {
+    float* data=nullptr;
+    size_t rows=0,columns=0,stride=0;
+    // Same planar addressing as Fp16OutputView, for unrounded FP32 writes.
+    size_t channel_stride=1;
+    bool Planar() const {return channel_stride!=1;}
+    bool ValidStrides() const {return Planar()?stride==1 && channel_stride>=rows:stride>=columns;}
+    float* Row(size_t r) const {return data+r*stride;}
 };
 // A producer writes row-symmetric UINT8 directly into the execution workspace.
 // It writes only logical columns and positive finite row scales. The backend
@@ -33,17 +55,34 @@ struct QuantizedInput {
 };
 // One KV head, with all its query/GQA rows expressed as indexed views. The
 // callback returns [first, end) visible keys for a logical query row. A backend
-// may consume INT32 scores directly; FP16 score/probability rounding remains
-// part of the contract. Returning false must leave output untouched.
+// may consume INT32 scores directly; FP16 score/probability rounding is the
+// default unless fp32_softmax opts into the precision path. Returning false
+// must leave output untouched.
 // K/V may contain physical zero padding. A shorter query.columns is padded
 // with zeros by the backend; only output.columns are written. The mask and
 // scale describe logical keys/head dimensions, never their padded sizes.
 struct AttentionMask {
     float scale=1,soft_cap=0;
+    // Optional additive logit bias, including -inf for arbitrary invisible keys.
+    std::function<float(size_t,size_t)> score_bias;
     std::function<std::pair<size_t,size_t>(size_t)> interval;
+    // Concurrent independent Torch heads share the four physical pairs.
+    // Native serving retains its existing per-head maximum by default.
+    size_t max_pair_lanes=4;
+    // Synchronous precision hooks: query quantization writes one logical row and
+    // returns its scale; output_bias has output.columns values. Caller-owned
+    // hook storage remains valid until all head jobs have drained.
+    std::function<float(const float*,uint8_t*)> quantize_fp32_query;
+    std::function<float(const uint16_t*,uint8_t*)> quantize_fp16_query;
+    bool fp32_softmax=false; // FAST FP16 keeps logits/probability scales in FP32.
+    const float* output_bias=nullptr;
+    // -1 inherits backend options; 0 selects I32; 8..16 selects native U8 QK.
+    int qk_shift_override=-1;
 };
 // Snapshot shared by projections with the same input. Does not own NPU memory.
 QuantizedInput QuantizeInput(Fp16InputView);
+// Immutable symmetric U8 snapshot, used by Torch FP32 weights/KV only.
+Tensor QuantizeFp32Weight(Fp32InputView,size_t padded_rows=0,size_t padded_columns=0);
 // Activation -> FP16 -> complete-row quantization in one CPU row group.
 // Columns must be a multiple of four to preserve GELU's global SIMD tails.
 QuantizedInput QuantizeActivatedInput(Fp16InputView,cpu::UnaryActivation);

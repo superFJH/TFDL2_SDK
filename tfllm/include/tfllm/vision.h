@@ -6,6 +6,7 @@ struct VisionConfig {
     std::string projector="qwen3vl_merger";
     size_t layers=0,hidden=0,intermediate=0,heads=0,output=0,patch=0,merge=2,position_side=0;
     size_t temporal=2,window=0,full_attention_period=0;
+    size_t vit_insert_layer=6;
     bool rms=false;
     bool position_align_corners=false;
     size_t min_pixels=0,max_pixels=0;
@@ -38,6 +39,7 @@ public:
 private:
     std::shared_ptr<VisualTokens> EncodeQwen3(const Activation&,size_t,size_t,size_t frames,const std::string&) const;
     std::shared_ptr<VisualTokens> EncodeDense(const Activation&,size_t,size_t,const std::string&) const;
+    std::shared_ptr<VisualTokens> EncodeMiniCpm(const Activation&,size_t,size_t,const std::string&) const;
     std::shared_ptr<const VisionModel> model_;
     std::shared_ptr<Linear> linear_;
     std::map<std::string,std::vector<float>> vectors_;

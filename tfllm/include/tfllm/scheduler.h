@@ -35,6 +35,11 @@ public:
     // tasks concurrently; competing groups share workers fairly at task boundaries.
     // Waits for EVERY task, including after failure, before releasing captures.
     void RunTasks(std::vector<std::function<void(Linear&)>> tasks);
+    // Optional soft worker preferences (bit i = worker i, 0 = any). Idle
+    // preferred workers get first choice; busy/offline preferences never
+    // prevent another available worker from running an accepted task.
+    void RunTasks(std::vector<std::function<void(Linear&)>> tasks,
+                  const std::vector<uint64_t>& preferred_workers);
     bool Healthy() const noexcept override;
     PoolStats Stats() const;
     LinearPool(const LinearPool&)=delete;

@@ -1,6 +1,6 @@
 namespace tfllm.fb;
 
-enum Encoding : ubyte { F32, F16, U8RowSymmetric }
+enum Encoding : ubyte { F32, F16, U8RowSymmetric, Q4RowBlocks }
 enum RegionKind : ubyte { Input, Output, Weight, Workspace, Kv }
 enum AddressPart : ubyte { Low32, High8, Full40 }
 
@@ -40,6 +40,10 @@ table Config {
   linear_key_dim:uint;
   linear_value_dim:uint;
   linear_conv_kernel:uint;
+  experts:uint;
+  experts_used:uint;
+  shared_intermediate:uint;
+  expert_weights_scale:float = 1;
 }
 // All offsets are relative to the external payload file. Large weights never
 // live inside a FlatBuffer (whose internal offsets are 32 bit).

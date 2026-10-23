@@ -6,7 +6,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from .runtime import _tensor, _attention_geometry, _fused_scale
+from .runtime import _tensor, _attention_tensors, _attention_geometry, _fused_scale, _linear_fp32, _module_autocast
 
 
 class _PackedModule(nn.Module):
@@ -46,9 +46,9 @@ class _PackedModule(nn.Module):
             self.close()  # Repack lazily on first use or explicitly prepare().
 
     def _apply(self, fn, recurse=True):
-        probe = fn(torch.empty(0, dtype=torch.float16, device="cpu"))
-        if probe.dtype != torch.float16 or probe.device.type != "cpu":
-            raise TypeError("NPU modules keep CPU float16 activations/weights; .to(device/dtype) is not a device backend")
+        probe = fn(torch.empty(0, dtype=self.weight.dtype, device="cpu"))
+        if probe.dtype not in (torch.float16, torch.float32) or probe.device.type != "cpu":
+            raise TypeError("NPU modules support CPU float16/float32 weights; .to(device) is not a device backend")
         self.close()
         return super()._apply(fn, recurse)
 
@@ -72,12 +72,20 @@ class NpuLinear(_PackedModule):
         return self.runtime.pack(self.weight)
 
     def forward(self, x):
-        x = _tensor(x)
+        x, = _module_autocast(_tensor(x, contiguous=False))
         if x.ndim < 1 or x.shape[-1] != self.in_features:
             raise ValueError("Linear input feature count differs from weight")
         packed = self.prepare()  # Retain through completion even during reload.
         y = self.runtime.linear(x, packed, self.out_features)
-        return y if self.bias is None else y + self.bias
+        return y if self.bias is None else y + self.bias.to(y.dtype)
+
+    def forward_fp32(self, x):
+        """Explicit alias for direct FP32 input quantization and FP32 output."""
+        if x.ndim < 1 or x.shape[-1] != self.in_features:
+            raise ValueError("Linear input feature count differs from weight")
+        packed = self.prepare()
+        y = _linear_fp32(x, self.runtime.id, packed.handle, self.out_features)
+        return y if self.bias is None else y + self.bias.to(y.dtype)
 
 
 def _pair(value):
@@ -89,7 +97,7 @@ def _pair(value):
 
 
 class NpuConv2d(_PackedModule):
-    """1x1 -> GEMM; spatial -> native INT32 Conv, never CPU im2col."""
+    """1x1 uses NCHW per-pixel symmetric quantization; spatial uses native Conv or GEMM."""
     def __init__(self, weight, bias=None, *, stride=1, padding=0, dilation=1, groups=1, runtime):
         if weight.ndim != 4 or min(weight.shape) <= 0:
             raise ValueError("Conv2d weight must be nonempty OIHW")
@@ -101,8 +109,10 @@ class NpuConv2d(_PackedModule):
         self.stride, self.padding = stride, padding
         self.out_channels, self.in_channels, kh, kw = weight.shape
         self.kernel_size, self.pointwise = (kh, kw), (kh, kw) == (1, 1)
-        if not self.pointwise and (max(kh, kw) >= 8 or self.in_channels * kh * kw > 4608):
-            raise NotImplementedError("native Conv2d requires kernels 1..7 and Cin*Kh*Kw <= 4608")
+        self.spatial_implementation = getattr(runtime, "spatial_convolution", "native")
+        reduction_limit = (2**31-1)//(255*255) if (kh, kw) == (3, 3) else 4608
+        if not self.pointwise and (max(kh, kw) >= 8 or self.in_channels * kh * kw > reduction_limit):
+            raise NotImplementedError("native Conv2d requires kernels 1..7; 3x3 Cin*Kh*Kw <=33025 (INT32 accumulator headroom), other kernels <=4608")
         super().__init__(weight, bias, runtime)
         self.prepare()
 
@@ -114,13 +124,18 @@ class NpuConv2d(_PackedModule):
                    dilation=module.dilation, groups=module.groups, runtime=runtime)
 
     def _pack(self):
-        if self.pointwise:
+        if self.pointwise or self.spatial_implementation == "gemm":
             return self.runtime.pack(self.weight.flatten(1))
         ph, pw = self.padding
         return self.runtime.pack(self.weight, spatial=(self.stride[0], ph, ph, pw, pw))
 
+    def forward_fp32(self, x):
+        """Explicit alias; forward() automatically selects the same FP32 path."""
+        if x.dtype != torch.float32:raise TypeError("forward_fp32 expects float32")
+        with torch.autocast('cpu', enabled=False):return self.forward(x)
+
     def forward(self, x):
-        x = _tensor(x)
+        x, = _module_autocast(_tensor(x, contiguous=False))
         if x.ndim != 4 or min(x.shape) <= 0 or x.shape[1] != self.in_channels:
             raise ValueError("Conv2d expects nonempty NCHW with matching input channels")
         h, w = x.shape[-2:]
@@ -131,13 +146,100 @@ class NpuConv2d(_PackedModule):
             raise ValueError("Conv2d output has nonpositive size")
         packed = self.prepare()
         if self.pointwise:
-            if ph or pw:
-                x = F.pad(x, (pw, pw, ph, ph))
-            x = x[:, :, ::self.stride[0], ::self.stride[1]].permute(0, 2, 3, 1).contiguous()
-            y = self.runtime.linear(x, packed, self.out_channels).permute(0, 3, 1, 2).contiguous()
+            y = self.runtime.pointwise(x, packed, self.out_channels, self.stride[0], self.padding)
+        elif self.spatial_implementation == "gemm":
+            # Materialize only a band of output rows. Padding once preserves
+            # the exact official convolution coordinates at every tile boundary.
+            padded = F.pad(x, (pw, pw, ph, ph)) if ph or pw else x
+            y = x.new_empty((x.shape[0], self.out_channels, oh, ow))
+            rows_per_tile = max(1, 1024 // ow)
+            kh, kw = self.kernel_size
+            for batch in range(x.shape[0]):
+                for first in range(0, oh, rows_per_tile):
+                    last = min(oh, first + rows_per_tile)
+                    begin = first * self.stride[0]
+                    end = (last - 1) * self.stride[0] + kh
+                    band = padded[batch:batch+1, :, begin:end, :]
+                    patches = F.unfold(band, (kh, kw), stride=self.stride).transpose(1, 2).contiguous()
+                    result = self.runtime.linear(patches, packed, self.out_channels)
+                    y[batch:batch+1, :, first:last, :] = result.transpose(1, 2).reshape(
+                        1, self.out_channels, last-first, ow)
         else:
             y = self.runtime.conv(x, packed, self.out_channels, oh, ow)
-        return y if self.bias is None else y + self.bias[None, :, None, None]
+        return y if self.bias is None else y + self.bias.to(y.dtype)[None, :, None, None]
+
+
+class NpuConvTranspose2d(_PackedModule):
+    """Native stride-2 deconvolution; canonical state_dict weights remain IOHW."""
+    def __init__(self, weight, bias=None, *, stride=2, padding=0, output_padding=0,
+                 groups=1, dilation=1, runtime):
+        if weight.ndim != 4 or min(weight.shape) <= 0:
+            raise ValueError("ConvTranspose2d weight must be nonempty IOHW")
+        self.stride, self.padding = _pair(stride), _pair(padding)
+        self.output_padding, self.dilation = _pair(output_padding), _pair(dilation)
+        self._output_packed = {}
+        self.in_channels, self.out_channels, kh, kw = weight.shape
+        self.kernel_size, self.groups = (kh, kw), groups
+        if self.stride != (2, 2):
+            raise NotImplementedError("native ConvTranspose2d requires stride=2")
+        if groups != 1 or self.dilation != (1, 1):
+            raise NotImplementedError("native ConvTranspose2d requires groups=1, dilation=1")
+        if max(kh, kw) >= 8 or self.in_channels*kh*kw > 4608:
+            raise NotImplementedError("native ConvTranspose2d requires kernels 1..7 and Cin*Kh*Kw <=4608")
+        if not all(0 <= p < k for p, k in zip(self.padding, self.kernel_size)) or not all(p in (0, 1) for p in self.output_padding):
+            raise NotImplementedError("native ConvTranspose2d requires padding smaller than kernel and output_padding=0..1")
+        # _PackedModule's ordinary Conv bias check uses weight.shape[0].
+        if bias is not None and bias.shape != (self.out_channels,):
+            raise ValueError("bias shape must equal output channels")
+        super().__init__(weight, None, runtime)
+        if bias is not None:
+            with torch.inference_mode(False), torch.no_grad():
+                self.bias = _tensor(bias.detach()).clone()
+        self.prepare()
+
+    @classmethod
+    def from_conv_transpose2d(cls, module, *, runtime):
+        if type(module) is not nn.ConvTranspose2d or module.padding_mode != "zeros":
+            raise NotImplementedError("from_conv_transpose2d requires plain ConvTranspose2d with zero padding")
+        return cls(module.weight, module.bias, stride=module.stride, padding=module.padding,
+                   output_padding=module.output_padding, groups=module.groups, dilation=module.dilation, runtime=runtime)
+
+    def close(self):
+        with self._packing_lock:
+            self._output_packed.clear()
+            super().close()
+
+    def _pack(self):
+        return self.runtime.pack_transposed(self.weight, self.stride[0], self.padding, self.output_padding)
+
+    def forward(self, x, output_size=None):
+        x, = _module_autocast(_tensor(x, contiguous=False))
+        if x.ndim != 4 or min(x.shape) <= 0 or x.shape[1] != self.in_channels:
+            raise ValueError("ConvTranspose2d expects nonempty NCHW with matching input channels")
+        if x.shape[-1] > 512:
+            raise NotImplementedError("native ConvTranspose2d input width must be <=512")
+        base = tuple((x.shape[d+2]-1)*2-2*self.padding[d]+self.kernel_size[d] for d in range(2))
+        if min(base)<=0:raise NotImplementedError("native ConvTranspose2d requires a positive base output size")
+        op = self.output_padding
+        if output_size is not None:
+            shape = tuple(output_size)
+            if len(shape) not in (2, 4):raise ValueError("output_size must have 2 or 4 dimensions")
+            if len(shape) == 4 and shape[:2] != (x.shape[0], self.out_channels):
+                raise ValueError("output_size batch/channels differ")
+            op = tuple(shape[-2+d]-base[d] for d in range(2))
+            if any(p not in (0, 1) for p in op):raise ValueError("output_size is outside valid stride-2 sizes")
+        oh, ow = (base[d]+op[d] for d in range(2))
+        if min(oh, ow) <= 0:raise ValueError("ConvTranspose2d output has nonpositive size")
+        packed = self.prepare()
+        if op != self.output_padding:
+            with self._packing_lock:
+                entry = self._output_packed.get(op)
+                if entry is None or entry[0] != self._version:
+                    entry = (self._version, self.runtime.pack_transposed(self.weight, 2, self.padding, op))
+                    self._output_packed[op] = entry
+                packed = entry[1]
+        y = self.runtime.conv_transpose(x, packed, self.out_channels, oh, ow)
+        return y if self.bias is None else y+self.bias.to(y.dtype)[None, :, None, None]
 
 
 class NpuAttention(nn.Module):
@@ -146,6 +248,8 @@ class NpuAttention(nn.Module):
     auto: native INT32 fusion for unmasked/causal NPU calls, otherwise bounded
     Torch softmax compatibility path (warns on NPU fallback). fused: never
     falls back. torch: explicitly use the old tiled runtime GEMM/Torch path.
+    auto also honors runtime.attention_policy='hybrid'/'cpu', using original
+    Torch CPU SDPA for the selected geometries. fused always requires NPU.
     query_tile controls only the compatibility path; runtime owns fused tiling.
     Causal masking uses upper-left alignment, as PyTorch SDPA does.
     """
@@ -162,7 +266,7 @@ class NpuAttention(nn.Module):
     def forward(self, query, key, value, attn_mask=None, *, is_causal=False, scale=None, dropout_p=0.0, enable_gqa=False):
         if dropout_p != 0:
             raise NotImplementedError("NpuAttention is inference-only; dropout_p must be zero")
-        q, k, v = map(_tensor, (query, key, value))
+        q, k, v = _module_autocast(*_attention_tensors(query, key, value, contiguous=False))
         b, heads, kv_heads, length, keys, dim, out_dim = _attention_geometry(q, k, v, enable_gqa)
         scale = dim ** -0.5 if scale is None else float(scale)
         if not math.isfinite(scale):
@@ -173,6 +277,9 @@ class NpuAttention(nn.Module):
                 raise NotImplementedError("fused attention supports no mask or is_causal; arbitrary masks require implementation='torch'")
             return self.runtime.attention(q, k, v, is_causal=is_causal, scale=scale, enable_gqa=enable_gqa)
         if self.implementation == "auto" and self.runtime.backend == "npu":
+            if self.runtime.attention_backend(q,k,v,attn_mask=attn_mask,is_causal=is_causal) == "torch":
+                return F.scaled_dot_product_attention(q,k,v,attn_mask=attn_mask,is_causal=is_causal,
+                                                     scale=scale,enable_gqa=enable_gqa)
             if eligible:
                 return self.runtime.attention(q, k, v, is_causal=is_causal, scale=scale, enable_gqa=enable_gqa)
             warnings.warn("NpuAttention is using tiled Torch softmax for this mask/shape/scale; "
@@ -208,7 +315,7 @@ class NpuAttention(nn.Module):
                     # PyTorch SDPA returns zeros for a fully masked query row.
                     empty = torch.isneginf(scores).all(dim=-1, keepdim=True)
                     scores.masked_fill_(empty, 0)
-                    probability = torch.softmax(scores, dim=-1).masked_fill_(empty, 0).half()
+                    probability = torch.softmax(scores, dim=-1).masked_fill_(empty, 0).to(q.dtype)
                     result[batch, head, first:last] = self.runtime.linear(probability, packed_v, out_dim)
         return result
 

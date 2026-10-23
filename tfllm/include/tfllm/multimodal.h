@@ -26,4 +26,7 @@ struct PromptInput {
     bool Same(size_t token,const PromptInput* other) const;
     void Validate(size_t tokens,const Config&) const;
 };
+// Marker order: slice start/end, image start/end, newline. Crop grids in
+// VisualTokens are already compressed to language-token dimensions.
+void BuildMiniCpmCanvas(const std::vector<int32_t>&,PromptInput&,const std::array<int32_t,5>&);
 }
