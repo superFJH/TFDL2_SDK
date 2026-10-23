@@ -283,12 +283,18 @@ def prepare(args, bin_dir, converter_dir):
                 if not script.is_file():
                     raise RuntimeError("Missing installed HF converter")
                 gguf = temporary / "source.gguf"
+                command = [sys.executable, script, source, "--outtype", "f16" if is_asr else "auto", "--outfile", gguf]
+                # Only MiniCPM-V 4.7's Qwen3.5 decoder needs MTP stripped.
+                # The pinned converter rejects this flag for non-MTP models.
+                if "MiniCPMV4_7ForConditionalGeneration" in architectures(read_json(source / "config.json")):
+                    command.append("--no-mtp")
                 try:
                     # ASR keeps its validated F16 source export for native
                     # prefill; the converter creates an independent Q4 decode.
-                    run([sys.executable, script, source, "--outtype", "f16" if is_asr else "auto", "--outfile", gguf, "--no-mtp"])
+                    run(command)
                 except subprocess.CalledProcessError as e:
-                    raise RuntimeError("HF conversion failed (see converter output). Install its pinned dependencies with: "
+                    raise RuntimeError(f"HF conversion failed (exit code {e.returncode}; see converter output above). "
+                        "If it reports missing Python dependencies, install them with: "
                         f"{sys.executable} -m pip install -r {converter_dir / 'requirements/requirements-convert_hf_to_gguf.txt'}") from e
             if export_vision:
                 mmproj = temporary / "mmproj.gguf"
