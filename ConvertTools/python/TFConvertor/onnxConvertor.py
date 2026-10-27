@@ -193,7 +193,8 @@ class GemmParser(OnnxParser):
         #Bias = None
         #bias2Rows = False
         channels1 = node.graph.params[str(args[1])].shape[0]
-        return InnerProduct2(args[0],args[1],None if len(args) < 3 else args[2],channels1)
+        a = InnerProduct2(args[0],args[1],None if len(args) < 3 else args[2],channels1)
+        return Squeeze(a,(2,3))
 
 class LinearConvParser(OnnxParser):
     @classmethod
@@ -1096,8 +1097,7 @@ class OnnxConvertor(TFConvertor):
             else:
                 self.outputs.append(output.name)
                 
-        # Preserve ONNX graph-output order, especially detection + mask proto.
-        self.outputs = list(dict.fromkeys(self.outputs))
+        self.outputs = list(set(self.outputs))
         removeParams = []
         for name in self.params.keys():
             ifremove = True
