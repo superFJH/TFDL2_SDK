@@ -44,9 +44,9 @@
 ```text
 模型 / TFEngine
       |
-      | TFNN_Malloc、TFNN_Run、设备锁
+      | DeviceRuntime：内存、命令队列、设备锁
       v
-稳定版 tfnn 用户态库
+NPU40T 后端动态库
       |
       | open / ioctl / mmap
       v
@@ -65,26 +65,26 @@ TFACC、L1 cache、ACP       reserved DDR + 1 GiB HugeTLB
 1. 发现并初始化 NPU40T 硬件；
 2. 把 TFACC 和 cache 寄存器映射到内核；
 3. 创建 `/dev/thinkforce0`，提供 `open/ioctl/mmap/release`；
-4. 从 reserved DDR 或注册的 HugePage 中给 `tfnn` 分配 DMA 地址；
+4. 从 reserved DDR 或注册的 HugePage 中给用户态运行时分配 DMA 地址；
 5. 管理跨进程 TFACC 锁、cache invalid 和共享 L1 高位地址；
 6. 在卸载或进程退出时回收软件状态和硬件状态。
 
 ### 1.2 最常见的一条执行路径
 
 ```text
-tfnn 打开 /dev/thinkforce0
+DeviceRuntime 打开 /dev/thinkforce0
   -> tf_open()
 
-tfnn 请求一大块内存
+DeviceRuntime 请求 reserved-only 大块
   -> ioctl(TF_BUF_CREATE)
   -> tf_ioctl()
   -> tf_ioctl_create()
   -> tf_create_and_init_kbuf()
   -> tf_init_kbuf()
-  -> 优先 reserved DDR，耗尽后使用 HugePage
+  -> 只使用 reserved DDR，作为 result/command 页池
   -> 返回 dma_addr + mmap_id
 
-tfnn 映射这块内存
+DeviceRuntime 映射这块内存
   -> mmap(fd, offset = mmap_id << PAGE_SHIFT)
   -> tf_mmap()
   -> remap_pfn_range()
@@ -101,7 +101,7 @@ TFEngine 执行算子
   -> ioctl(TF_SET_ADDRESS_HIGH)
   -> tf_ioctl_set_address_high()
   -> CPU MMIO 修改 cache 侧 0x90 / 0x94
-  -> tfnn 启动 NPU 命令
+  -> DeviceRuntime 直接配置队列并启动 NPU 命令
 
 TFExecutor 销毁
   -> FreeTask()/ReleaseCmd() 释放描述符持有的 param 强引用
@@ -460,9 +460,10 @@ TGID 的 block offset 清零。
 
 ### 7.3 为什么第一块必须来自 reserved DDR
 
-稳定版 `tfnn` 第一次向驱动申请的内存中放置结果队列，但它把所有
+历史 `tfnn` 第一次向驱动申请的内存中放置结果队列，但它把所有
 `REG_RESULT_QUEUE*_HIGH` 写成 0。硬件依靠 ACP `0x10` 中驱动启动时设置的 reserved
-DDR 高位补全地址。
+DDR 高位补全地址。内置 `DeviceRuntime` 保留了同样的硬件约束，但会通过
+`TF_BUF_FLAG_RESERVED_ONLY` 显式保证 result/command 留在 direct 窗口。
 
 因此 `tf_init_kbuf()` 要求每个 TGID/chip 先拥有至少一个 reserved block，称为
 reserved anchor。没有 anchor 时不能直接从 HugePage 返回第一块，否则结果队列会写
@@ -470,7 +471,8 @@ reserved anchor。没有 anchor 时不能直接从 HugePage 返回第一块，�
 
 ### 7.4 HugePage fallback
 
-reserved DDR 找不到足够空间后，`tf_init_kbuf()` 遍历 `tf_huge_regions`：
+为保持旧 ABI，普通 `TF_BUF_CREATE` 在 reserved DDR 找不到足够空间后，
+`tf_init_kbuf()` 仍会遍历 `tf_huge_regions`：
 
 1. chip 必须匹配；
 2. region 必须空闲或已属于当前 TGID；
@@ -482,9 +484,13 @@ reserved DDR 找不到足够空间后，`tf_init_kbuf()` 遍历 `tf_huge_regions
 不允许单个大块跨 4 GiB 边界，是因为 NPU 算子中的部分地址字段只有低 32 位，
 一次算子只能配合一个共享 `address_high`。
 
+设置 `TF_BUF_FLAG_RESERVED_ONLY` 时会在进入这条 fallback 之前直接返回
+`ENOMEM`。NPU40T 的 result queue 和 command cache 总是使用该标志。
+
 ### 7.5 分配不是逐 tensor 发生的
 
-`TF_BUF_CREATE` 分的是 tfnn 大块。tfnn 再把大块切成自己的 16 KiB 页面并管理
+`TF_BUF_CREATE` 分的是 runtime 大块。`DeviceRuntime` 再把大块切成自己的
+16 KiB 页面并管理
 tensor。驱动因此只知道“大块属于哪个 TGID”，不知道每个 tensor 的生命周期。
 
 ---
@@ -557,8 +563,8 @@ dump。
 
 ## 10. cache invalid 为什么需要新 ioctl
 
-旧 `TF_TFNN_InvalidCache()` 把 invalid 地址高 32 位固定为 0。高地址 HugePage
-出现后，它可能 invalid 错误的地址。
+历史 runtime 的 cache invalid 路径把地址高 32 位固定为 0。高地址
+HugePage 出现后，它可能 invalid 错误的地址。
 
 `TF_CACHE_INVALIDATE` 的路径是：
 
@@ -573,7 +579,7 @@ TFEngine DriverInvalidateCache(full_dma_addr)
 ```
 
 驱动在返回新的高地址大块前先 invalid 一次；TFEngine 在释放高地址 `MmapBuf` 前
-再 invalid 一次。这样不需要修改稳定版 tfnn 的 ABI。
+再 invalid 一次。该 ioctl 也保持了对旧用户态调用者的 ABI 兼容。
 
 ---
 
@@ -605,7 +611,7 @@ ACP 中存在两类不同路径：
 驱动初始化时二者都指向 reserved DDR。运行时只允许 cache 操作数在不同 4 GiB
 窗口之间切换。
 
-稳定版 tfnn 的结果队列 HIGH 寄存器始终写 0，它依赖 `0x10` 保持 reserved DDR
+结果队列 HIGH 寄存器始终写 0，依赖 `0x10` 保持 reserved DDR
 高位。如果运行时把 `0x10` 也改成模型 tensor 的高位，NPU 完成信息就会写到错误
 地址，软件永远等不到 result tail，表现为所有 NPU 操作卡死。这就是 0.7.0 出错、
 0.7.1 修复的原因。
@@ -1314,7 +1320,7 @@ cat /sys/module/tfacc2/version
 
 - `LowAddr()/HighAddr()` 从 64 位 NPU DMA 地址拆出低/高 32 位；
 - 命令缓冲区额外保存 `commandAddressHigh` 软件元数据；
-- 高地址 buffer 析构前调用 `DriverInvalidateCache()`，绕过旧 tfnn 的高位截断。
+- 高地址 buffer 析构前调用 `DriverInvalidateCache()`，避免高位地址截断。
 
 ### 16.2 `TFACCOpDescriptor::SetInOutPtr()`
 
@@ -1329,6 +1335,17 @@ cat /sys/module/tfacc2/version
 
 进程内只打开一次 `/dev/thinkforce0` 并保持到进程退出。这样不会因为辅助 ioctl fd
 提前 close 而触发驱动旧的按 TGID release 行为。
+
+#### `DriverAllocateLegacyMemory()`
+
+保留 `TF_BUF_CREATE` 的结构布局，并通过 `TF_BUF_FLAG_RESERVED_ONLY`
+申请 direct-address 内存。result queue、command cache，以及无 HugePage
+机器的 tensor/weight 都使用这条路径，绝不 fallback 到 HugePage。
+
+#### `DriverHasHugePageMemory()`
+
+通过 HugePage query UAPI 判断当前 chip 是否有空闲或已归属当前 TGID
+的注册区。只有返回 true 时才启用 model arena 和 command LRU。
 
 #### `DriverInvalidateCache()`
 
@@ -1362,14 +1379,20 @@ WeightManager 去重权重，并增加 25%（至少 128 MiB）冗余。估算超
 共享一个同 high arena。
 
 `ModelMemoryArena::ReserveFreeCapacity()` 重复向驱动取段；`Allocate()` 在段内按
-16 KiB 对齐 best-fit 子分配，返回不拥有底层 tfnn 内存的 `MmapBuf` view。view
+16 KiB 对齐 best-fit 子分配，返回不拥有底层 runtime 大块的 `MmapBuf` view。view
 析构时由 `Release()` 把范围插回空闲表并与左右相邻范围合并，因此反复创建模型不会
 永久消耗激活区；arena 最后析构时才 `munmap` 大段。激活分配若耗尽预留会保留
 第一次错误，不再回退软件内存制造级联错误。
 
-`registerAndGetParam()` 的缓存键从单独 CPU 指针扩展为
-`(CPU pointer, chip, address_high, bytes)`；只有同一模型窗口才能复用已变换权重。
-`paramDict` 保存 `weak_ptr<MmapBuf>`，Convolution 命令描述符保存 `shared_ptr`。
+预留不足时，arena 默认按 64 MiB 增长并把 operand 之外的尾部放回空闲表，避免大量
+小 LUT 各自创建 ioctl/mmap segment。可在进程启动前用
+`TFDL_NPU40T_MODEL_ARENA_GROWTH_MB` 设置 1 到 4095 之间的 MiB 数；大块增长无法放入
+当前 high-address 窗口时会自动回退为当前 operand 的精确大小。
+
+`registerAndGetParam()` 的缓存键为
+`(CPU pointer, chip, address_high, bytes)`；只有同一模型窗口才能复用权重。
+`paramDict` 保存 `weak_ptr<MmapBuf>`，Convolution 和普通 MatMul 命令描述符保存
+`shared_ptr`。InnerProduct 的转置/补齐权重仍由描述符独占，留给专用 Helper 处理。
 因此共享命令仍在时缓存有效，最后一个 `ReleaseCmd()` 删除描述符后，变换权重和
 偏置自动析构并把子范围还给 arena，不需要 TFContext/TFSchedule 显式清缓存。
 
@@ -1377,12 +1400,18 @@ WeightManager 去重权重，并增加 25%（至少 128 MiB）冗余。估算超
 `CoreInfo::TrimIdleModelArenas()`；`use_count == 1` 表示只剩 CoreInfo 的 workspace
 缓存引用，此时删除 arena 并通过上述 free ioctl 把整段容量归还驱动。
 
-只有 Convolution 使用跨描述符的 `paramDict`，因此只有它的变换 weight/bias 需要
-`shared_ptr/weak_ptr` 引用关系。Deconvolution、MatMul、InnerProduct、Eltwise、
-Concat、Slice、Transpose 和 ImageWarp 的 NPU 缓冲均由各自描述符独占，
+Convolution 的变换 weight/bias，以及普通 MatMul 的静态矩阵，使用跨描述符的
+`paramDict` 和 `shared_ptr/weak_ptr` 引用关系。同一 chip 上按 batch/row 切分的多
+NPU MatMul 因此共享广播权重。Deconvolution、InnerProduct、Eltwise、Concat、
+Slice、Transpose 和 ImageWarp 的 NPU 缓冲仍由各自描述符独占，
 `tfaccDestroyDescriptor()` 删除 Helper 时由析构函数直接 `manager->Free()`；其余
 Helper 不申请 `MmapBuf`。临时拆分 Helper 只是借用父 Helper 缓冲，必须设置
 `reffer = true`，不能在栈对象析构时释放父对象内存。
+
+多 NPU 图编译只调用一次 `BuildCmdSplit()`，shard 数直接取 TFACC id 列表长度。
+调度器把实际 id 列表传入，Convolution/Deconvolution/MatMul 的 ForwardAlgorithm
+再把对应 id 送到 Helper，因此大小核分别选择 16/8 MAU，而不需要在每个 NPU 上
+重复生成整套 shard。
 
 ### 16.5 `ProcessHighAddressLease`
 
@@ -1396,7 +1425,8 @@ Helper 不申请 `MmapBuf`。临时拆分 Helper 只是借用父 Helper 缓冲�
 
 ### 16.6 `CoreInfo::LockPair()`
 
-进程内引用计数复用一对跨进程锁。首个用户通过稳定 tfnn ABI 分别锁两颗 TFACC；
+进程内引用计数复用一对跨进程锁。首个用户通过驱动
+`TF_APP_LOCK` ABI 分别锁两颗 TFACC；
 最后一个用户才成对解锁。
 
 ### 16.7 `NPU40THandler::Forward()/Launch()`
@@ -1414,6 +1444,26 @@ Helper 不申请 `MmapBuf`。临时拆分 Helper 只是借用父 Helper 缓冲�
 
 不能把驱动写高位放到 NPU 命令流，因为 `0xFE170000` 等是 CPU 物理 MMIO 控制块，
 不是 NPU `TFACCRegisterBlasop` 能访问的内部寄存器编号。
+
+### 16.8 内置 `DeviceRuntime` 与 command LRU
+
+NPU40T 动态库不再 include/link `tfnn` 和 `libnuma`。`DeviceRuntime.cpp`
+只移入当前后端必需的部分：设备发现、寄存器映射、result queue、
+16 KiB reserved-DDR 页池、设备锁、同步/异步命令提交和 cache invalid。
+运行时构造阶段只映射寄存器和准备软件状态，不会直接改动队列寄存器；
+硬件初始化延后到已持有 pair-wide 驱动锁的首次提交，避免新进程破坏其他
+进程正在执行的 command queue。
+
+有 HugePage 时，`CommandMemoryCache` 在每个 chip 内共享 reserved-DDR 页池：
+
+- resident 且已命中的 command 直接提交，没有每次 copy；
+- 分配失败时只驱逐 `pins == 0` 的最旧命令，把内容保存到 CPU shadow；
+- 再次命中被驱逐命令时重新申请 reserved 页并 copy back；
+- 同步 `Forward` 在整次执行期间 pin，异步 `Launch` 一直 pin 到 `Wait`，
+  因此硬件不会读到被回收的 DMA 地址。
+
+没有 HugePage 时不启用 command LRU，所有对象与传统 4 GiB 模式一样从
+reserved DDR 顺序扩展，空间耗尽立即报错。
 
 ---
 

@@ -10,7 +10,9 @@
 #include <linux/sizes.h>
 #include <linux/time.h>
 #include <linux/jiffies.h>
-#include <linux/version.h>
+#include <linux/ktime.h>
+#include <linux/ratelimit.h>
+#include "tfacc_address_runtime.h"
 
 static struct tf_device *tf_dev = NULL;
 static bool versionIsRight = false; // 表明version是否check过，如果check成功则置为true
@@ -25,6 +27,53 @@ static int skipFullSwRst = 0;
 static unsigned long long chipGap = 0; // 相邻两个chip之间的寄存器地址差多少
 static unsigned long long ddrStart = 0x100000000LL;
 static resource_size_t ddrSize = 0x100000000ULL;
+
+/* Diagnostic only. No clock reads or printk on the default path. */
+static unsigned int control_trace_us;
+module_param(control_trace_us, uint, 0644);
+MODULE_PARM_DESC(control_trace_us,
+                "Log slow HIGH/unlock control calls in microseconds (0 disables)");
+
+struct tf_control_trace {
+    unsigned int threshold_us;
+    u64 begin_ns;
+    u64 acquired_ns;
+};
+
+static struct tf_control_trace tf_control_begin(void)
+{
+    struct tf_control_trace trace = {0};
+
+    trace.threshold_us = READ_ONCE(control_trace_us);
+    if (trace.threshold_us)
+        trace.begin_ns = ktime_get_ns();
+    return trace;
+}
+
+static void tf_control_acquired(struct tf_control_trace *trace)
+{
+    if (trace->threshold_us)
+        trace->acquired_ns = ktime_get_ns();
+}
+
+/* Call after unlocking; logging must never extend the app_mutex section. */
+static void tf_control_end(const struct tf_control_trace *trace,
+                           const char *operation, int core, u32 high, int status)
+{
+    u64 end;
+
+    if (!trace->threshold_us)
+        return;
+    end = ktime_get_ns();
+    if (end - trace->begin_ns < (u64)trace->threshold_us * 1000)
+        return;
+    pr_info_ratelimited("TFACC_CONTROL op=%s core=%d high=0x%x tgid=%d pid=%d start_ns=%llu lock_wait_ns=%llu work_unlock_ns=%llu total_ns=%llu status=%d\n",
+                        operation, core, high, current->tgid, current->pid,
+                        (unsigned long long)trace->begin_ns,
+                        (unsigned long long)(trace->acquired_ns - trace->begin_ns),
+                        (unsigned long long)(end - trace->acquired_ns),
+                        (unsigned long long)(end - trace->begin_ns), status);
+}
 
 struct tf_huge_region {
     struct list_head list;
@@ -745,6 +794,31 @@ static u64 tf_model_window_capacity_locked(struct tf_device *dev, int chip_id,
     return capacity;
 }
 
+static u64 tf_model_huge_window_capacity_locked(
+    struct tf_device *dev, int chip_id, pid_t tgid, u32 address_high)
+{
+    struct tf_huge_region *region;
+    u64 capacity = 0;
+
+    list_for_each_entry(region, &tf_huge_regions, list) {
+        u64 pool_capacity;
+
+        if (region->chip_id != chip_id ||
+            (region->owner_tgid != -1 && region->owner_tgid != tgid) ||
+            !tf_model_find_pool_gap_locked(
+                dev, TF_MEMORY_HUGEPAGE, -1, region, region->dma_addr,
+                region->length, address_high, NULL, NULL,
+                &pool_capacity)) {
+            continue;
+        }
+        if (capacity > U64_MAX - pool_capacity) {
+            return U64_MAX;
+        }
+        capacity += pool_capacity;
+    }
+    return capacity;
+}
+
 static int tf_ioctl_model_pool_alloc(struct tf_device *dev, void __user *arg)
 {
     struct tf_model_pool_alloc request;
@@ -785,6 +859,20 @@ static int tf_ioctl_model_pool_alloc(struct tf_device *dev, void __user *arg)
         u64 best_capacity = 0;
 
         selected_high = TF_MODEL_POOL_AUTO_HIGH;
+        /* Keep reserved DDR available for direct command/result traffic.
+         * Prefer a complete HugePage window whenever it can hold the model. */
+        for (high = 0; high <= 0xffU; ++high) {
+            capacity = tf_model_huge_window_capacity_locked(
+                dev, request.chip_id, current->tgid, high);
+            if (capacity >= required && capacity > best_capacity) {
+                best_capacity = capacity;
+                selected_high = high;
+            }
+        }
+        if (selected_high != TF_MODEL_POOL_AUTO_HIGH) {
+            goto selected_window;
+        }
+        best_capacity = 0;
         for (high = 0; high <= 0xffU; ++high) {
             capacity = tf_model_window_capacity_locked(
                 dev, request.chip_id, current->tgid, high);
@@ -807,10 +895,32 @@ static int tf_ioctl_model_pool_alloc(struct tf_device *dev, void __user *arg)
         }
     }
 
-    /* Return the largest remaining segment first.  This leaves fewer tiny
-     * tails for the userspace arena and makes large weights more likely to
-     * fit without crossing a HugePage boundary. */
-    for (i = 0; i < reserveDDRBlcokCnt; ++i) {
+selected_window:
+
+    /* HugePages host model tensors and weights whenever possible.  Reserved
+     * DDR is the fallback for legacy machines and for an explicitly selected
+     * window whose HugePages have been exhausted. */
+    list_for_each_entry(region, &tf_huge_regions, list) {
+        u64 offset;
+        u64 available;
+
+        if (region->chip_id != request.chip_id ||
+            (region->owner_tgid != -1 &&
+             region->owner_tgid != current->tgid) ||
+            !tf_model_find_pool_gap_locked(
+                dev, TF_MEMORY_HUGEPAGE, -1, region, region->dma_addr,
+                region->length,
+                selected_high, &offset, &available, NULL)) {
+            continue;
+        }
+        if (available > best_available) {
+            best_region = region;
+            best_block_index = -1;
+            best_offset = offset;
+            best_available = available;
+        }
+    }
+    for (i = 0; i < reserveDDRBlcokCnt && !best_region; ++i) {
         u64 offset;
         u64 available;
 
@@ -826,26 +936,6 @@ static int tf_ioctl_model_pool_alloc(struct tf_device *dev, void __user *arg)
         if (available > best_available) {
             best_block_index = i;
             best_region = NULL;
-            best_offset = offset;
-            best_available = available;
-        }
-    }
-    list_for_each_entry(region, &tf_huge_regions, list) {
-        u64 offset;
-        u64 available;
-
-        if (region->chip_id != request.chip_id ||
-            (region->owner_tgid != -1 &&
-             region->owner_tgid != current->tgid) ||
-            !tf_model_find_pool_gap_locked(
-                dev, TF_MEMORY_HUGEPAGE, -1, region, region->dma_addr,
-                region->length, selected_high, &offset, &available,
-                NULL)) {
-            continue;
-        }
-        if (available > best_available) {
-            best_region = region;
-            best_block_index = -1;
             best_offset = offset;
             best_available = available;
         }
@@ -1267,6 +1357,7 @@ static int tf_app_try_lock(struct tf_device* dev, int* p) {
 }
 
 static int tf_app_try_unlock(struct tf_device* dev, int* p) {
+    struct tf_control_trace trace;
     if (efuse) {
         return -1;
     }
@@ -1285,12 +1376,15 @@ static int tf_app_try_unlock(struct tf_device* dev, int* p) {
     {
         // 正常退出判断
         // DPRINTK("[ENTERING ZONE], pid: %d, tgid: %d, tfaccID: %d \n", current->pid, current->tgid, tfaccID);
+        trace = tf_control_begin();
         mutex_lock(&app_mutex);
+        tf_control_acquired(&trace);
         // DPRINTK("[ENTERED ZONE], pid: %d, tgid: %d, tfaccID: %d \n", current->pid, current->tgid, tfaccID);
         if (dev->holdTFACCTgid[tfaccID] == current->tgid) {
             finishAppLockRecord(dev, tfaccID);
         }
         mutex_unlock(&app_mutex);
+        tf_control_end(&trace, "unlock", tfaccID, 0, 0);
         // DPRINTK("[QUIT ZONE], pid: %d, tgid: %d, tfaccID: %d \n", current->pid, current->tgid, tfaccID);
     }
 
@@ -1504,13 +1598,30 @@ static void init_pids(void) {
     return;
 }
 
+static void tf_unmap_device_registers(struct tf_device *dev)
+{
+    unsigned int i;
+
+    tf_unmap_address_registers(dev);
+    for (i = 0; i < ARRAY_SIZE(dev->ioreg); ++i) {
+        if (dev->ioreg[i]) {
+            iounmap(dev->ioreg[i]);
+            dev->ioreg[i] = NULL;
+        }
+        if (dev->ioreg_cache[i]) {
+            iounmap(dev->ioreg_cache[i]);
+            dev->ioreg_cache[i] = NULL;
+        }
+    }
+}
+
 static struct tf_device * tf_create_and_init_device(int device_id_counter) {
-    int retval;
+    int retval = -ENOMEM;
     struct tf_device * dev;
     int c;
 
     if (efuse) {
-        return dev;
+        return NULL;
     }
 
     DPRINTK("ENTER\n");
@@ -1532,9 +1643,13 @@ static struct tf_device * tf_create_and_init_device(int device_id_counter) {
     DPRINTK("dev tfacc inited\n");
 
     DPRINTK("isBusy = %d\n", dev->isBusy);
-    tf_dev = dev;
     dev->mmap_id_counter = 1;
     hash_init(dev->buf_list);
+
+    retval = tf_map_address_registers(dev, chips, chipGap);
+    if (retval)
+        goto fail_remap;
+    retval = -ENOMEM;
 
     for (c = 0; c < chips; c++) {
         int i;
@@ -1550,6 +1665,7 @@ static struct tf_device * tf_create_and_init_device(int device_id_counter) {
             int index = i + c * TFACC_REG_CNT;
             dev->ioreg[index] = ioremap(base, DEVICE_IO_LENGTH);
             if (dev->ioreg[index] == NULL || (unsigned long long)dev->ioreg[index] == 0xFFFFFFFF) {
+                dev->ioreg[index] = NULL;
                 DPRINTK("failed to map io reg!\n");
                 goto fail_remap;
             }
@@ -1562,6 +1678,7 @@ static struct tf_device * tf_create_and_init_device(int device_id_counter) {
             base = gap + TFACC_CACHE_BASE[i];
             dev->ioreg_cache[index] = ioremap(base, DEVICE_IO_LENGTH);
             if (dev->ioreg_cache[index] == NULL || (unsigned long long)dev->ioreg_cache[index] == 0xFFFFFFFF) {
+                dev->ioreg_cache[index] = NULL;
                 DPRINTK("failed to map io reg_cache!\n");
                 goto fail_remap;
             }
@@ -1572,10 +1689,14 @@ static struct tf_device * tf_create_and_init_device(int device_id_counter) {
         }
     }
 
+    tf_dev = dev;
+    pr_info("tfacc: persistent address-high mappings chips=%d pairs=%d\n",
+            chips, chips * (TFACC_REG_CNT / 2));
     DPRINTK("EXIT, succeed\n");
     return dev;
 
     fail_remap:
+    tf_unmap_device_registers(dev);
     kfree(dev);
     dev = NULL;
 
@@ -1976,48 +2097,6 @@ static void tfacc_write_direct_address_high(void __iomem *buf, u32 high_addr)
     writel(value, regs + 0x10);
 }
 
-/* Operand addresses are extended inside the L1 shared by a TFACC pair.  Only
- * these cache-side fields may change between operators. */
-static void tfacc_write_cache_address_high(void __iomem *buf, u32 high_addr)
-{
-    u8 __iomem *regs = buf;
-    u32 value;
-
-    value = readl(regs + 0x90);
-    value &= ~((0xffU << 0) | (0xffU << 16));
-    value |= (1U << 28) | (1U << 8) | (1U << 24) |
-             (high_addr << 0) | (high_addr << 16);
-    writel(value, regs + 0x90);
-
-    value = readl(regs + 0x94);
-    value &= ~((0xffU << 0) | (0xffU << 16));
-    value |= (1U << 28) | (1U << 8) | (1U << 24) |
-             (high_addr << 0) | (high_addr << 16);
-    writel(value, regs + 0x94);
-
-    /* Complete the high-address update before the caller starts a command. */
-    wmb();
-    readl(regs + 0x94);
-}
-
-static int tfacc_set_cache_address_high(unsigned long long base, u32 high_addr)
-{
-    void __iomem *buf;
-
-    if (high_addr > 0xffU) {
-        return -ERANGE;
-    }
-
-    buf = ioremap(base, TFACC_CLK_LENGTH);
-    if (!buf) {
-        return -ENOMEM;
-    }
-
-    tfacc_write_cache_address_high(buf, high_addr);
-    iounmap(buf);
-    return 0;
-}
-
 void tfacc_full_acp(unsigned long long base, int highAddr) {
     void __iomem *buf;
 
@@ -2053,45 +2132,27 @@ void tfacc_full_acp(unsigned long long base, int highAddr) {
 
 static int tf_ioctl_set_address_high(struct tf_device *dev, void __user *arg)
 {
-    static const unsigned long long acp_bases[] = {
-        TFACC0_FULL_ACP_BASE,
-        TFACC1_FULL_ACP_BASE,
-        TFACC2_FULL_ACP_BASE,
-        TFACC3_FULL_ACP_BASE,
-    };
     struct tf_address_high request;
-    int first_tfacc;
-    int chip_id;
-    int pair_id;
-    unsigned long long base;
+    struct tf_control_trace trace;
     int retval;
 
     if (copy_from_user(&request, arg, sizeof(request))) {
         return -EFAULT;
     }
-    if (request.api_version != TF_ADDRESS_API_VERSION || request.flags ||
-        request.tfacc_id < 0 ||
-        request.tfacc_id >= chips * TFACC_REG_CNT ||
-        request.address_high > 0xffU) {
+    if (request.api_version != TF_ADDRESS_API_VERSION || request.flags)
         return -EINVAL;
-    }
 
-    chip_id = request.tfacc_id / TFACC_REG_CNT;
-    pair_id = (request.tfacc_id % TFACC_REG_CNT) / 2;
-    first_tfacc = (request.tfacc_id / 2) * 2;
-    base = chipGap * chip_id + acp_bases[pair_id];
-
-    /* app_mutex keeps the ownership check and MMIO update atomic with
-     * TF_APP_UNLOCK.  Both cores must be held because they share this L1. */
+    /* Keep ownership validation and MMIO atomic with TF_APP_UNLOCK. The
+     * register mapping has device lifetime; the selected HIGH remains dynamic. */
+    trace = tf_control_begin();
     mutex_lock(&app_mutex);
-    if (dev->holdTFACCTgid[first_tfacc] != current->tgid ||
-        dev->holdTFACCTgid[first_tfacc + 1] != current->tgid) {
-        retval = -EPERM;
-    } else {
-        retval = tfacc_set_cache_address_high(base, request.address_high);
-    }
+    tf_control_acquired(&trace);
+    retval = tf_set_address_high_locked(dev, request.tfacc_id,
+                                        request.address_high, chips,
+                                        current->tgid);
     mutex_unlock(&app_mutex);
-
+    tf_control_end(&trace, "set_high", request.tfacc_id,
+                   request.address_high, retval);
     return retval;
 }
 
@@ -2486,7 +2547,8 @@ static int tf_ioctl_check_version(struct tf_device * dev, void * arg) {
     return retval;
 }
 
-static int tf_init_kbuf(struct tf_device * dev,struct kbuf * kbuf_p) {
+static int tf_init_kbuf(struct tf_device * dev,struct kbuf * kbuf_p,
+                        bool reserved_only) {
     struct tf_huge_region *region;
     u64 candidate;
     u64 dma_start;
@@ -2532,6 +2594,13 @@ static int tf_init_kbuf(struct tf_device * dev,struct kbuf * kbuf_p) {
         goto allocated;
     }
 
+    if (reserved_only) {
+        kbuf_p->phy_addr = 0;
+        kbuf_p->cpu_phys_addr = 0;
+        kbuf_p->mmap_id = -1;
+        return -ENOMEM;
+    }
+
     /* tfnn places result queues in its first allocation and programs their
      * legacy high fields as zero.  Keep that per-chip anchor in reserved DDR;
      * only payload allocations after it may fall back to HugeTLB memory. */
@@ -2561,10 +2630,10 @@ static int tf_init_kbuf(struct tf_device * dev,struct kbuf * kbuf_p) {
             }
 
             kbuf_p->phy_addr = dma_start;
-        kbuf_p->cpu_phys_addr = region->physical_addr + candidate;
-        kbuf_p->pool_offset = candidate;
-        kbuf_p->pool_previous_offset = region->offset;
-        kbuf_p->pool_index = -1;
+            kbuf_p->cpu_phys_addr = region->physical_addr + candidate;
+            kbuf_p->pool_offset = candidate;
+            kbuf_p->pool_previous_offset = region->offset;
+            kbuf_p->pool_index = -1;
             kbuf_p->backend = TF_MEMORY_HUGEPAGE;
             kbuf_p->huge_region = region;
             kbuf_p->owner_tgid = current->tgid;
@@ -2620,7 +2689,8 @@ static void tf_rollback_kbuf(struct kbuf *kbuf_p)
     }
 }
 
-static struct kbuf * tf_create_and_init_kbuf(struct tf_device * dev, int len) {
+static struct kbuf * tf_create_and_init_kbuf(struct tf_device * dev, int len,
+                                             bool reserved_only) {
     if (efuse) {
         return NULL;
     }
@@ -2634,7 +2704,7 @@ static struct kbuf * tf_create_and_init_kbuf(struct tf_device * dev, int len) {
     }
     kbuf_p->len = len;
     DPRINTK("kbuf_p->len: 0x%08x\n", len);
-    if ((retval = tf_init_kbuf(dev, kbuf_p))) {
+    if ((retval = tf_init_kbuf(dev, kbuf_p, reserved_only))) {
         DPRINTK("failed to init kbuf\n");
         goto after_alloc_kbuf;
     }
@@ -2675,7 +2745,14 @@ static int tf_ioctl_create(struct tf_device * dev, void * arg) {
     mutex_lock(&tf_memory_mutex);
 
     //create kbuf
-    if (!(kbuf_p = tf_create_and_init_kbuf(dev, io_param->len))) {
+    if (io_param->uncache & ~(TF_BUF_FLAG_UNCACHED |
+                              TF_BUF_FLAG_RESERVED_ONLY)) {
+        retval = -EINVAL;
+        goto after_unlock_memory;
+    }
+    if (!(kbuf_p = tf_create_and_init_kbuf(
+                  dev, io_param->len,
+                  io_param->uncache & TF_BUF_FLAG_RESERVED_ONLY))) {
         DPRINTK("fail to create_and_init kbuf\n");
         retval = -ENOMEM;
         goto after_unlock_memory;
@@ -2693,7 +2770,7 @@ static int tf_ioctl_create(struct tf_device * dev, void * arg) {
         }
     }
 
-    if (io_param->uncache) {
+    if (io_param->uncache & TF_BUF_FLAG_UNCACHED) {
         isNextUncache = 1;
     }
 
@@ -2836,6 +2913,7 @@ void tf_remove(void) {
     tf_reset_memory_owner(0, true);
     mutex_unlock(&tf_memory_mutex);
     tf_release_all_huge_regions();
+    tf_unmap_device_registers(tf_dev);
     kfree(tf_dev);
 
     DPRINTK("EXIT, succeed\n");
@@ -3058,6 +3136,8 @@ static int __init tf_init_module(void)
     }
 
     major = register_chrdev(0, "thinkforce_kernel", &mytest_ops);
+    if (major < 0)
+        return major;
     //cls = class_create(THIS_MODULE, "thinkforce_kernel_class");
     //mydev = device_create(cls, 0, MKDEV(major,0),NULL,"thinkforce_kernel_device");
 
@@ -3136,7 +3216,8 @@ static int __init tf_init_module(void)
 
     dev = tf_create_and_init_device(0);
     if (dev == NULL) {
-        goto origin;
+        retval = -ENOMEM;
+        goto class_error;
     }
 
 #ifdef CONFIG_ACPI
@@ -3150,7 +3231,8 @@ static int __init tf_init_module(void)
     }
 #endif
 
-    if (tf_create_and_init_cdev(dev, 0) < 0) {
+    retval = tf_create_and_init_cdev(dev, 0);
+    if (retval < 0) {
         goto create_error;
     }
 
@@ -3158,13 +3240,17 @@ static int __init tf_init_module(void)
     return 0;
 
     create_error:
-#ifdef CONFIG_ACPI
-    tf_cleanup_module(pdev);
-#else
-    tf_cleanup_module();
-#endif
+    /* cdev creation already rolled back its own resources. Do not call the
+     * successful-device removal path on a partially published cdev. */
+    tf_unmap_device_registers(dev);
+    kfree(dev);
+    tf_dev = NULL;
+
+    class_error:
+    class_destroy(thinkforce_class);
 
     origin:
+    unregister_chrdev(major, "thinkforce_kernel");
     DPRINTK("EXIT, failed with code %d\n", retval);
 
     return retval;
@@ -3184,16 +3270,21 @@ void tfacc_cache_debug(unsigned long long BASE) {
 }
 
 #ifdef CONFIG_ACPI
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
+static void tf_cleanup_module(struct platform_device *pdev) {
+#else
 static int tf_cleanup_module(struct platform_device *pdev) {
-	if (efuse) {
-		return -1;
-	}
+#endif
 #else
 static void __exit tf_cleanup_module(void) {
-    if (efuse) {
-        return;
-    }
 #endif
+    if (efuse) {
+#if defined(CONFIG_ACPI) && LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
+        return -1;
+#else
+        return;
+#endif
+    }
     int c;
     unsigned long long gap;
 
@@ -3222,7 +3313,7 @@ static void __exit tf_cleanup_module(void) {
     tfacc_full_checkrstcond();
 
     DPRINTK("EXIT, succeed\n");
-#ifdef CONFIG_ACPI
+#if defined(CONFIG_ACPI) && LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
     return 0;
 #endif
 }

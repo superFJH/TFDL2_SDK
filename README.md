@@ -79,9 +79,6 @@ numactl --membind=1 --cpunodebind=1 ./your_program
 
 # 7000系列芯片
 cd Driver
-
-tar -xvf driver.tgz
-
 ./insmodTFDriver.sh
 ```
 

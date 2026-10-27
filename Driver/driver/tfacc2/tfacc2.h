@@ -19,6 +19,7 @@
 #include <asm/cacheflush.h>
 #include <linux/platform_device.h>
 #include <linux/acpi.h>
+#include <linux/version.h>
 //#include <asm/outercache.h>
 
 #define DRIVER_VERSION          "0.8.0"
@@ -79,7 +80,11 @@ void tf_remove(void);
 
 #ifdef CONFIG_ACPI
 static int tf_init_module(struct platform_device *pdev);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
+static void tf_cleanup_module(struct platform_device *pdev);
+#else
 static int tf_cleanup_module(struct platform_device *pdev);
+#endif
 #else
 static int __init tf_init_module(void);
 static void __exit tf_cleanup_module(void);
@@ -90,6 +95,8 @@ static void __exit tf_cleanup_module(void);
 #define TF_BUF_CLEAR        _IO(TF_MAGIC, 0)
 #define TF_BUF_RESET        _IO(TF_MAGIC, 8)
 #define TF_BUF_CREATE       _IOWR(TF_MAGIC, 0, struct tf_buf_io_param *)
+#define TF_BUF_FLAG_UNCACHED      (1U << 0)
+#define TF_BUF_FLAG_RESERVED_ONLY (1U << 1)
 #define TF_BUF_FLUSHL1      _IOWR(TF_MAGIC, 1, struct tf_get_phy_value *)
 #define TF_VERSION_CHECK    _IOWR(TF_MAGIC, 2, struct tf_version *)
 
@@ -190,6 +197,8 @@ struct tf_device {
     spinlock_t lock;
     void *ioreg[TFACC_REG_CNT * 10];
     void *ioreg_cache[TFACC_REG_CNT * 10];
+    /* One persistent ACP mapping per ownership-capable NPU pair. */
+    void __iomem *ioreg_acp[MAX_TFACC_CNT / 2];
     void *ioregMain;
     void *sram1;
     void *sram2;
@@ -229,7 +238,7 @@ struct tf_buf_io_param{
     dma_addr_t phy_addr;
     int len;
     int mmap_id;
-    int uncache;
+    int uncache; /* TF_BUF_FLAG_*; kept in place for ABI compatibility */
     int useDDR2;
 };
 
