@@ -800,6 +800,14 @@ namespace PythonInter {
         return pyTFTensor(std::move(GetTensorByName(self.self,cname)),std::move(q));
     }
 
+    pyTFTensor PYGetContextTensorByName(pyTFContext& self,py::str name){
+        string cname = string(name);
+        auto tensor = GetTensorByName(self.self,cname);
+        if (!tensor.IsValid())throw py::key_error(cname);
+        auto q = GetTensorQuantizeInfo(self.self,cname);
+        return pyTFTensor(std::move(tensor),std::move(q));
+    }
+
 
 
     //BinaryOp
@@ -2737,6 +2745,8 @@ PYBIND11_MODULE(TFDL2,m) {
             .def("__getitem__",PythonInter::symbol_getitem1)
             .def("__getitem__",PythonInter::symbol_getitem2);
 
+    m.def("GetDeviceNum", [](){return GetDeviceNum();});
+
     py::class_<PythonInter::pyTFContext>(m, "_TFContext", "this is the Context of tfdl　for python")
             .def(py::init<py::tuple>())
             .def(py::init<py::str>())
@@ -2744,6 +2754,7 @@ PYBIND11_MODULE(TFDL2,m) {
             .def("_RegisterQuantizedParamToContext", PythonInter::RegisterQuantizedParamToContext)
             .def("_GetParamSymbol", PythonInter::GetParamSymbol)
             .def("_GetParam", PythonInter::GetParam)
+            .def("_GetTensorByName", PythonInter::PYGetContextTensorByName)
             .def("_RegistorInt8config", PythonInter::RegistorInt8config)
             .def("_RegistorInt8configPerChannel", PythonInter::RegistorInt8configPerChannel)
             .def("_GetAttr", PythonInter::GetAttr)
@@ -2772,7 +2783,7 @@ PYBIND11_MODULE(TFDL2,m) {
 
     py::class_<PythonInter::pyTFCalibration>(m, "_TFCalibration",
                                              "this is the wrape of tfdl calibration　for python")
-            .def(py::init<PythonInter::pyTFContext &, TFCalibrationMode,py::str>())
+            .def(py::init<PythonInter::pyTFContext &, TFCalibrationMode,py::str>(), py::keep_alive<1, 2>())
             .def("_Calibration", PythonInter::pyCalibration)
             .def("_Getinputs", PythonInter::GetInputTensorCalibration)
             .def("_Fp32ToFp16", PythonInter::pyConvertCalibrationFp32ToFp16)

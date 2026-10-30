@@ -6,6 +6,7 @@ from .Common import TFDataType,TFConverType
 
 class TFCalibration(_TFCalibration):
     def __init__(self,context,calibrationmode,config:dict=None):
+        self._shared_weight_context = context
         if config == None:
             config = {}
             config["UseHardware"] = False

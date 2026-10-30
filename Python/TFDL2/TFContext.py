@@ -37,6 +37,12 @@ class TFContext(_TFContext):
     def GetParam(self,paramName:str):
         return TFTensor(super(TFContext,self)._GetParam(paramName))
 
+    def GetTensorByName(self,name:str):
+        """Read a prepared activation and its SDK quantization metadata."""
+        tensor = TFTensor(super(TFContext,self)._GetTensorByName(name))
+        tensor._shared_context = self
+        return tensor
+
     def GetAttr(self,paramName:str):
         ddd = super(TFContext,self)._GetAttr(paramName)
         ddd = bytes(ddd,encoding='utf-8')

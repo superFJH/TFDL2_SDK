@@ -1226,3 +1226,67 @@ def LSTM2(x:TFSymbol,w:TFSymbol,r:TFSymbol,b:TFSymbol,hidden_size:int,direction:
     :return:
     '''
     return TFDL2.LSTM2(x,w,r,b,hidden_size,direction)
+
+
+# Recording is opt-in and scoped to the calling thread/task. Existing imports
+# of Op functions retain the wrappers, so ONNX/custom converters need no patching.
+from contextlib import contextmanager as _contextmanager
+from contextvars import ContextVar as _ContextVar
+from functools import wraps as _wraps
+from inspect import signature as _signature
+
+_recording = _ContextVar('tfdl_op_recording', default=None)
+
+@_contextmanager
+def capture_operations():
+    """Record public Op calls without changing their native graph semantics."""
+    state = {'calls': [], 'depth': 0}
+    token = _recording.set(state)
+    try:
+        yield state['calls']
+    finally:
+        _recording.reset(token)
+
+def _record_op(function):
+    signature = _signature(function)
+    @_wraps(function)
+    def invoke(*args, **kwargs):
+        state = _recording.get()
+        if state is None:
+            return function(*args, **kwargs)
+        outer = state['depth'] == 0
+        state['depth'] += 1
+        try:
+            result = function(*args, **kwargs)
+        finally:
+            state['depth'] -= 1
+        if outer:
+            bound = signature.bind(*args, **kwargs)
+            bound.apply_defaults()
+            state['calls'].append((function.__name__, dict(bound.arguments), result))
+        return result
+    return invoke
+
+for _name, _function in list(globals().items()):
+    if callable(_function) and getattr(_function, '__module__', None) == __name__ and (_name[0].isupper() or _name == 'deReArrange'):
+        # Enum/classes are callable too; only wrap Python operator functions.
+        if hasattr(_function, '__code__'):
+            globals()[_name] = _record_op(_function)
+
+# Converter parsers also use x+y, x*scalar and x[index] directly. Record the
+# original native overload, preserving scalar types and reverse-operand order.
+_symbol_methods = {}
+def _record_symbol(method, original):
+    @_wraps(original)
+    def invoke(self, other):
+        result = original(self, other)
+        state = _recording.get()
+        if state is not None and state['depth'] == 0:
+            state['calls'].append(('_symbol_'+method, {'Input': self, 'other': other}, result))
+        return result
+    return invoke
+
+for _method in ('__add__','__sub__','__mul__','__truediv__','__radd__','__rsub__','__rmul__','__rtruediv__','__lt__','__gt__','__le__','__ge__','__eq__','__getitem__'):
+    _original = getattr(TFSymbol, _method)
+    _symbol_methods['_symbol_'+_method] = _original
+    setattr(TFSymbol, _method, _record_symbol(_method, _original))
