@@ -486,8 +486,7 @@ class NpuRuntime:
         raise TypeError("NPU runtime handles are process-local; save module.state_dict(), not the runtime")
 
 
-@torch.library.custom_op("tfllm::linear", mutates_args=())
-def _linear(x: torch.Tensor, runtime: int, weight: int, out_features: int) -> torch.Tensor:
+def _linear_impl(x: torch.Tensor, runtime: int, weight: int, out_features: int) -> torch.Tensor:
     x = _tensor(x)
     if x.ndim < 1 or x.shape[-1] <= 0 or out_features <= 0:
         raise ValueError("invalid Linear shape")
@@ -499,7 +498,26 @@ def _linear(x: torch.Tensor, runtime: int, weight: int, out_features: int) -> to
     return y
 
 
-@_linear.register_fake
+# Keep a dispatcher operator (including fake/compile support), but register the
+# fixed, fresh-output kernel directly. custom_op's generic per-call wrapper and
+# alias checks are measurable for small synchronous projections on the board.
+_linear_library = torch.library.Library("tfllm", "FRAGMENT")
+_linear_library.define(
+    "linear(Tensor x, SymInt runtime, SymInt weight, SymInt out_features) -> Tensor",
+    tags=(torch.Tag.pt2_compliant_tag,),
+)
+_linear_library.impl("linear", _linear_impl, "CompositeExplicitAutograd")
+_linear = torch.ops.tfllm.linear.default
+
+
+def _linear_backward(ctx, grad):
+    raise RuntimeError("TFLLM is inference-only; use torch.inference_mode()")
+
+
+torch.library.register_autograd(_linear, _linear_backward)
+
+
+@torch.library.register_fake("tfllm::linear")
 def _linear_fake(x, runtime, weight, out_features):
     return x.new_empty((*x.shape[:-1], out_features))
 
@@ -536,17 +554,12 @@ def _pointwise(x: torch.Tensor, runtime: int, weight: int, channels: int,
         raise ValueError("invalid pointwise shape/geometry")
     oh, ow = (x.shape[2]+2*pad_h-1)//stride+1, (x.shape[3]+2*pad_w-1)//stride+1
     context = _context(runtime)
-    if context.backend == "npu" and hasattr(context._lib, "tfllm_torch_pointwise"):
-        y = x.new_empty((x.shape[0], channels, oh, ow))
-        shape = (C.c_size_t * 8)(*x.shape, channels, stride, pad_h, pad_w)
-        if context._call("pointwise", weight, x.data_ptr(), y.data_ptr(), shape, allow_unsupported=True):
-            return y
-    # Explicit CPU reference, old ABI, disabled optimization or unsupported K.
-    # A device/quantization error above propagates; it never executes this path.
-    if pad_h or pad_w:
-        x = torch.nn.functional.pad(x, (pad_w, pad_w, pad_h, pad_h))
-    pixels = x[:, :, ::stride, ::stride].permute(0, 2, 3, 1).contiguous()
-    return _linear(pixels, runtime, weight, channels).permute(0, 3, 1, 2).contiguous()
+    if not hasattr(context._lib, "tfllm_torch_pointwise"):
+        raise RuntimeError("rebuild TFLLM with native pointwise support")
+    y = x.new_empty((x.shape[0], channels, oh, ow))
+    shape = (C.c_size_t * 8)(*x.shape, channels, stride, pad_h, pad_w)
+    context._call("pointwise", weight, x.data_ptr(), y.data_ptr(), shape)
+    return y
 
 
 @_pointwise.register_fake
@@ -569,16 +582,12 @@ def _pointwise_fp32(x: torch.Tensor, runtime: int, weight: int, channels: int,
     oh, ow = (x.shape[2]+2*pad_h-1)//stride+1, (x.shape[3]+2*pad_w-1)//stride+1
     context = _context(runtime)
     _external_dtype(context)
-    if context.backend == "npu" and hasattr(context._lib, "tfllm_torch_pointwise_fp32"):
-        y = x.new_empty((x.shape[0], channels, oh, ow))
-        shape = (C.c_size_t * 8)(*x.shape, channels, stride, pad_h, pad_w)
-        if context._call("pointwise_fp32", weight, x.data_ptr(), y.data_ptr(), shape, allow_unsupported=True):
-            return y
-    # Coverage rejection is pre-submit. Preserve FP32 through this layout path.
-    if pad_h or pad_w:
-        x = torch.nn.functional.pad(x, (pad_w, pad_w, pad_h, pad_h))
-    pixels = x[:, :, ::stride, ::stride].permute(0, 2, 3, 1).contiguous()
-    return _linear(pixels, runtime, weight, channels).permute(0, 3, 1, 2).contiguous()
+    if not hasattr(context._lib, "tfllm_torch_pointwise_fp32"):
+        raise RuntimeError("rebuild TFLLM with native FP32 pointwise support")
+    y = x.new_empty((x.shape[0], channels, oh, ow))
+    shape = (C.c_size_t * 8)(*x.shape, channels, stride, pad_h, pad_w)
+    context._call("pointwise_fp32", weight, x.data_ptr(), y.data_ptr(), shape)
+    return y
 
 
 @_pointwise_fp32.register_fake

@@ -99,6 +99,19 @@ class TFConvertor(object):
         pass
 
     def buildTFmodel(self,inputshape=None,std=None,mean=None):
+        from TFDL2 import Op
+        if hasattr(Op,'capture_operations'):
+            with Op.capture_operations() as operations:
+                self._buildTFmodel(inputshape,std,mean)
+            self._op_calls = operations
+        else:
+            self._buildTFmodel(inputshape,std,mean)
+            self._op_calls = None
+        self._build_options = dict(inputshape=inputshape,std=std,mean=mean)
+
+    def _buildTFmodel(self,inputshape=None,std=None,mean=None):
+        self.renames = {}
+        self.nodeMap = {}
         with TFContext(self.name) as context:
             
             for name,attr in self.inputs.items():
@@ -205,9 +218,8 @@ class TFConvertor(object):
 
             
         
-        ordered_outputs = [tfoutputname[name] for name in self.outputs]
-        print("output : ", ordered_outputs)
-        context.SetOutputs(ordered_outputs)
+        print("output : ",list(tfoutputname.values()))
+        context.SetOutputs(list(tfoutputname.values()))
 
         print("Finished!!")
 
@@ -226,7 +238,10 @@ class TFConvertor(object):
         calibration = TFCalibration(self._context,CalibrationMode.Naive)
         calibration.ConvertCalibrationFp32ToFp16()
 
-    def quantContext(self,calibration_list:list=None,quant_input:dict=None,decoderflags:DECODER_FLAGS=None,MergeConcate:bool=True, avoidtensors:tuple=(),stopquanttensors:tuple=()):
+    def quantContext(self,calibration_list:list=None,quant_input:dict=None,decoderflags:DECODER_FLAGS=None,MergeConcate:bool=True, avoidtensors:tuple=(),stopquanttensors:tuple=(),calibration_backend="sdk-cpu",auto_fallback=False,calibration_options=None):
+        if calibration_backend != "sdk-cpu" or auto_fallback or calibration_options is not None:
+            from .calibration_backend import quantize
+            return quantize(self,calibration_list,quant_input,decoderflags,MergeConcate,avoidtensors,stopquanttensors,calibration_backend,auto_fallback,calibration_options)
         calibration = TFCalibration(self._context,CalibrationMode.Naive)
         inputs = calibration.GetInputs()
 
@@ -270,3 +285,4 @@ class TFConvertor(object):
             calibration.Quantize(inputtype,MergeConcate=MergeConcate,stopquanttensors=stopquanttensors,avoidtensors=avoidtensors)
         else:
             calibration.Quantize(quant_input,MergeConcate=MergeConcate,stopquanttensors=stopquanttensors,avoidtensors=avoidtensors)
+

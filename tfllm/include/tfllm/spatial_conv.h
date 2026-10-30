@@ -20,6 +20,9 @@ AffineU8 AffineRange(const uint16_t* data,size_t count);
 AffineU8 AffineRange(const float* data,size_t count);
 void QuantizeAffine(const uint16_t*,uint8_t*,size_t,AffineU8);
 void QuantizeAffine(const float*,uint8_t*,size_t,AffineU8);
+// Quantize contiguous NCHW channel planes; leave destination padding untouched.
+void QuantizeAffinePlanar(const uint16_t*,uint8_t*,size_t channels,size_t image,size_t stride,AffineU8);
+void QuantizeAffinePlanar(const float*,uint8_t*,size_t channels,size_t image,size_t stride,AffineU8);
 void DequantizeSpatial(const int32_t*,uint16_t*,size_t,float scale);
 void DequantizeSpatial(const int32_t*,float*,size_t,float scale);
 // Round channel bias into the INT32 accumulator domain; reject nonfinite

@@ -53,7 +53,8 @@ struct NpuOptions {
     bool attention_qk_overlap=true; // Fuse the preceding score tile during the next QK.
     bool attention_workspace_reuse=true; // Private, pressure-evictable encode scope.
     bool workspace_reuse=true; // Static/dynamic GEMM, per prefill/encode caller.
-    size_t workspace_cache_bytes=1024ull*1024*1024; // Idle A/C/scratch + commands; <=32 instances.
+    size_t workspace_cache_bytes=1024ull*1024*1024; // Idle A/C/scratch + commands, bounded with count below.
+    size_t workspace_cache_instances=32; // Independent cap; deep/concurrent CNNs can explicitly raise it.
     // 1..32 CPU participants per lane, including the pair worker. Also grows
     // the shared CPU pool to at least this value minus one background threads.
     // Ordinary CPU kernels retain their per-call limit of eight participants.
@@ -73,6 +74,8 @@ struct NpuOptions {
 // U8 requires the matching SDK, padded head dim <=256, and keeps I32 retry storage.
 // WORKSPACE_REUSE: 0/1. These names have the TFLLM_NPU_ATTENTION_ prefix.
 // TFLLM_NPU_WORKSPACE_REUSE: 0/1; TFLLM_NPU_WORKSPACE_CACHE_MIB: 1..4096.
+// TFLLM_NPU_WORKSPACE_CACHE_INSTANCES: 1..4096, default 32. The byte budget,
+// idle timeout and allocation-pressure eviction remain independent limits.
 // TFLLM_NPU_ELASTIC_MEMORY: 0/1 (Torch default 1, native serve default 0).
 // TFLLM_NPU_FORWARD_CACHE: 0/1 (Torch default 1); CACHE_IDLE_MS: 0..86400000;
 // TEMPLATE_CACHE_MIB: 1..4096. The latter two also have the TFLLM_NPU_ prefix.

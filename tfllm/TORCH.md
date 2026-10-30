@@ -174,6 +174,64 @@ PYTHONPATH=TFLLM/python TFLLM_TORCH_LIBRARY=/path/libtfllm-torch.so \
 
 ## 函数式代码与 torch.compile
 
+### 固定模型的 CPU 编译融合与请求并发
+
+已 `optimize()` 的纯 eval 模型可额外建立 `compile_snapshot()`：
+它捕获 TFLLM 原生算子调用，再用 Inductor 融合 CPU 部分，保留显式输入/权重 dtype。
+该可选接口已在 Torch 2.14 上验证，普通 eager 导入不依赖编译器模块。
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+import torch
+from tfllm.torch import NpuRuntime, optimize, restore, compile_snapshot
+
+torch.set_num_threads(16)  # 在主线程设置一次，所有请求共享这项配置
+model.eval()
+with NpuRuntime(chip=0, spatial_convolution="native", memory_fraction=.125) as runtime:
+    optimize(model, runtime=runtime, operators=("conv2d", "linear"), precision="auto")
+    fast = None
+    try:
+        with torch.inference_mode():
+            fast = compile_snapshot(model, example_input)
+        def infer(value):
+            with torch.inference_mode():
+                return fast(value)
+        with ThreadPoolExecutor(max_workers=4) as requests:
+            outputs = list(requests.map(infer, inputs))
+        print(fast.report)  # 包含准备、捕获及首次编译耗时
+    finally:
+        if fast is not None:
+            fast.close()
+        restore(model)
+```
+
+每个请求线程一次只执行一个样本。只读 eval 模型和 runtime 共享，原生执行工作区由
+runtime 独占借出，输入、输出和观察统计保持私有。关闭快照会等待该快照的在途请求完成，
+不会关闭调用者拥有的 runtime。实例数需要实测；8 个请求不保证比 4 个更快。
+
+`chip=0` 指第一个八核 NPU 芯片，调度范围为 TFACC 0–7，含四个 pair worker；
+不是只使用第 0 核。`torch.set_num_threads(16)` 也不是整个进程的 OS 线程上限，
+runtime 有独立的 CPU 辅助线程。单请求延迟与多请求吞吐应分别对照 ORT。
+
+快照固定输入形状、stride、dtype/device 和模型 Python 配置。输入数据可变；输入相关的
+`item()`/`tolist()` 或 Python 分支会被拒绝。权重 reload/原地修改、模块替换、训练模式、
+`restore()` 后需重建快照；任意自定义 Python 状态仍应保持不变。
+编译融合可能改变浮点舍入，再经过动态量化会放大局部差异，需用任务数据验收。
+该接口不会把原生近似动态量化变成精确 FP32，也不会静默回退到 CPU 模型。
+
+首次捕获/编译可能需要数十秒，`report` 单独记录；稳态测速应排除这项启动成本，
+端到端校准时间应包含它。少量校准图片通常优先使用 eager 请求并发。
+
+深层 CNN 可按显存预算增加执行实例缓存，避免默认 32 项的 LRU 在层间反复替换：
+
+```sh
+export TFLLM_NPU_WORKSPACE_CACHE_INSTANCES=512  # 1..4096，默认 32
+export TFLLM_NPU_WORKSPACE_CACHE_MIB=2048       # 1..4096 MiB，默认 1024
+```
+
+计数上限独立于字节预算；空闲超时和内存压力回收继续生效。增加上限不会在启动时预分配
+所有实例。此选项需更新配套原生库；C++ 客户端使用更新的 `NpuOptions` 头文件时需重新编译。
+
 ```python
 from tfllm.torch import make_backend
 
@@ -256,24 +314,26 @@ SDPA、量化层、自定义子类或 CUDA 专属代码；带 hooks 的层明确
   K/V 每次调用创建不可变快照，不自动缓存跨帧状态。不含 QKV/output projection、RoPE、dropout、FlashVSR LCSA。
 - 1×1 Conv2d：NPU 默认直接读写 NCHW，量化与原 Linear 桥接一致：输入按每个像素的
   `max(abs(x))/127` 对称定标，权重按输出通道对称定标，U8 zeroPoint=128；全零 scale=1。
-  `stride=1、padding=0、Cin≤4096、Cout≤16384`、输入宽度满足原生 Conv 限制，
-  且每个原生分片的通道平面 stride≤8192 像素时，使用现有原生 Conv 命令；
+  NPU 只使用原生 Conv 命令，Cin≤4096、Cout≤16384；不再回退到 GEMM。
+  stride=1、padding=0 且满足原生空间限制时直接执行；其他 stride/padding、宽度尾部和
+  大空间平面先在 C++ 中按最多 8192 像素的 NCHW 块取样补零，再执行原生 1×1。
+  不生成完整 NHWC 或 padding 张量；每像素定标使空间分块不改变量化结果。
   输入 U8 与输出 I32 均为 NCHW，反量化乘像素 scale 与权重通道 scale。
-  其他几何在 Cin≤16384 时采用 NCHW 取数/量化与直接写回的 GEMM 路径，支持 stride 和零 padding，
-  不生成完整 NHWC 激活或 padding 张量。FP16 输出舍入和后续 FP16 bias 相加保持原来的边界。
-  `TFLLM_NPU_POINTWISE_NCHW=0` 在创建 runtime 时显式恢复旧的布局转换路径，便于独立进程 A/B。
-  CPU 参考模式、旧版库或超出量化 producer 的 K 范围保留旧桥接；设备异常不会回放旧路径。
+  FP16 输出舍入和后续 FP16 bias 相加保持原来的边界。
+  旧的 `TFLLM_NPU_POINTWISE_NCHW` 路由开关已移除；设备异常直接报错，不回放计算。
   FP32 输入现在直接按 FP32 原值求每像素 scale 并量化 U8，I32 直接反量化写 NCHW FP32，
   不创建整图 FP16 输入/输出，也不在寄存器内舍入到 FP16。FP16/FP32 权重按其原值逐输出通道量化。
   `NpuConv2d(x_fp32)` / `forward_fp32(x_fp32)` 与 `optimize(...)` 的 FP32 1×1
   均走此入口；FP32 bias 在输出后按 FP32 相加。这里的 FP32 激活语义与旧的 FP16 桥接不同，
   需用直接 FP32 量化参考验证；极小的非零 scale 下限为 `FLT_MIN`，全零仍用 1。
-  CPU 参考、显式关闭或超出 K 范围时使用同 dtype 的布局/GEMM 路径；不隐含转 FP16。
+  显式 CPU backend 使用同 dtype 的 NCHW 浮点卷积参考；旧版库缺少入口时要求重新编译。
   板端复测可运行 `python TFLLM/examples/torch_pointwise_benchmark.py`；它交替计时新旧路径，
   在计时外检查 FP16 一致性，并报告直接 FP32 与原 FP32 桥接的配对耗时。
   `TFLLM_NPU_VERIFY_OUTPUTS=1` 用于单独的 I32 检查，不用于性能计时。
 - 非 1×1 Conv2d 默认使用 NPU 原生空间卷积，不进行 CPU im2col。
-  整个 NCHW 输入共用一次 min/max 定标（范围包含零）；权重按输出通道非对称 U8。
+  整个 NCHW 输入（含全部 batch）共用一次 min/max 定标（范围包含零）；权重按输出通道非对称 U8。
+  大输入并行扫描后归约成同一个范围；低通道输入沿空间分块量化，避免 RGB 仅有三个 CPU 任务。
+  FP16/FP32 保留各自原有的 scale 舍入和量化规则；这些优化不改变权重量化或输出数值。
   `scale=(max-min)/255`、`zero=clamp(round(-min/scale),0,255)`，全零范围用 scale=1。
   四舍五入采用 half-away-from-zero；真实/通道 padding 使用对应零点。
   原生输出已补偿零点的 INT32，CPU 乘输入与通道 scale，直接写入输入对应的 FP16/FP32 输出；

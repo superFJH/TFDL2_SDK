@@ -28,9 +28,10 @@ class _PackedModule(nn.Module):
 
     def prepare(self):
         with self._packing_lock:
-            if tuple(self.weight.shape) != self._weight_shape:
+            weight = self.weight
+            if tuple(weight.shape) != self._weight_shape:
                 raise ValueError("reloaded weight shape differs from this module's geometry")
-            version = (id(self.weight), self.weight.data_ptr(), self.weight._version)
+            version = (id(weight), weight.data_ptr(), weight._version)
             if self._packed is None or self._version != version:
                 packed = self._pack()
                 self._packed, self._version = packed, version
