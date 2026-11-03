@@ -82,3 +82,22 @@ class TFContext(_TFContext):
     def AddInt8ConfigPerChannel(self,name:str,max:list,min:list)->bool:
         """Register per-channel UINT8 ranges in consumer channel order."""
         return super(TFContext,self)._RegistorInt8configPerChannel(name,max,min)
+
+    def SetQuantization(self,name:str,scale,zero_point)->bool:
+        """Register activation UINT8 scale/zero-point without range reconstruction.
+
+        Weight parameters have separate range-based serialization. Scalars and
+        channel vectors are accepted here. Signed ONNX codes must first
+        be shifted by 128, together with their zero-point, to SDK UINT8 storage.
+        """
+        import numpy as np
+        scales = np.asarray(scale, dtype=np.float32).reshape(-1)
+        zeros = np.asarray(zero_point)
+        if not np.issubdtype(zeros.dtype, np.integer):
+            raise TypeError("zero_point must contain integers")
+        zeros = zeros.reshape(-1)
+        if (not scales.size or scales.size != zeros.size
+                or not np.all(np.isfinite(scales)) or np.any(scales <= 0)
+                or np.any(zeros < 0) or np.any(zeros > 255)):
+            raise ValueError("invalid UINT8 scale/zero-point vectors")
+        return super(TFContext,self)._SetQuantization(name,scales.tolist(),zeros.tolist())

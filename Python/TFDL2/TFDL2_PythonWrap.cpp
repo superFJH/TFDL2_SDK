@@ -9,6 +9,7 @@
 #include <TFModule.h>
 //#include "TFCV.h"
 #include <pybind11/stl.h>
+#include <cmath>
 namespace py = pybind11;
 using namespace TFDL_CAPI;
 namespace PythonInter {
@@ -701,6 +702,22 @@ namespace PythonInter {
             throw py::value_error("per-channel max/min must have the same non-zero length");
         }
         return RegisterQuantInfo(self.self,paramName,max_,min_);
+    }
+
+    bool SetQuantization(pyTFContext& self,py::str paramName,
+                         const vector<float>& scales,const vector<int>& zeros){
+        if(scales.empty() || scales.size() != zeros.size()){
+            throw py::value_error("scale/zero-point must have equal non-zero lengths");
+        }
+        for(size_t i=0;i<scales.size();++i){
+            if(!std::isfinite(scales[i]) || scales[i] <= 0 || zeros[i] < 0 || zeros[i] > 255){
+                throw py::value_error("invalid UINT8 scale/zero-point");
+            }
+        }
+        if(scales.size() == 1){
+            return RegisterQuantInfo(self.self,string(paramName),scales[0],zeros[0]);
+        }
+        return RegisterQuantInfo(self.self,string(paramName),scales,zeros);
     }
 
     string GetAttr(pyTFContext& self,py::str paramName) {
@@ -2757,6 +2774,7 @@ PYBIND11_MODULE(TFDL2,m) {
             .def("_GetTensorByName", PythonInter::PYGetContextTensorByName)
             .def("_RegistorInt8config", PythonInter::RegistorInt8config)
             .def("_RegistorInt8configPerChannel", PythonInter::RegistorInt8configPerChannel)
+            .def("_SetQuantization", PythonInter::SetQuantization)
             .def("_GetAttr", PythonInter::GetAttr)
             .def("_GetAllTensorNames", PythonInter::pyGetAllTensorNames)
             .def("_DumpToFile", PythonInter::DumpContext)

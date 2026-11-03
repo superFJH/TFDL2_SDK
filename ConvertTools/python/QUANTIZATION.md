@@ -364,3 +364,142 @@ CUDA 实机测试在没有 CUDA 时跳过，tfllm 实机精度和性能仍需目
 SE 的 20 张未回退 MinMax 导出能在 NPU 运行，SDK CPU 校准的平均 cosine 约 0.519，
 tfllm 校准约 0.457，均未达精度目标。这是后端/导出功能验证；
 开启加速校准本身不会解决该模型的 MinMax 量化精度损失。CUDA 精度/性能仍需 GPU 实测。
+
+## 导入 ONNX Runtime 的量化参数
+
+`onnx2tfdl.py --external-qparams-json FILE` 接受
+`Example/Benchmark/se_inception_ort_qparams.py` 导出的 JSON。该脚本调用开源
+ONNX Runtime 的 `quantize_static` 生成 QDQ ONNX，支持 MinMax、Entropy 和 Percentile；
+再从 QDQ 初始化常量导出激活和权重的 `scale`/`zero_point`。对未插入 QDQ 的浮点
+ONNX 张量，使用同一校准算法推导 UINT8 参数，并在 JSON 的 `origin` 中标明来源。
+`Example/Benchmark/se_inception_nncf_qparams.py` 也可从 NNCF QDQ 导出相同格式，
+未被 NNCF 量化的张量使用 ORT MinMax 兜底，并在 `origin` 中注明。
+
+NNCF 导出的 JSON 可额外包含 `precision_policy`。该字段中的
+`float_onnx_outputs` 记录需保留浮点的原 ONNX 输出名，
+`qdq_onnx_sha256` 记录判定所用 QDQ 文件的哈希。生成器从 QDQ 图中寻找
+激活或权重输入没有对应 `DequantizeLinear` 的 Conv/Gemm/MatMul，
+再向前后追踪到 Q/DQ 边界，保留这一段的浮点计算。它不会把
+`Conv → Relu → Q` 误判为浮点卷积，因为 Conv 两个输入都可以从 DQ 来。
+转换器按 ONNX 名映射到 SDK 输出，也保护 Gemm 拆解产生的 SDK 内部
+InnerProduct 输出。映射失败、源 ONNX 哈希不匹配或无效策略会报错。
+
+```json
+{
+  "precision_policy": {
+    "format": "onnx-qdq-float-islands-v1",
+    "qdq_onnx_sha256": "<64 位 SHA-256>",
+    "float_onnx_outputs": ["/block/Concat_output_0", "/block/conv/Conv_output_0"]
+  }
+}
+```
+
+使用该字段时，转换器通过 SDK 图重建显式量化/反量化边界，并核对导出 FB
+中的浮点输出类型；没有该字段的旧 JSON 继续走原生 SDK Quantize。
+`--auto-fallback` 也会把这些浮点区域当作必需回退，不纳入搜索。
+混合 FB 的主干仍可有 INT8 算子，具体数量须检查最终 FB。
+策略只决定哪些输出保留浮点，并不能复制 NNCF 的整数权重、偏置修正或
+精确的 Q/DQ 位置；NPU 实际精度要另行验证。
+
+导入时按 ONNX 输出名映射到转换器记录的 TFDL 张量名，检查 ONNX 与校准输入的 SHA-256，
+然后把激活参数转为有效 `min/max` 传给 SDK `AddInt8Config`。ONNX 图没有对应物的
+TFDL 内部张量仍由所选后端采集范围。这条外部范围导入路径不直接设置激活 `scale/zero_point`，
+也不导入 ORT 权重参数；SDK 会处理共享量化范围并自行量化权重。因此最终 FB 的
+`scale/zero_point` 可能与外部 JSON 不同，应以
+`Example/Benchmark/export_tfdl_qparams.py` 从最终 FB 导出的 JSON 为准。
+
+SE-Inception 的 ORT 与 NNCF 实测命令、逐层参数和 NPU 精度结果见
+`Doc/se_inception_open_source_ptq_20261103.md`；量化 ONNX 与 FB 的逐层差异、
+`MergeConcate` 对照和 `--no-merge-concat` 结果见
+`Doc/se_inception_onnx_fb_alignment_20261103.md`。
+
+## 可选 NNCF 量化优化
+
+客户使用原始浮点 ONNX，加 **`--nncf`** 即可完成 NNCF 校准、量化及原生 TFDL FB
+导出。无需先手动生成量化 ONNX、外部参数 JSON 或调用 QDQ 导入。
+原 `--import-qdq`、`--qdq-native-only` 命令行参数已移除；QDQ 转换现在是内部步骤。
+
+### 安装与启用
+
+NNCF 不加入基础 requirements，不会自动安装。未开启 `--nncf` 时不导入 NNCF，
+原有 SDK/Torch 校准、递归回退和普通模型转换流程继续使用原路径。
+开启后若缺少 NNCF，则停止并提示当前 Python 环境的安装命令，不静默切换算法。
+可选依赖当前固定为已验证的 **NNCF 3.4.0，Python ≥ 3.10**：
+
+```bash
+python3 -m pip install -r ConvertTools/python/requirements-nncf.txt
+```
+
+SE-Inception 示例（在当前 SDK 和用户自行安装 NNCF 的 Python 环境执行）：
+
+```bash
+python3 ConvertTools/python/onnx2tfdl.py \
+  --onnxpath /path/to/SE_Inception_resnet_v2_224_slim.onnx \
+  --output_name /tmp/SE_Inception_resnet_v2 \
+  --quantimgDir /path/to/calibraImgs \
+  --cvtype 0 --mean 0 0 0 --std 255 255 255 \
+  --calibration-count 20 --calibration-threads 8 --nncf --check
+```
+
+不传 `--nncf` 即不启用 NNCF。普通图片读取仍需现有工具链的 OpenCV。
+
+### 校准与预处理
+
+继续使用已有的三种输入，三选一：
+
+- `--quantimgDir DIR`：按种子、类别子目录均衡抽样；`--calibration-count` 默认 20。
+- `--calibration-list FILE`：每行一张图片，路径相对列表文件；使用列表中的全部图片。
+- `--calibration-bin FILE`：已归一化、little-endian FP32 NCHW 数据，使用全部样本。
+
+图片按 `--cvtype` 解码（0=BGR、1=RGB、2=灰度），INTER_LINEAR 缩放后计算
+`(pixel-mean)/std`。mean/std 可各提供一个值或逐通道值；缺省为 0/1。
+导出 FB 使用相同预处理，**输入仍为 FP32 张量**；例如上面的命令使 FB 接收 0–255 BGR。
+二进制已经归一化，不会再次归一化；若同样希望 FB 接收原始像素，二进制命令中仍传
+`--mean 0 0 0 --std 255 255 255`，校验程序会反算回 FB 的输入口径。
+NNCF 要求真实校准数据，不使用随机数据兜底。
+
+NNCF ONNX 校准由 **NNCF 自己的 ORT CPU 后端**执行，采用库默认线程设置；
+`--calibration-threads` 在这条路径中只控制额外的 ORT/TFDL 输出校验。
+NNCF 路径不使用 `--calibration-backend torch-cpu/torch-cuda/tfllm-npu`。
+也不能与 `--auto-fallback`、`--external-qparams-json`、`--fp16`、`--fuse-se-block`、
+`--stoptensor` 或编译校准组合；这些配置会明确报错。
+SEBlock 及其普通转换流程继续保留。
+
+### 导出结果与检查
+
+上述示例生成：
+
+- `/tmp/SE_Inception_resnet_v2.quant.fb`：最终原生 TFDL 模型。
+- `/tmp/SE_Inception_resnet_v2.nncf/report.json`：版本、输入哈希、预处理、源模型与
+  最终 FB 哈希、算子计数、校验结果和状态。
+- 同目录 `model.nncf.onnx`、`import.json`：内部量化图及整数权重/激活参数映射，留作复现。
+
+`--quant-workdir DIR` 可指定报告和中间文件目录。NNCF 使用打包的 `quantize`，
+启用 Fast Bias Correction；因当前原生导入器只支持标量 scale，显式采用逐张量量化。
+不再用 SDK 重采范围或重新量化 NNCF 权重。
+
+默认去掉浮点路径直接相连的 Quant→DeQuant；同一个 Quant 若仍供 INT8 消费者使用则
+保留，整数卷积输出进入浮点算子时保留必要的 DeQuant。部署目标是保留原始浮点值，
+不要求复现 NNCF QDQ 的浮点分支舍入。当前 SE-Inception 为 **109 个原生量化卷积、
+25 个 Quant、54 个 DeQuant、0 个 Custom，直接 Quant→DeQuant 连接为 0**。
+
+`--check` 在校准输入上报告 FP32 ONNX、NNCF ONNX、最终 FB 三者的差异；
+FB 检查在 **TFDL CPU** 上进行。量化后输出可改变，默认只对错误形状、类型、非有限值
+等执行失败；指标不等于分类准确率，也不是 NPU 实测结果。
+支持已有 `--validation-bin`、`--validation-labels`；可继续使用
+`--require-validation-target` 或 `--max-accuracy-loss` 检查独立性和精度门槛。
+此处是最终 FB 验收，不会自动调用 NNCF 的 accuracy-control 重新搜索模型。
+
+当前集成支持单个固定形状、batch=1、C=1 或 3 的 FP32 NCHW 图像输入；动态输入用
+`--input_shapes` 固定。安全 Conv→Relu→Q 区域使用原生 UINT8 卷积，其他受支持算子
+使用原生浮点实现。报告给出实际整数卷积数量；没有该类区域时会提示，不能把任意模型
+都当作已实现全 INT8 加速。
+
+本次实际重跑：原 SE-Inception、20 张相同校准数据，经二进制入口和图片目录入口
+均导出成功；两者内部 NNCF ONNX 与此前已验证模型的 SHA-256 相同。
+图片入口带预处理及 `--check`，20 张 FB 对 FP32 ONNX 的 top1 全部相同。
+当前测试与原始数据见 `Doc/benchmark_data/se_inception_nncf_toolchain_20261103/`。
+此前 500 图 NPU 结果见 `Doc/se_inception_nncf_qdq_cleanup_20261103.md`，未冒充本次新测。
+
+上游接口依据：[NNCF PTQ 用法](https://github.com/openvinotoolkit/nncf/blob/v3.4.0/docs/usage/post_training_compression/post_training_quantization/Usage.md)、
+[ONNX 后端说明](https://github.com/openvinotoolkit/nncf/blob/v3.4.0/docs/usage/post_training_compression/post_training_quantization/ONNX.md)。

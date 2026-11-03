@@ -196,6 +196,7 @@ class Graph:
             for c in self.calls
             if c["outputs"][0] in self.units
             and c["op"] not in safe_uint8
+            and not (c["op"] == "Custom" and c["args"].get("Opname") == "SEBlock")
             and not c["op"].startswith("_symbol_")
         }
         self.ranges = {}

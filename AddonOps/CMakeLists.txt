@@ -15,6 +15,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         "${CMAKE_CURRENT_SOURCE_DIR}/ArmCausalMaskSoftmax.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/ApplyRope.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/RMSNorm.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/SEBlock.cpp"
         PROPERTIES COMPILE_OPTIONS "-O3;-fno-math-errno"
     )
 endif()

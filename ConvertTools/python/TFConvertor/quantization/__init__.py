@@ -49,6 +49,128 @@ def read_images(graph, paths, color, normalized_bin=None):
     return np.ascontiguousarray(a, dtype=np.float32)
 
 
+def overlay_external_qparams(converter, graph, ranges, path, source_onnx, calibration_path, work):
+    """Map external activation QDQ qparams to recorded SDK tensor names.
+
+    SDK AddInt8Config accepts ranges, so these are the QDQ effective endpoints.
+    SDK-only intermediate tensors retain the collector's ranges.
+    """
+    from .graph import sha256
+    from TFDL2 import TFDataType as DT
+
+    source = json.loads(Path(path).read_text())
+    if source.get("format") != "onnxruntime-qdq-qparams-v1":
+        raise ValueError("unsupported external qparams JSON format")
+    if not source_onnx or source.get("source_onnx_sha256") != sha256(source_onnx):
+        raise ValueError("external qparams ONNX SHA-256 differs from the source model")
+    if source.get("calibration_bin_sha256") != sha256(calibration_path):
+        raise ValueError("external qparams calibration inputs differ from this run")
+    params = source.get("activation_qparams")
+    if not isinstance(params, dict):
+        raise ValueError("external qparams JSON lacks activation_qparams")
+    updated = dict(ranges)
+    mapping = {}
+    for onnx_name, qparam in params.items():
+        if onnx_name not in converter.renames:
+            continue
+        sdk_name = str(converter.renames[onnx_name])
+        if sdk_name not in graph.meta or graph.meta[sdk_name]["dtype"] != DT.TFDL_FLOAT:
+            # SDK-only integer/shape tensors are not UINT8 activations.
+            continue
+        scale = np.asarray(qparam.get("scale"), dtype=np.float64)
+        zero = np.asarray(qparam.get("zero_point"), dtype=np.int64)
+        if qparam.get("dtype") != "uint8" or scale.shape != (1,) or zero.shape != (1,):
+            raise ValueError("expected scalar uint8 external activation qparams for " + onnx_name)
+        if not np.isfinite(scale[0]) or scale[0] <= 0 or not 0 <= zero[0] <= 255:
+            raise ValueError("invalid external activation qparams for " + onnx_name)
+        lo, hi = -int(zero[0]) * float(scale[0]), (255 - int(zero[0])) * float(scale[0])
+        if sdk_name in mapping and mapping[sdk_name]["range"] != [lo, hi]:
+            raise ValueError("conflicting ONNX qparams map to " + sdk_name)
+        updated[sdk_name] = (lo, hi)
+        mapping[sdk_name] = dict(
+            onnx_tensor=onnx_name,
+            origin=qparam.get("origin", "external QDQ initializer"),
+            scale=float(scale[0]),
+            zero_point=int(zero[0]),
+            range=[lo, hi],
+        )
+    if not mapping:
+        raise ValueError("no external ONNX activation qparams mapped to SDK tensors")
+    (work / "external-qparam-map.json").write_text(json.dumps(mapping, indent=2))
+    origin_counts = {}
+    for item in mapping.values():
+        origin_counts[item["origin"]] = origin_counts.get(item["origin"], 0) + 1
+    summary = dict(
+        path=str(Path(path).resolve()),
+        sha256=sha256(path),
+        sdk_tensors=len(graph.meta),
+        mapped=len(mapping),
+        mapped_by_origin=origin_counts,
+        sdk_collector_fallback=len(graph.meta) - len(mapping),
+        sdk_collector_fallback_names=sorted(set(graph.meta) - set(mapping)),
+        external_weight_qparams_available=len(source.get("weight_qparams", {})),
+        external_weight_qparams_imported=0,
+        note="SDK AddInt8Config accepts min/max; SDK chooses final scales and quantizes weights itself",
+    )
+    float_units = set()
+    policy = source.get("precision_policy")
+    if policy is not None:
+        if not isinstance(policy, dict) or policy.get("format") != "onnx-qdq-float-islands-v1":
+            raise ValueError("unsupported external precision_policy format")
+        outputs = policy.get("float_onnx_outputs")
+        if (not isinstance(outputs, list)
+                or any(not isinstance(name, str) or not name for name in outputs)
+                or len(outputs) != len(set(outputs))):
+            raise ValueError("precision_policy requires unique ONNX float outputs")
+        qdq_digest = policy.get("qdq_onnx_sha256")
+        if not isinstance(qdq_digest, str) or len(qdq_digest) != 64:
+            raise ValueError("precision_policy requires QDQ ONNX SHA-256")
+        qdq_path = source.get("nncf_qdq_model")
+        if qdq_path and Path(qdq_path).is_file() and sha256(qdq_path) != qdq_digest:
+            raise ValueError("precision_policy QDQ ONNX SHA-256 mismatch")
+        missing = [name for name in outputs if name not in converter.renames]
+        if missing:
+            raise ValueError("precision_policy ONNX outputs were not converted: "
+                             + ", ".join(missing[:5]))
+        for name in outputs:
+            sdk_name = str(converter.renames[name])
+            if (sdk_name not in graph.meta
+                    or graph.meta[sdk_name]["dtype"] != DT.TFDL_FLOAT):
+                raise ValueError("precision_policy mapped to a non-FP32 SDK output: "
+                                 + name + " -> " + sdk_name)
+            float_units.add(sdk_name)
+        # Some ONNX operators expand into multiple SDK calls. Gemm, for
+        # example, becomes InnerProduct2 + Squeeze, while renames points to
+        # Squeeze. Preserve the unmapped internal producer as well.
+        from .graph import refs
+        onnx_sdk_outputs = set(map(str, converter.renames.values()))
+        units = set(graph.units)
+        calls_by_output = {
+            output: call for call in graph.calls for output in call["outputs"]
+        }
+        frontier = list(float_units)
+        internal_units = set()
+        while frontier:
+            call = calls_by_output[frontier.pop()]
+            for producer in refs(call["args"]):
+                if (producer in units and producer not in onnx_sdk_outputs
+                        and producer not in float_units):
+                    float_units.add(producer)
+                    internal_units.add(producer)
+                    frontier.append(producer)
+        summary["precision_policy"] = dict(
+            format=policy["format"],
+            qdq_onnx_sha256=qdq_digest,
+            float_onnx_outputs=len(outputs),
+            float_sdk_units=len(float_units),
+            float_sdk_internal_units=len(internal_units),
+            float_sdk_names=sorted(float_units),
+            seed_nodes=policy.get("seed_nodes", []),
+            note="Preserves selected float islands; external ranges still do not import exact weight qparams",
+        )
+    return updated, summary, float_units
+
+
 def quantize(
     converter,
     calibration_list,
@@ -178,14 +300,28 @@ def quantize(
         else:
             raise ValueError("unknown calibration backend")
 
+        policy_float_units = set()
+        if options.get("external_qparams_json"):
+            ranges, report["external_qparams"], policy_float_units = overlay_external_qparams(
+                converter,
+                graph,
+                ranges,
+                options["external_qparams_json"],
+                options.get("source_onnx"),
+                work / "calibration.f32",
+                work,
+            )
+
         # Without auto_fallback, retain the original SDK Quantize path and
         # its avoid/stop semantics regardless of the selected collector.
         def mapped(names):
             return {str(converter.nodeMap.get(n, n)) for n in names}
 
-        avoid_units, stop_units = mapped(avoids), mapped(stops)
+        avoid_units, stop_units = mapped(avoids) | policy_float_units, mapped(stops)
         if (avoid_units | stop_units) - set(graph.meta):
             raise ValueError("unknown avoid/stop node")
+        if policy_float_units - set(graph.units):
+            raise ValueError("precision_policy selected a non-quantizable SDK unit")
         input_types = {graph.input_name: DT.TFDL_UINT8}
         if quant_input:
             input_types = {
@@ -196,7 +332,7 @@ def quantize(
                 iter(input_types.values())
             ) not in (DT.TFDL_FLOAT, DT.TFDL_UINT8):
                 raise ValueError("expected the model input with type FP32 or UINT8")
-        if auto_fallback:
+        if auto_fallback or policy_float_units:
             graph.set_ranges(ranges, merge_concat)
         else:
             graph.register_ranges(ranges)
@@ -229,7 +365,32 @@ def quantize(
             backend=backend,
         )
         if not auto_fallback:
-            converter._context = graph.context
+            if policy_float_units:
+                # The SDK's native Quantize may optimize away avoidtensors.
+                # Replay the graph with explicit output types and Q/DQ edges.
+                converter._context = graph.build(avoid_units, input_type=next(iter(input_types.values())))
+                exported = set(converter._context.GetAllTensorNames())
+                missing = policy_float_units - exported
+                if missing:
+                    raise RuntimeError("precision_policy outputs are absent from the FB: "
+                                       + ", ".join(sorted(missing)[:5]))
+                from TFDL2 import TFDataType
+                wrong = [name for name in policy_float_units
+                         if converter._context.GetTensorByName(name).dtype != TFDataType.TFDL_FLOAT]
+                if wrong:
+                    raise RuntimeError("precision_policy outputs are not float in the FB: "
+                                       + ", ".join(sorted(wrong)[:5]))
+                (work / "profile.json").write_text(json.dumps(dict(
+                    floating_units=sorted(avoid_units | graph.forced_float),
+                    weight_precision="fp32",
+                    unit="recorded SDK Op",
+                ), indent=2))
+                report["precision_policy_export"] = dict(
+                    requested_float_sdk_units=len(policy_float_units),
+                    exported_float_sdk_units=len(policy_float_units),
+                )
+            else:
+                converter._context = graph.context
             converter._context.Dump(str(work / "model.quant"))
             report.update(
                 status="quantized",

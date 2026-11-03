@@ -33,17 +33,60 @@ class InputShapeAction(argparse.Action):
         setattr(namespace, self.dest, result)
 
 
+def calibration_images(args):
+    """Use the same deterministic image selection for SDK and NNCF PTQ."""
+    if args.calibration_list:
+        base = Path(args.calibration_list).resolve().parent
+        return [str((base / Path(s.strip()).expanduser()).resolve())
+                for s in Path(args.calibration_list).read_text().splitlines() if s.strip()]
+    if not args.quantimgDir:
+        return None
+    extensions = {".jpg", ".jpeg", ".png", ".bmp"}
+    folder = Path(args.quantimgDir).expanduser()
+    groups = [sorted(str(p) for p in d.rglob("*") if p.suffix.lower() in extensions)
+              for d in sorted(folder.iterdir()) if d.is_dir()]
+    groups = [g for g in groups if g]
+    if not groups:
+        groups = [sorted(str(p) for p in folder.rglob("*") if p.suffix.lower() in extensions)]
+    rng = random.Random(args.seed)
+    images = []
+    if args.calibration_count < len(groups):
+        raise ValueError("calibration-count must cover all class folders")
+    for k, group in enumerate(groups):
+        count = args.calibration_count // len(groups) + (k < args.calibration_count % len(groups))
+        if len(group) < count:
+            raise ValueError("not enough calibration images")
+        images.extend(rng.sample(group, count))
+    rng.shuffle(images)
+    return images
+
+
 def from_onnx(args):
     assert args.onnxpath is not None
     destination = Path(args.output_name).expanduser()
     destination.parent.mkdir(parents=True, exist_ok=True)
+    if getattr(args, 'nncf', False):
+        from TFConvertor.quantization.nncf_backend import convert_with_nncf
+        return convert_with_nncf(args, destination, calibration_images)
     convertor = OnnxConvertor(destination.name)
     convertor.load(args.onnxpath, stoptensor=args.stoptensor)
-    # 这里后面可以使用自定义的模型优化器，比如合并算子，剪枝算子等
-    convertor.optmize()  # ([custom1,custom3])#([custom1,custom2])
-    # 这里可以注册自定义的节点转换器，比如自定义的节点类型，或者需要特殊处理的节点类型，后面函数的书写方法参考customop.py
-    # convertor.registorCustomNodeConvertor("PPScatterPlugin",PillarScatterPlugin)
-    # convertor.registorCustomNodeConvertor("Optimize1",Optimize1)
+    if args.fuse_se_block:
+        from TFDL2.utils import LoadCustomOp
+        from TFConvertor.Optimize.MergeSEBlock import (
+            convert_se_block, merge_se_blocks,
+        )
+
+        addon_path = Path(args.addon_path).expanduser().resolve()
+        if not addon_path.is_file():
+            raise FileNotFoundError("SEBlock custom op library: " + str(addon_path))
+        LoadCustomOp(str(addon_path))
+        convertor.registorCustomNodeConvertor("SEBlock", convert_se_block)
+        convertor.optmize([merge_se_blocks])
+        if not convertor.se_block_fusion["count"]:
+            raise RuntimeError("--fuse-se-block found no matching SE branch")
+        print("Fused SE blocks:", convertor.se_block_fusion["count"])
+    else:
+        convertor.optmize()
 
     convertor.buildTFmodel(inputshape=args.input_shapes, std=args.std, mean=args.mean)
     if (
@@ -52,6 +95,7 @@ def from_onnx(args):
         or args.calibration_list
         or args.calibration_bin
         or args.validation_bin
+        or args.external_qparams_json
     ):
         if args.fp16:
             raise ValueError(
@@ -60,46 +104,7 @@ def from_onnx(args):
         if args.check and not convertor.verification(targetModel=args.testonnxpath):
             raise RuntimeError("ONNX conversion verification failed")
         convertor.dump(str(destination))
-        if args.calibration_list:
-            base = Path(args.calibration_list).resolve().parent
-            imglist = [
-                str((base / Path(s.strip()).expanduser()).resolve())
-                for s in Path(args.calibration_list).read_text().splitlines()
-                if s.strip()
-            ]
-        elif args.quantimgDir:
-            groups = [
-                sorted(
-                    str(p)
-                    for p in d.rglob("*")
-                    if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp"}
-                )
-                for d in sorted(Path(args.quantimgDir).iterdir())
-                if d.is_dir()
-            ]
-            groups = [g for g in groups if g]
-            if not groups:
-                groups = [
-                    sorted(
-                        str(p)
-                        for p in Path(args.quantimgDir).rglob("*")
-                        if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp"}
-                    )
-                ]
-            rng = random.Random(args.seed)
-            imglist = []
-            if args.calibration_count < len(groups):
-                raise ValueError("calibration-count must cover all class folders")
-            for k, g in enumerate(groups):
-                n = args.calibration_count // len(groups) + (
-                    k < args.calibration_count % len(groups)
-                )
-                if len(g) < n:
-                    raise ValueError("not enough calibration images")
-                imglist.extend(rng.sample(g, n))
-            rng.shuffle(imglist)
-        else:
-            imglist = None
+        imglist = calibration_images(args)
         options = dict(
             source_onnx=args.onnxpath,
             calibration_bin=args.calibration_bin,
@@ -117,6 +122,7 @@ def from_onnx(args):
             validation_labels=args.validation_labels,
             require_validation_target=args.require_validation_target,
             max_accuracy_loss=args.max_accuracy_loss,
+            external_qparams_json=args.external_qparams_json,
         )
         convertor.quantContext(
             calibration_list=imglist,
@@ -180,7 +186,18 @@ if __name__ == "__main__":
         help="如果onnx模型是修改过的无法直接forward,此时使用这个备用onnx模型地址,如果没有修改onnx则不需要指定此参数",
     )
     parser.add_argument("--output_name", type=str, help="导出模型名称", required=True)
+    parser.add_argument(
+        "--fuse-se-block", action="store_true",
+        help="replace structurally matched SE branches with the floating-point SEBlock custom op",
+    )
+    parser.add_argument(
+        "--addon-path",
+        default=str(Path(__file__).resolve().parents[2] / "AddonOps/build/libTFDLAddOn.so"),
+        help="custom op library used by --fuse-se-block",
+    )
     parser.add_argument("--fp16", action="store_true", help="将fp32模型降为半精度")
+    parser.add_argument("--nncf", action="store_true",
+                        help="enable optional NNCF ONNX PTQ and export a native TFDL .quant.fb; requires user-installed nncf")
     parser.add_argument(
         "--stoptensor", type=str, nargs="+", help="模型转化停止节点名称", default=None
     )
@@ -244,6 +261,10 @@ if __name__ == "__main__":
     parser.add_argument("--tolerate", type=int, default=16,
                         help="stop after this many new candidates without reducing feasible float units; 0 disables")
     parser.add_argument("--quant-workdir")
+    parser.add_argument(
+        "--external-qparams-json",
+        help="external QDQ scale/zero-point JSON with optional precision_policy for float islands",
+    )
     parser.add_argument("--seed", type=int, default=20261027)
     parser.add_argument("--chip", type=int, default=0)
     parser.add_argument("--no-merge-concat", action="store_true")
@@ -297,4 +318,9 @@ if __name__ == "__main__":
         parser.error(
             "choose one calibration source: --calibration-bin, --calibration-list, or --quantimgDir"
         )
-    from_onnx(args)
+    try:
+        from_onnx(args)
+    except (ImportError, ValueError, RuntimeError) as error:
+        if args.nncf:
+            parser.exit(2, str(error) + "\n")
+        raise
