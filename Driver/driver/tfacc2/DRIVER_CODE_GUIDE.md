@@ -1,6 +1,6 @@
 # TFACC2 Linux 驱动源码导读
 
-> 对应驱动版本：`0.8.0`  
+> 对应驱动版本：`0.9.0`\
 > 主要源码：[tfacc2.c](./tfacc2.c)、[tfacc2.h](./tfacc2.h)、
 > [tfacc_hugepage_uapi.h](./tfacc_hugepage_uapi.h)、
 > [tfacc_cache_uapi.h](./tfacc_cache_uapi.h)、
@@ -230,7 +230,7 @@ return error
 
 ### 4.1 模块元数据和调试宏
 
-- `DRIVER_VERSION` 是模块版本，当前为 `0.8.0`；
+- `DRIVER_VERSION` 是模块版本，当前为 `0.9.0`；
 - `MODULE_AUTHOR/DESCRIPTION/LICENSE/VERSION` 会进入 `.ko` 元数据；
 - `DPRINTK` 仅在定义 `TF_DEBUG` 时输出；
 - `assert` 和 `DASSERT2` 也是调试日志，不会像用户态 `assert()` 那样终止执行。
@@ -782,7 +782,7 @@ chip 和 ID。越过末尾返回 `-ENOENT`，用户工具用它作为列表结�
 
 #### `tf_ioctl_model_pool_alloc(dev, arg)`
 
-这是 0.8.0 的构建期模型池入口。`requested_high=AUTO` 时，它遍历硬件支持的
+这是 0.9.0 的构建期模型池入口。`requested_high=AUTO` 时，它遍历硬件支持的
 8-bit high，选择“容量足够且剩余最大”的窗口；后续调用传回这个确定 high。
 一次 ioctl 只返回一个连续段，优先选择当前最大的段，最大不超过 `int len` 能表达
 的范围。函数更新对应 backend 的 bump offset，建立 `kbuf/mmap_id`，先做完整

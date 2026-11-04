@@ -22,7 +22,7 @@
 #include <linux/version.h>
 //#include <asm/outercache.h>
 
-#define DRIVER_VERSION          "0.8.0"
+#define DRIVER_VERSION          "0.9.0"
 #ifdef CONFIG_ACPI
 #define MODNAME                 "tfacc2_ACPI"
 #else
