@@ -29,8 +29,12 @@ def MergeHardSigmoidOnnx(Model:TFConvertor):
             if matchnodes is None:
                 continue
             removeNodes.extend([node.name for node in matchnodes[:-1]])
-            nodes[index+2].inputs = [nodes[index].inputs[0]]
-            nodes[index+2].op = "HardSigmoid"
+            fused = matchnodes[-1]
+            fused.inputs = [matchnodes[0].inputs[0]]
+            fused.op = "HardSigmoid"
+            # clamp(x + 3, 0, 6) / 6 has a different slope from ONNX's
+            # default HardSigmoid; keep the synthesized parameters explicit.
+            fused.attr = {"alpha": 1.0 / 6.0, "beta": 0.5}
 
 
 
@@ -39,4 +43,3 @@ def MergeHardSigmoidOnnx(Model:TFConvertor):
             if iname in Model.params:
                 del Model.params[iname]
         Model.nodes.pop(node)
-

@@ -412,9 +412,10 @@ class ActivationParser(OnnxParser):
         elif node.op == "Mish":
             return Mish(args[0])
         elif node.op == "HardSigmoid":
-            if "alpha" in node.attr or "beta" in node.attr:
-                return HardSigmoid2(args[0],node.attr['alpha'] if "alpha" in node.attr else 1.0,node.attr['beta'] if "beta" in node.attr else 0.0)
-            return HardSigmoid(args[0])
+            # ONNX defaults differ from the SDK's fixed x/6 + 0.5 variant.
+            # Pass both parameters even when the ONNX omits either attribute.
+            return HardSigmoid2(args[0], node.attr.get("alpha", 0.2),
+                                node.attr.get("beta", 0.5))
         elif node.op == "HardSwish":
             return HardSwish(args[0])
         elif node.op == "GeLU":
@@ -546,6 +547,23 @@ def _static_tensor_value(graph, tensor_name, stack=None):
             }
             if node.attr.get("to") in dtype_map:
                 result = values[0].astype(dtype_map[node.attr["to"]])
+        elif node.op == "Sqrt" and len(values) == 1 and values[0] is not None:
+            result = np.sqrt(values[0])
+        elif node.op == "ConstantOfShape" and len(values) == 1 and values[0] is not None:
+            shape = tuple(int(v) for v in values[0].reshape(-1))
+            # Bound allocation before materializing an exported Expand shape.
+            if all(v >= 0 for v in shape) and np.prod(shape, dtype=object) <= 4096:
+                value = np.asarray(node.attr.get("value", np.array([0.], np.float32)))
+                if value.size == 1:
+                    result = np.full(shape, value.reshape(-1)[0], dtype=value.dtype)
+        elif node.op == "Equal" and len(values) == 2 and all(v is not None for v in values):
+            result = np.equal(values[0], values[1])
+        elif node.op == "Where" and len(values) == 3 and all(v is not None for v in values):
+            result = np.where(*values)
+        elif node.op == "Expand" and len(values) == 2 and all(v is not None for v in values):
+            shape = np.broadcast_shapes(values[0].shape, tuple(int(v) for v in values[1].reshape(-1)))
+            if np.prod(shape, dtype=object) <= 4096:
+                result = np.broadcast_to(values[0], shape)
         elif node.op == "Reshape" and len(values) == 2 and all(value is not None for value in values):
             result = np.reshape(values[0], tuple(int(value) for value in values[1].reshape(-1)))
         elif node.op == "Transpose" and values and values[0] is not None:
@@ -585,7 +603,8 @@ def FoldStaticShapeSubgraphsOnnx(graph):
 
     foldable_ops = {
         "Shape", "Gather", "Unsqueeze", "Squeeze", "Concat", "Add", "Sub",
-        "Mul", "Div", "Mod", "Cast", "Reshape", "Slice", "Transpose",
+        "Mul", "Div", "Mod", "Cast", "Reshape", "Slice", "Transpose", "Sqrt",
+        "ConstantOfShape", "Equal", "Where", "Expand",
     }
     graph._static_tensor_cache = {}
     graph._onnx_producers = {
@@ -829,6 +848,10 @@ class MathOpParser(OnnxParser):
     def _impl_v11(cls,*args,node:NodeConvertor):
         if node.op == "Floor":
             return Floor(args[0])
+        elif node.op == "Sqrt":
+            return Sqrt(args[0])
+        elif node.op == "Erf":
+            return MathOp(args[0],MathOpType.MathErf)
         elif node.op == "Equal":
             assert len(args) == 2
             return EQ(args[0],args[1])
@@ -956,6 +979,8 @@ def _get_convert_map(opset):
         "Cast":CastParser.get_converter(opset),
         "Unsqueeze":UnsqueezeParser.get_converter(opset),
         "Floor":MathOpParser.get_converter(opset),
+        "Sqrt":MathOpParser.get_converter(opset),
+        "Erf":MathOpParser.get_converter(opset),
         "Equal":MathOpParser.get_converter(opset),
         "Mod":MathOpParser.get_converter(opset),
         "Cos":MathOpParser.get_converter(opset),
@@ -1111,7 +1136,12 @@ class OnnxConvertor(TFConvertor):
         for name in removeParams:
             del self.params[name]
 
-    def optmize(self,CustomOptimize:list=[]):
+    def optmize(self,CustomOptimize:list=[], *, preserve_quantization=False, protected_parameters=()):
+        if preserve_quantization:
+            if CustomOptimize:
+                raise ValueError('CustomOptimize is not supported with preserve_quantization')
+            from .Optimize.QuantizedGraph import OptimizeQuantizedOnnx
+            return OptimizeQuantizedOnnx(self, FoldStaticShapeSubgraphsOnnx, protected_parameters)
         Clip2RuLUXOnnx(self)
         #ReplaceDilationConv(self)
         ReshapConvTransposeWeightOnnx(self)

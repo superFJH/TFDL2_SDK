@@ -1,7 +1,9 @@
 """Import an ONNX QDQ graph without calibration or reselecting its qparams.
 
 Safe Conv/Relu/Q regions use native quantized Conv with UINT8 output and fused
-ReLU. Float consumers bypass direct Quantize/Dequantize roundtrips and use the
+ReLU. Other QDQ Conv regions use native integer inputs/weights and FP32 output
+without adding an uncalibrated output quantizer. Float consumers bypass direct
+Quantize/Dequantize roundtrips and use the
 pre-Quant FP32 values. Integer consumers retain their quantized inputs and
 source qparams. Floating regions use native operators with the dequantized
 original weights and corrected biases.
@@ -38,11 +40,9 @@ def scalar_qparams(node, initializers):
     return value, int(zero.reshape(-1)[0]) + offset, offset
 
 
-def import_qdq(path, name, input_shapes=None, mean=None, std=None):
+def import_qdq(path, name, input_shapes=None, mean=None, std=None, input_quantization=None):
     from TFDL2 import TFContext, TFDataType, Op
     from ..onnxConvertor import OnnxConvertor
-    from ..Optimize.PrepareParam import ReshapGemmWeightOnnx
-    from ..Optimize.MergeBatchnorm import ReplaceBatchNorm
 
     if not hasattr(TFContext, 'SetQuantization'):
         raise RuntimeError("strict QDQ import requires the SDK Python SetQuantization binding")
@@ -91,22 +91,77 @@ def import_qdq(path, name, input_shapes=None, mean=None, std=None):
     if not any(node.op_type == 'QuantizeLinear' for node in kept):
         raise ValueError("NNCF QDQ import requires activation QuantizeLinear nodes")
 
+    # Optimize before planning dependencies: a fused GeLU/Swish or a folded
+    # shape expression must no longer depend on the removed source nodes.
+    with tempfile.TemporaryDirectory(prefix='tfdl_qdq_') as temporary:
+        source = Path(temporary) / 'prepared.onnx'
+        onnx.save(prepared, source)
+        converter = OnnxConvertor(name)
+        converter.load(str(source))
+    for input_name, shape in (input_shapes or {}).items():
+        converter.inputs[input_name]['shape'] = list(shape)
+        converter.tensor_shapes[input_name] = list(shape)
+    protected_weights = {n.input[1] for n in original.graph.node if n.op_type == 'Conv'
+                         and n.input[1] in quantized_weights}
+    optimization = converter.optmize(preserve_quantization=True,
+                                    protected_parameters=protected_weights)
+
     # Plan the effective dependencies before creating SDK nodes. A quantized
     # Conv consumes the UINT8 tensor before DQ; creating every original DQ
     # first leaves orphan float tensors (and costly dead SDK operations).
+    # NNCF propagates a shared quantization range across layout operations.
+    # A Conv after Concat/Split/Reshape still consumes quantized values even
+    # though there is no DQ immediately adjacent to it. Track an integer view
+    # separately from the original float view used by genuine float branches.
+    integer_views = {}
+    def integer_view(tensor_name):
+        if tensor_name in integer_views:
+            return integer_views[tensor_name]
+        integer_views[tensor_name] = None
+        node = original_nodes.get(tensor_name)
+        if node is None:
+            return None
+        if node.op_type == 'DequantizeLinear' and node.input[0] not in initializers:
+            result = dict(kind='quantized', source=node.input[0],
+                          qparams=scalar_qparams(node, initializers)[:2])
+        elif node.op_type in ('Concat','Split','Reshape','Transpose','MaxPool','Resize','Slice'):
+            if node.op_type == 'Resize':
+                mode = next((onnx.helper.get_attribute_value(a) for a in node.attribute if a.name=='mode'),b'nearest')
+                if mode != b'nearest':
+                    return None
+            inputs = list(node.input) if node.op_type=='Concat' else [node.input[0]]
+            parents = [integer_view(n) for n in inputs]
+            if any(p is None for p in parents) or len({p['qparams'] for p in parents}) != 1:
+                return None
+            result = dict(kind='layout', source=tensor_name, node=node,
+                          inputs=inputs, qparams=parents[0]['qparams'])
+        else:
+            return None
+        integer_views[tensor_name] = result
+        return result
+
+    def integer_dependencies(tensor_name):
+        view = integer_view(tensor_name)
+        if view['kind']=='quantized':
+            return [view['source']]
+        return [n for parent in view['inputs'] for n in integer_dependencies(parent)]
+
     integer_convs = {}
     aliases = {}
-    dependencies = {output:list(n.input) for n in original.graph.node for output in n.output}
-    for output, region in conv_regions.items():
-        conv = original_nodes[output]
-        dq = original_nodes.get(conv.input[0])
-        if (dq is not None
-                and dq.op_type == 'DequantizeLinear' and conv.input[1] in quantized_weights):
+    dependencies = {output:list(n.inputs) for n in converter.nodes.values() for output in n.outputs}
+    for conv in original.graph.node:
+        if conv.op_type != 'Conv':
+            continue
+        output = conv.output[0]
+        view = integer_view(conv.input[0])
+        if view is not None and conv.input[1] in quantized_weights:
+            region = conv_regions.get(output)
             integer_convs[output] = region
-            dependencies[output] = [dq.input[0]] + list(conv.input[1:])
-            relu,quantizer = region
-            aliases[relu.output[0]] = output
-            aliases[quantizer.output[0]] = output
+            dependencies[output] = integer_dependencies(conv.input[0]) + list(conv.input[1:])
+            if region is not None:
+                relu,quantizer = region
+                aliases[relu.output[0]] = output
+                aliases[quantizer.output[0]] = output
     float_bypasses = {}
     for node in kept:
         if node.op_type != 'DequantizeLinear':
@@ -122,6 +177,34 @@ def import_qdq(path, name, input_shapes=None, mean=None, std=None):
             float_bypasses[node.output[0]] = q.input[0]
             aliases[node.output[0]] = q.input[0]
 
+    # SetInput already holds normalized UINT8 codes. A source input Q with
+    # those same parameters is the input tensor itself, not DQ(input) -> Q.
+    # Cut its float dependency before liveness analysis so a decoded input is
+    # only created when a surviving float branch actually consumes it.
+    input_quantizers = {}
+    for node in kept:
+        if node.op_type != 'QuantizeLinear':
+            continue
+        qparams = (input_quantization or {}).get(node.input[0])
+        if qparams is None:
+            continue
+        scale, zero, _ = scalar_qparams(node, initializers)
+        if scale == qparams['scale'] and zero == qparams['zero_point']:
+            # The current SDK's direct input Conv specialization does not
+            # support normalized codes with nonuniform image preprocessing.
+            # The NNCF frontend uses a separate input range for that case.
+            direct_conv = any(integer_view(original_nodes[output].input[0])['kind']=='quantized'
+                and integer_view(original_nodes[output].input[0])['source']==node.output[0]
+                for output in integer_convs)
+            if (direct_conv and mean is not None and std is not None
+                    and (np.any(np.asarray(mean) != 0)
+                         or np.any(np.asarray(std) != np.asarray(std)[0]))):
+                raise ValueError('SDK direct UINT8 input Conv does not support folded '
+                    'input Q with nonzero means or unequal channel stds; use a distinct '
+                    'input quantization range to retain the preprocessing boundary')
+            input_quantizers[node.output[0]] = node.input[0]
+            dependencies[node.output[0]] = []
+
     def canonical(tensor_name):
         while tensor_name in aliases:
             tensor_name = aliases[tensor_name]
@@ -136,20 +219,6 @@ def import_qdq(path, name, input_shapes=None, mean=None, std=None):
         needed.add(tensor_name)
         pending.extend(dependencies.get(tensor_name,()))
 
-    # Use the existing float parsers without running graph calibration or
-    # ordinary fusion passes across the remaining integer boundaries.
-    with tempfile.TemporaryDirectory(prefix='tfdl_qdq_') as temporary:
-        source = Path(temporary) / 'prepared.onnx'
-        onnx.save(prepared, source)
-        converter = OnnxConvertor(name)
-        converter.load(str(source))
-    ReplaceBatchNorm(converter)
-    for node in converter.nodes.values():
-        if node.op == 'Gemm' and (node.attr.get('alpha',1.)!=1. or node.attr.get('beta',1.)!=1.
-                                  or node.attr.get('transA',0)):
-            raise ValueError('strict QDQ Gemm currently requires alpha=beta=1 and transA=0')
-    ReshapGemmWeightOnnx(converter)
-
     context = TFContext(name)
     symbols = {}
     fused_quantizers = {}
@@ -158,10 +227,12 @@ def import_qdq(path, name, input_shapes=None, mean=None, std=None):
               'source_sha256': hashlib.sha256(Path(path).read_bytes()).hexdigest(),
               'integer_kernels': True, 'native_only': True,
               'bypass_float_roundtrips':True,
+              'optimization':optimization,
               'rounding_semantics_preserved':False,
               'removed_source_nodes':[], 'bypassed_float_roundtrips':[],
-              'sdk_expand_connections':[],
-              'operators': {}, 'quantizers': [], 'native_conv_regions': [],
+              'sdk_expand_connections':[], 'sdk_opaque_connections':[],
+              'folded_input_quantizers':[], 'integer_layout_views':[],
+              'operators': {}, 'inputs': [], 'quantizers': [], 'native_conv_regions': [],
               'integer_weights': [], 'mapping': {}, 'float_reduction_backend': 'sdk'}
     counts = Counter()
 
@@ -176,6 +247,46 @@ def import_qdq(path, name, input_shapes=None, mean=None, std=None):
         if not tensor_name or tensor_name == 'ISNULL':
             return None
         return parameter(tensor_name) if tensor_name in converter.params else symbols[tensor_name]
+
+    converter_nodes = {o:n for n in converter.nodes.values() for o in n.outputs}
+    resolved_integer_views = {}
+    def resolve_integer(tensor_name):
+        if tensor_name in resolved_integer_views:
+            return resolved_integer_views[tensor_name]
+        view = integer_view(tensor_name)
+        if view['kind']=='quantized':
+            return resolve(view['source'])
+        node = converter_nodes[tensor_name]
+        integer_inputs = [resolve_integer(n) for n in view['inputs']]
+        arguments = (integer_inputs if node.op=='Concat' else
+                     integer_inputs + [resolve(n) for n in node.inputs[1:]])
+        if node.op=='Split':
+            # Only create the requested integer slice. A full multi-output
+            # Split can leave unused terminal tensors when another branch
+            # needs only the original float view.
+            lengths = node.attr.get('split')
+            if lengths is None:
+                lengths = np.asarray(converter.params[node.inputs[1]]).reshape(-1).tolist()
+            index = node.outputs.index(tensor_name)
+            start = sum(lengths[:index])
+            value = Op.Crop3(integer_inputs[0],((start,start+lengths[index]-1,1),),node.attr['axis'])
+            scale,zero = view['qparams']
+            context.SetQuantization(str(value),scale,zero)
+            resolved_integer_views[tensor_name] = value
+            report['integer_layout_views'].append({'onnx':tensor_name,'sdk':str(value),
+                'op':'Split','scale':scale,'zero_point':zero})
+            counts['integer_Split'] += 1
+            return value
+        value = node(*arguments)
+        outputs = list(value) if isinstance(value,(list,tuple)) else [value]
+        scale,zero = view['qparams']
+        for name,sdk in zip(node.outputs,outputs):
+            context.SetQuantization(str(sdk),scale,zero)
+            resolved_integer_views[name] = sdk
+            report['integer_layout_views'].append({'onnx':name,'sdk':str(sdk),
+                'op':node.op,'scale':scale,'zero_point':zero})
+        counts['integer_'+node.op] += 1
+        return resolved_integer_views[tensor_name]
 
     def integer_weight(node, index):
         weight_name = node.inputs[1]
@@ -197,14 +308,33 @@ def import_qdq(path, name, input_shapes=None, mean=None, std=None):
     with context:
         for input_name, attrs in converter.inputs.items():
             if attrs['dtype'] != TFDataType.TFDL_FLOAT:
-                raise ValueError('strict QDQ public inputs currently require FP32')
+                raise ValueError('QDQ source ONNX inputs currently require FP32')
             shape = tuple((input_shapes or {}).get(input_name, attrs['shape']))
             preprocessing = {}
             if mean is not None or std is not None:
                 if mean is None or std is None:
                     raise ValueError('internal preprocessing requires both mean and std')
                 preprocessing = dict(mean=tuple(mean),scale=tuple(1.0/np.asarray(std)))
-            symbols[input_name] = Op.Placeholder2(context, shape, attrs['dtype'], **preprocessing)
+            qparams = (input_quantization or {}).get(input_name)
+            dtype = TFDataType.TFDL_UINT8 if qparams is not None else attrs['dtype']
+            placeholder = Op.Placeholder2(context, shape, dtype, **preprocessing)
+            if qparams is not None:
+                if not context.SetQuantization(str(placeholder),qparams['scale'],qparams['zero_point']):
+                    raise RuntimeError('could not register UINT8 input parameters: '+input_name)
+                symbols[input_name] = (Op.DeQuantize(placeholder)
+                    if input_name in needed else placeholder)
+                for quantizer, source_input in input_quantizers.items():
+                    if source_input == input_name and quantizer in needed:
+                        fused_quantizers[quantizer] = placeholder
+                        report['folded_input_quantizers'].append({
+                            'onnx':quantizer,'input':input_name,'sdk':str(placeholder),
+                            'scale':qparams['scale'],'zero_point':qparams['zero_point']})
+            else:
+                symbols[input_name] = placeholder
+            report['inputs'].append({'onnx':input_name,'sdk':str(placeholder),
+                'dtype':'uint8' if qparams is not None else 'float32',
+                'shape':list(shape),'mean':list(mean) if mean is not None else None,
+                'scale':preprocessing.get('scale'), 'quantization':qparams})
         for index, node in enumerate(converter.nodes.values()):
             if not any(canonical(output) in needed for output in node.outputs):
                 report['removed_source_nodes'].append({'name':node.name,'op':node.op,
@@ -238,11 +368,24 @@ def import_qdq(path, name, input_shapes=None, mean=None, std=None):
                 if q_record is None or q_record['scale'] != scale or q_record['zero_point'] != zero:
                     raise ValueError('Q/DQ with different parameters is not supported: ' + node.name)
                 output = Op.DeQuantize(input_symbol)
+            elif node.op == 'Split':
+                lengths = node.attr.get('split')
+                if lengths is None:
+                    lengths = np.asarray(converter.params[node.inputs[1]]).reshape(-1).tolist()
+                activation = resolve(node.inputs[0])
+                for part, onnx_name in enumerate(node.outputs):
+                    if canonical(onnx_name) not in needed:
+                        continue
+                    start = sum(lengths[:part])
+                    value = Op.Crop3(activation,((start,start+lengths[part]-1,1),),node.attr['axis'])
+                    symbols[onnx_name] = value
+                    report['mapping'][onnx_name] = str(value)
+                counts['Split'] += 1
+                continue
             else:
-                input_dq = original_nodes.get(node.inputs[0]) if node.inputs else None
                 native_integer = node.outputs[0] in integer_convs
                 if native_integer:
-                    activation = resolve(input_dq.input[0])
+                    activation = resolve_integer(node.inputs[0])
                     weight = integer_weight(node, index)
                     attr = node.attr
                     pads = attr.get('pads', [0, 0, 0, 0])
@@ -256,7 +399,7 @@ def import_qdq(path, name, input_shapes=None, mean=None, std=None):
                         pad_array = np.array([0,0,pads[0],pads[1],0,0,pads[2],pads[3]],np.int64)
                         context.RegisterParamToContext(**{pad_name: pad_array})
                         activation = Op.Pad2(activation,context.GetParamSymbol(pad_name))
-                        sx_pad,zx_pad,_ = scalar_qparams(input_dq,initializers)
+                        sx_pad,zx_pad = integer_view(node.inputs[0])['qparams']
                         context.SetQuantization(str(activation),sx_pad,zx_pad)
                         pads = [0,0,0,0]
                     bias = resolve(node.inputs[2]) if len(node.inputs)>2 else None
@@ -264,18 +407,31 @@ def import_qdq(path, name, input_shapes=None, mean=None, std=None):
                         attr.get('kernel_shape', quantized_weights[node.inputs[1]][0].shape[2:]),
                         [pads[0], pads[2], pads[1], pads[3]], attr.get('strides', [1, 1]),
                         dilations[0], quantized_weights[node.inputs[1]][0].shape[0], attr.get('group', 1))
-                    relu_node, q_node = conv_regions[node.outputs[0]]
-                    sy, zy, _ = scalar_qparams(q_node, initializers)
-                    context.SetQuantization(str(output),sy,zy)
-                    context.Modify({'Layer':[{'layerName':str(output),
-                        'outputDataType':'TFDtypeUint8','ActivationType':'ReLU'}]})
-                    context.SetQuantization(str(output),sy,zy)
-                    fused_quantizers[q_node.output[0]] = output
-                    fused_relus[relu_node.output[0]] = output
-                    report['native_conv_regions'].append({
-                        'conv':node.outputs[0],'relu':relu_node.output[0],
-                        'quantizer':q_node.output[0],'sdk_quantized':str(output),
-                        'note':'native quantized Conv with FP32 source bias and fused ReLU'})
+                    region = integer_convs[node.outputs[0]]
+                    if region is not None:
+                        relu_node, q_node = region
+                        sy, zy, _ = scalar_qparams(q_node, initializers)
+                        context.SetQuantization(str(output),sy,zy)
+                        context.Modify({'Layer':[{'layerName':str(output),
+                            'outputDataType':'TFDtypeUint8','ActivationType':'ReLU'}]})
+                        context.SetQuantization(str(output),sy,zy)
+                        fused_quantizers[q_node.output[0]] = output
+                        fused_relus[relu_node.output[0]] = output
+                        report['native_conv_regions'].append({
+                            'conv':node.outputs[0],'relu':relu_node.output[0],
+                            'quantizer':q_node.output[0],'sdk_quantized':str(output),
+                            'output_dtype':'uint8',
+                            'note':'native quantized Conv with FP32 source bias and fused ReLU'})
+                    else:
+                        # SiLU and prediction heads often have no calibrated
+                        # pre-activation output Q. Native integer Conv supports
+                        # direct FP32 postprocessing; keep that boundary exact.
+                        context.Modify({'Layer':[{'layerName':str(output),
+                            'outputDataType':'TFDtypeFp32'}]})
+                        report['native_conv_regions'].append({
+                            'conv':node.outputs[0],'relu':None,'quantizer':None,
+                            'sdk_quantized':str(output),'output_dtype':'float32',
+                            'note':'native UINT8 inputs and weights with FP32 postprocessing'})
                     counts['integer_' + node.op] += 1
                 else:
                     arguments = [resolve(tensor_name) for tensor_name in node.inputs]
@@ -292,6 +448,15 @@ def import_qdq(path, name, input_shapes=None, mean=None, std=None):
                 report['sdk_expand_connections'].append({'layerName':str(outputs[0]),
                     'layerType':'Expand','input':[str(resolve(n)) for n in node.inputs],
                     'output':[str(o) for o in outputs]})
+            elif node.op=='Split':
+                # _GetAttr segfaults on multi-output Slice tensor names in
+                # this SDK. Record actual native connectivity without calling
+                # that accessor on the individual outputs.
+                report['sdk_opaque_connections'].append({
+                    'layerName':str(outputs[0]).rsplit('_',1)[0],
+                    'layerType':'Slice','input':[str(resolve(node.inputs[0]))],
+                    'output':[str(o) for o in outputs],
+                    'audit_source':'native Split parser outputs'})
             counts[node.op] += 1
     # Select the source public outputs after CloseContext's terminal discovery.
     context.SetOutputs([str(resolve(output.name)) for output in original.graph.output])
@@ -301,12 +466,16 @@ def import_qdq(path, name, input_shapes=None, mean=None, std=None):
     if actual_outputs != [o['sdk'] for o in report['public_outputs']]:
         raise RuntimeError('SDK public output selection differs from the source graph')
     report['operators'] = dict(counts)
+    report['integer_kernels'] = bool(report['native_conv_regions'])
+    report['native_conv_output_dtypes'] = dict(Counter(
+        row['output_dtype'] for row in report['native_conv_regions']))
     layers = {}
-    # This SDK's JSON accessor crashes for Expand, even though the
-    # native node executes and serializes correctly. Record that gap.
+    # Some native multi-output tensors and Expand cannot be queried through
+    # this SDK's JSON accessor. Their connectivity is recorded at creation.
     report['sdk_attr_audit_skipped'] = []
+    opaque_outputs={o for row in report['sdk_opaque_connections'] for o in row['output']}
     for tensor_name in context.GetAllTensorNames():
-        if tensor_name.startswith('TFDL_Expand_'):
+        if tensor_name.startswith('TFDL_Expand_') or tensor_name in opaque_outputs:
             report['sdk_attr_audit_skipped'].append(tensor_name)
             continue
         raw = context._GetAttr(tensor_name)
@@ -314,11 +483,12 @@ def import_qdq(path, name, input_shapes=None, mean=None, std=None):
             layer = json.loads(raw)
             if 'layerName' in layer:
                 layers[layer['layerName']] = layer
-    report['sdk_layers'] = list(layers.values())
-    report['sdk_layer_types'] = dict(Counter(l['layerType'] for l in layers.values()))
+    connections=(list(layers.values())+report['sdk_expand_connections']
+                 +report['sdk_opaque_connections'])
+    report['sdk_layers'] = connections
+    report['sdk_layer_types'] = dict(Counter(l['layerType'] for l in connections))
     if any(l['layerType']=='Custom' for l in layers.values()):
         raise RuntimeError('native-only import unexpectedly created a Custom node')
-    connections=list(layers.values())+report['sdk_expand_connections']
     consumed={n for layer in connections for n in layer.get('input',[])}
     terminal=[n for layer in connections for n in layer['output'] if n not in consumed]
     report['graph_audit']={'layer_count':len(connections),'terminal_tensors':terminal,
@@ -331,10 +501,15 @@ def import_qdq(path, name, input_shapes=None, mean=None, std=None):
         {'quantize':producers[layer['input'][0]]['layerName'],'dequantize':layer['layerName']}
         for layer in connections if layer['layerType']=='DeQuantize'
         and producers.get(layer['input'][0],{}).get('layerType')=='Quantize']
+    report['graph_audit']['dequantize_to_quantize_edges']=[
+        {'dequantize':producers[layer['input'][0]]['layerName'],'quantize':layer['layerName']}
+        for layer in connections if layer['layerType']=='Quantize'
+        and producers.get(layer['input'][0],{}).get('layerType')=='DeQuantize']
     if report['graph_audit']['quantize_to_dequantize_edges']:
         raise RuntimeError('native graph still contains a direct Quantize/DeQuantize roundtrip')
     if report['graph_audit']['unexpected_terminal_tensors']:
-        raise RuntimeError('native graph contains unexpected terminal tensors')
+        raise RuntimeError('native graph contains unexpected terminal tensors: '
+                           +str(report['graph_audit']['unexpected_terminal_tensors']))
     converter._context = context
     converter.renames = symbols
     converter.qdq_import_report = report

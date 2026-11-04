@@ -1,48 +1,22 @@
-from ..TFConvertor import NodeConvertor,TFConvertor
-import numpy as np
+from ..TFConvertor import TFConvertor
+from .ActivationPatterns import graph_edges, other_operand, private_intermediates
 
 
 def MergeSwishOnnx(Model:TFConvertor):
-    matches = ["Sigmoid","Mul"]
-    removeNodes = []
-    nodes = list(Model.nodes.values())
-
-    def matchfunc(index,matches):
-        lastoutput = None
-        matchnodes = []
-        for one in matches:
-            found = False
-            for i in range(index,len(nodes),1):
-                if nodes[i].op == one and (lastoutput is None or lastoutput in nodes[i].inputs):
-                    found = True
-                    index = i + 1
-                    lastoutput = nodes[i].outputs[0]
-                    matchnodes.append(nodes[i])
-                    break
-            if found is False:
-                return None
-        return matchnodes
-
-    for index,node in enumerate(nodes):
-        if node.op == matches[0]:
-            matchnodes = matchfunc(index,matches)
-            if matchnodes is None:
-                continue
-
-            signode = matchnodes[0]
-            mulnode = matchnodes[1]
-
-            if set(mulnode.inputs) != {signode.inputs[0], signode.outputs[0]}:
-                continue
-            removeNodes.append(signode.name)
-            mulnode.inputs = [signode.inputs[0]]
-            mulnode.op = "Swish"
-
-
-
-    for node in removeNodes:
-        for iname in Model.nodes[node].inputs:
-            if iname in Model.params:
-                del Model.params[iname]
-        Model.nodes.pop(node)
-
+    _, consumers = graph_edges(Model)
+    count = 0
+    for sigmoid in list(Model.nodes.values()):
+        if sigmoid.op != "Sigmoid":
+            continue
+        users = consumers.get(sigmoid.outputs[0], [])
+        if len(users) != 1 or users[0].op != "Mul":
+            continue
+        mul = users[0]
+        if other_operand(mul, sigmoid.outputs[0]) != sigmoid.inputs[0]:
+            continue
+        if not private_intermediates(Model, consumers, [sigmoid, mul], mul):
+            continue
+        mul.inputs, mul.op, mul.attr = sigmoid.inputs[:], "Swish", {}
+        Model.nodes.pop(sigmoid.name)
+        count += 1
+    return count

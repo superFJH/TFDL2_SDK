@@ -453,9 +453,26 @@ python3 ConvertTools/python/onnx2tfdl.py \
 
 图片按 `--cvtype` 解码（0=BGR、1=RGB、2=灰度），INTER_LINEAR 缩放后计算
 `(pixel-mean)/std`。mean/std 可各提供一个值或逐通道值；缺省为 0/1。
-导出 FB 使用相同预处理，**输入仍为 FP32 张量**；例如上面的命令使 FB 接收 0–255 BGR。
-二进制已经归一化，不会再次归一化；若同样希望 FB 接收原始像素，二进制命令中仍传
-`--mean 0 0 0 --std 255 255 255`，校验程序会反算回 FB 的输入口径。
+导出 FB 与原 SDK 量化流程统一：**`SetInput` 为 UINT8**，内部记录 mean 和
+`scale=1/std`，并保存输入量化参数。本例 `mean=0、std=255` 时，SetInput 直接承接
+NNCF 首个输入 Quant 的参数：`qscale=0.003842368256300688、zero_point=0`，
+输入 Quant 合并到 SetInput，图的开头为 **SetInput → Pad → UINT8 Conv**。
+注意，归一化 `scale=1/std` 与输入量化 `qscale` 是两种参数。
+
+二进制校准文件仍是已归一化的 FP32，不会在 NNCF 校准时再次归一化。
+校验最终 FB 时，根据实际输入张量的 scale/zero-point 转为 UINT8：
+
+```python
+codes = np.clip(np.floor(normalized / input_scale + input_zero_point + 0.5), 0, 255).astype(np.uint8)
+input_tensor.fromNumpy(codes)
+```
+
+手动 `fromNumpy` 写入的是量化码，不能一律把原像素字节当作量化码。
+**实测当前 SDK 的 `TFCV::DumpImgData` 对 UINT8 张量直接写入原像素，未根据
+mean/std 和 qscale 编码**；使用该接口时还需按上式处理，不能直接推理。
+例如本模型原 BGR 像素 37/119/203 对应的输入码为 38/121/207。
+若二进制校准也需保存 BGR/255 图片预处理参数，
+命令中仍指定 `--mean 0 --std 255`。
 NNCF 要求真实校准数据，不使用随机数据兜底。
 
 NNCF ONNX 校准由 **NNCF 自己的 ORT CPU 后端**执行，采用库默认线程设置；
@@ -478,10 +495,28 @@ SEBlock 及其普通转换流程继续保留。
 启用 Fast Bias Correction；因当前原生导入器只支持标量 scale，显式采用逐张量量化。
 不再用 SDK 重采范围或重新量化 NNCF 权重。
 
+NNCF 导入默认接入 `OnnxConvertor.optmize(preserve_quantization=True)`，无需额外开关：
+
+- 复用普通转换的 Clip→ReLUX、标准 erf 公式 GeLU 局部融合；Clip 支持旧版
+  min/max 属性及 opset ≥ 11 的常量输入。共享中间结果、公开输出和 Q/DQ 边界不被跨越。
+- 复用有大小限制的静态形状/小常量折叠，包含 Sqrt、ConstantOfShape、Equal、Where、
+  Expand；单个折叠结果不超过 4096 个元素，避免物化大激活或广播权重。
+- 保留 NNCF 的 Q/DQ 名称、连接、参数及整数 Conv 权重，优化前后检查指纹。涉及卷积
+  权重重写的 Conv/BN 融合、量化范围重采样和 attention 重构不在此模式执行。
+- NNCF 模式暂保留显式 Sigmoid×Mul，不合并 Swish。现有 YOLO 回归显示，融合后的浮点
+  舍入差别会经后续量化放大；普通转换仍支持 Swish 融合。跳过原因记录在 `optimization.skipped`。
+- 独立 Sqrt 映射到现有 `Op.Sqrt`；独立 Erf 映射到 `Op.MathOp(..., MathOpType.MathErf)`，
+  不是把单个 Erf 当作 GeLU。两者也可用于普通 ONNX 转换。
+
+`import.json` 和主 `report.json` 的 `optimization` 字段记录模式、逐项融合/折叠数量及
+保留的量化边界、参数、整数卷积权重数量。优化在依赖分析之前执行，避免已融合节点
+留下失效连接。该模式不改变 NNCF 的量化算法，也不会自动恢复已在 NNCF 阶段损失的精度。
+
 默认去掉浮点路径直接相连的 Quant→DeQuant；同一个 Quant 若仍供 INT8 消费者使用则
 保留，整数卷积输出进入浮点算子时保留必要的 DeQuant。部署目标是保留原始浮点值，
-不要求复现 NNCF QDQ 的浮点分支舍入。当前 SE-Inception 为 **109 个原生量化卷积、
-25 个 Quant、54 个 DeQuant、0 个 Custom，直接 Quant→DeQuant 连接为 0**。
+不要求复现 NNCF QDQ 的浮点分支舍入。2026-11-03 的 SE-Inception 输入合并版为 **109 个原生量化卷积、
+24 个 Quant、54 个 DeQuant、0 个 Custom，直接 Quant→DeQuant 和
+DeQuant→Quant 连接均为 0**。原先固定输入 qscale=1/255 造成的一对输入转换已去掉。
 
 `--check` 在校准输入上报告 FP32 ONNX、NNCF ONNX、最终 FB 三者的差异；
 FB 检查在 **TFDL CPU** 上进行。量化后输出可改变，默认只对错误形状、类型、非有限值
@@ -489,17 +524,48 @@ FB 检查在 **TFDL CPU** 上进行。量化后输出可改变，默认只对错
 支持已有 `--validation-bin`、`--validation-labels`；可继续使用
 `--require-validation-target` 或 `--max-accuracy-loss` 检查独立性和精度门槛。
 此处是最终 FB 验收，不会自动调用 NNCF 的 accuracy-control 重新搜索模型。
+只有输入仍有真实浮点消费者时才创建输入 DeQuant，整数入口直接复用 SetInput。
+当前 SDK 的直接输入卷积在非零 mean 或各通道 std 不同时，对已经编码的 UINT8
+输入存在特殊预处理限制；这类配置保留独立输入范围和转换边界，并在报告
+`input_quantization_policy` 中说明，不能把本例的折叠结论推广到任意预处理。
 
 当前集成支持单个固定形状、batch=1、C=1 或 3 的 FP32 NCHW 图像输入；动态输入用
-`--input_shapes` 固定。安全 Conv→Relu→Q 区域使用原生 UINT8 卷积，其他受支持算子
-使用原生浮点实现。报告给出实际整数卷积数量；没有该类区域时会提示，不能把任意模型
-都当作已实现全 INT8 加速。
+`--input_shapes` 固定。安全 Conv→Relu→Q 区域使用原生 UINT8 输出卷积。
+其它已有输入和权重量化参数的 Conv 使用原生 UINT8 输入/权重、FP32 输出，保留原始
+FP32 bias；不为 SiLU 前缺少输出量化参数的结果新增量化器。同尺度的 Concat、Split、
+Reshape、Transpose、MaxPool、nearest Resize 等布局路径可保留整数视图；不同尺度的
+Concat 不直接拼接整数码。真实浮点消费者保留独立浮点视图，Split 仅生成存活的 Crop。
+报告的 `native_conv_output_dtypes` 区分 UINT8 与 FP32 结果，`integer_layout_views`
+记录布局路径。原生卷积数量描述 UINT8 入口，硬件执行位置需查看目标 SDK 的运行日志。
 
 本次实际重跑：原 SE-Inception、20 张相同校准数据，经二进制入口和图片目录入口
 均导出成功；两者内部 NNCF ONNX 与此前已验证模型的 SHA-256 相同。
 图片入口带预处理及 `--check`，20 张 FB 对 FP32 ONNX 的 top1 全部相同。
 当前测试与原始数据见 `Doc/benchmark_data/se_inception_nncf_toolchain_20261103/`。
-此前 500 图 NPU 结果见 `Doc/se_inception_nncf_qdq_cleanup_20261103.md`，未冒充本次新测。
+随后已从同一 `--nncf` 图片入口重新转换，并在 `10.10.12.65` 完成两组新的 500 图 NPU
+验证：运行时三项全开为 **479/500（95.8%）**、平均 **107.83 ms**、P99 **119.27 ms**；
+三项全关正确数同为 479，平均 115.60 ms。两者有 2 张预测不同。
+该轮记录的是旧 FP32 输入 FB。统一 UINT8 并去掉输入 DeQuant→Quant 后再测 500 图：
+三项全开仍为 **479/500**，全部 2,500 个 logits 与旧 FP32 输入版逐位一致；
+平均 **108.25 ms**、P99 **122.04 ms**。三关平均 117.49 ms，正确数相同。
+当前模型、输入编码和新测结果见
+[输入 Quant 合并验证报告](../../Doc/se_inception_nncf_input_fold_20261103.md)。
+
+2026-11-04 的泛化补充识别了此前遗漏的 FP32 输出量化卷积。SE-Inception 当前可识别
+132 个整数输入卷积，其中 112 个 UINT8 输出、20 个 FP32 输出；500 图 CPU 回归仍为
+479/500，500 张 top1 与旧 FB 全部相同，logits 有变化。旧 FB 保留，旧报告的 NPU 时延
+不能直接作为新导出的性能数据。
+
+COCO 泛用性验证覆盖 YOLO11n、YOLOv8n、YOLOv5s-u：100 张固定校准、4,900 张独立
+评估，用同一 RGB letterbox、输入编码与 COCOeval 比较 FP32 ONNX、NNCF ONNX、FB CPU。
+本轮配置强制权重/激活逐张量量化，结果仅适用于该配置。准备数据和评估程序分别为
+`Example/Benchmark/coco_nncf_prepare.py`、`Example/Benchmark/coco_nncf_evaluate.py`。
+
+**目标 SDK 的 NPU 支持仍有已复现的限制**：这三个模型在 12.65 开启 MakeAlign 时，
+DFL 投影的 8,400 宽输入触发 MakeAlign_40T 的 QuantInfo 拷贝崩溃；关闭 MakeAlign 可
+单图运行，但 W8A8→FP32 卷积全部选择 Software。CPU 精度评估与 NPU 硬件加速需要
+分别验证。完整 mAP、配置、模型、日志及单层复现见
+[COCO NNCF 泛用性报告](../../Doc/coco_nncf_generality_20261104.md)。
 
 上游接口依据：[NNCF PTQ 用法](https://github.com/openvinotoolkit/nncf/blob/v3.4.0/docs/usage/post_training_compression/post_training_quantization/Usage.md)、
 [ONNX 后端说明](https://github.com/openvinotoolkit/nncf/blob/v3.4.0/docs/usage/post_training_compression/post_training_quantization/ONNX.md)。

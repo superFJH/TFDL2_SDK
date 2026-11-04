@@ -72,6 +72,30 @@ def _preprocessing(mean, std, channels):
     return mean, std
 
 
+def _input_qparams(images, mean, std, has_preprocessing):
+    """Image input range for float inputs or SDK channel-preprocessing boundaries."""
+    if has_preprocessing:
+        low = min(0., float(np.min(-mean / std)))
+        high = max(0., float(np.max((np.float32(255.) - mean) / std)))
+    else:
+        low = min(0., float(images.min()))
+        high = max(0., float(images.max()))
+    scale = np.float32((high-low)/255.) if high>low else np.float32(1.)
+    zero = int(np.clip(np.rint(-low/float(scale)),0,255))
+    return dict(scale=float(scale),zero_point=zero)
+
+
+def _nncf_input_qparams(model, input_name, fallback):
+    """Reuse NNCF's input quantizer instead of adding a second quantization."""
+    from .qdq_import import scalar_qparams
+    initializers = {p.name:onnx.numpy_helper.to_array(p) for p in model.graph.initializer}
+    for node in model.graph.node:
+        if node.op_type == 'QuantizeLinear' and node.input[0] == input_name:
+            scale, zero, _ = scalar_qparams(node, initializers)
+            return dict(scale=scale,zero_point=zero)
+    return fallback
+
+
 def _ort_outputs(model, images, threads):
     import onnxruntime as ort
     options = ort.SessionOptions()
@@ -86,15 +110,23 @@ def _ort_outputs(model, images, threads):
 
 
 def _fb_outputs(path, images, mean, std, threads):
-    from TFDL2 import TFContext, TFExecutor
+    from TFDL2 import TFContext, TFExecutor, TFDataType
     context = TFContext(path=str(path))
     executor = TFExecutor(context, dict(UseHardware=False, FrugalMode=False, cpuLimit=threads,
         optimize=dict(RuntimeQuantMatMul=False, RuntimeQuantConv=False,
                       RuntimeFastQuantConv=False, RuntimeQuantPostProcess=False)))
     rows = [[] for _ in context.GetOutSymbols()]
+    input_tensor = executor.GetInputs()[0]
     for image in images:
-        raw = image[None] * std.reshape(1, -1, 1, 1) + mean.reshape(1, -1, 1, 1)
-        executor.GetInputs()[0].fromNumpy(np.ascontiguousarray(raw, dtype=np.float32))
+        if input_tensor.dtype == TFDataType.TFDL_UINT8:
+            if len(input_tensor.qscale)!=1 or len(input_tensor.qzeropoint)!=1:
+                raise ValueError('NNCF input check requires per-tensor input quantization')
+            raw = np.clip(np.floor(image[None]/np.float32(input_tensor.qscale[0])
+                +np.float32(input_tensor.qzeropoint[0])+.5),0,255).astype(np.uint8)
+        else:
+            raw = np.ascontiguousarray(image[None] * std.reshape(1,-1,1,1)
+                +mean.reshape(1,-1,1,1),dtype=np.float32)
+        input_tensor.fromNumpy(raw)
         outputs = executor()
         if len(outputs) != len(rows):
             raise RuntimeError('NNCF export check: output count changed')
@@ -133,6 +165,8 @@ def convert_with_nncf(args, destination, select_images):
     if not paths and not args.calibration_bin:
         raise ValueError('--nncf requires --quantimgDir, --calibration-list or --calibration-bin; random calibration is disabled')
     images = read_images(spec, paths, args.cvtype, args.calibration_bin)
+    has_preprocessing = args.mean is not None or args.std is not None
+    input_qparams = _input_qparams(images, mean, std, has_preprocessing)
     work = Path(args.quant_workdir or (str(destination) + '.nncf')).expanduser().resolve()
     qdq_path = work / 'model.nncf.onnx'
     if qdq_path == source:
@@ -150,7 +184,8 @@ def convert_with_nncf(args, destination, select_images):
         quantization=dict(per_channel=False, fast_bias_correction=True,
                           target_device='ANY', sdk_recalibration=False,
                           remove_float_qdq_roundtrips=True),
-        input_contract='FB embeds (input-mean)/std; calibration binary is already normalized',
+        input_dtype='uint8',input_quantization=input_qparams,
+        input_contract='UINT8 codes of normalized input; SetInput stores mean/scale; encode normalized pixels with the actual input scale/zero-point before fromNumpy; UINT8 DumpImgData writes raw pixels',
         qdq_model=str(qdq_path), exported_model=str(fb_path))
     started = time.perf_counter()
 
@@ -173,17 +208,30 @@ def convert_with_nncf(args, destination, select_images):
         onnx.save(quantized, str(qdq_path))
         report['qdq_sha256'] = _sha256(qdq_path)
         report['nncf_operators'] = dict(Counter(n.op_type for n in quantized.graph.node))
-        preprocessing = dict(mean=mean.tolist(), std=std.tolist()) if args.mean is not None or args.std is not None else {}
-        converter = import_qdq(str(qdq_path), destination.name, **preprocessing)
+        if np.all(mean == 0) and np.all(std == std[0]):
+            input_qparams = _nncf_input_qparams(quantized,name,input_qparams)
+            report['input_quantization_policy'] = 'reuse NNCF input Q and fold into SetInput'
+        else:
+            report['input_quantization_policy'] = 'separate image range for SDK channel preprocessing; retain input boundary'
+        report['input_quantization'] = input_qparams
+        preprocessing = dict(mean=mean.tolist(), std=std.tolist()) if has_preprocessing else {}
+        converter = import_qdq(str(qdq_path), destination.name,
+            input_quantization={name:input_qparams}, **preprocessing)
         converter.dump(str(destination) + '.quant')
         imported = converter.qdq_import_report
         (work / 'import.json').write_text(json.dumps(imported, indent=2))
         report['fb_sha256'] = _sha256(fb_path)
         report['native_conv_count'] = len(imported['native_conv_regions'])
+        report['native_conv_output_dtypes'] = imported['native_conv_output_dtypes']
         report['sdk_layer_types'] = imported['sdk_layer_types']
+        report['optimization'] = imported['optimization']
         report['graph_audit'] = imported['graph_audit']
         if report['native_conv_count'] == 0:
-            print('Warning: this graph has no native UINT8 Conv regions; inspect the report before assuming INT8 acceleration.', flush=True)
+            print('Warning: this graph has no native integer-input Conv regions; inspect the import report.', flush=True)
+        float_outputs = imported['native_conv_output_dtypes'].get('float32',0)
+        if float_outputs:
+            print(f'Native W8A8 Conv with FP32 output: {float_outputs}; '
+                  'check the target SDK execution log for hardware placement.', flush=True)
 
         reference_model = onnx.load(args.testonnxpath) if args.testonnxpath else model
         if args.check:
