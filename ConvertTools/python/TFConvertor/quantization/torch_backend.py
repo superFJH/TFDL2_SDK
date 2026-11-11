@@ -74,6 +74,14 @@ class TorchGraph(nn.Module):
             "NearestReSize1",
             "NearestReSize2",
             "NearestReSize3",
+            "BilnearReSize1",
+            "BilnearReSize2",
+            "BilnearReSize3",
+            "Exp",
+            "Log",
+            "MathOp",
+            "Pow",
+            "Sqrt",
             "Add",
             "Sub",
             "Mul",
@@ -306,6 +314,30 @@ class TorchGraph(nn.Module):
                 )
             elif name in ("NearestReSize1", "NearestReSize2", "NearestReSize3"):
                 y = F.interpolate(a, size=shape[-2:], mode="nearest")
+            elif name == "MathOp":
+                kind = int(getattr(p["type"], "value", p["type"]))
+                fn = {
+                    0: torch.ceil, 1: torch.floor, 2: torch.sqrt, 3: torch.log2,
+                    6: torch.abs, 7: torch.cos, 8: torch.sin, 9: torch.neg,
+                    10: torch.erf, 11: torch.sinh, 12: torch.cosh, 13: torch.log,
+                }.get(kind)
+                if fn is None:
+                    raise ValueError(f"Torch observer does not support MathOp type {kind}")
+                y = fn(a)
+            elif name == "Sqrt":
+                y = torch.sqrt(a)
+            elif name == "Pow":
+                exponent = p.get("exponent", p.get("power"))
+                exponent = torch.as_tensor(exponent, device=a.device, dtype=a.dtype) if not torch.is_tensor(exponent) else exponent
+                y = torch.pow(a, exponent)
+            elif name == "Exp":
+                y = torch.exp(a)
+            elif name == "Log":
+                y = torch.log(a)
+            elif name in ("BilnearReSize1", "BilnearReSize2", "BilnearReSize3"):
+                # YOLO26 depth upsamples with bilinear resize; ranges only, so
+                # torch's align_corners=False convention is close enough.
+                y = F.interpolate(a, size=shape[-2:], mode="bilinear", align_corners=False)
             elif name in ("Gather", "Gather2"):
                 indices = torch.as_tensor(
                     p["indices"], device=a.device, dtype=torch.int64

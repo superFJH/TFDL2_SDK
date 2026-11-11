@@ -104,10 +104,41 @@ class TFConvertor(object):
             with Op.capture_operations() as operations:
                 self._buildTFmodel(inputshape,std,mean)
             self._op_calls = operations
+            self._reject_duplicate_inputs(operations)
         else:
             self._buildTFmodel(inputshape,std,mean)
             self._op_calls = None
         self._build_options = dict(inputshape=inputshape,std=std,mean=mean)
+
+    @staticmethod
+    def _reject_duplicate_inputs(operations):
+        """TFDL operators do not support the same tensor in two input slots.
+
+        Passing one symbol twice (e.g. ``x * x`` for a power) makes the runtime
+        alias an in-place input buffer, which silently corrupts results once
+        FrugalMode reuses activations. Reject it at conversion time instead.
+        """
+        def symbols(value):
+            if isinstance(value,TFSymbol):
+                yield value
+            elif isinstance(value,(tuple,list)):
+                for item in value:
+                    yield from symbols(item)
+            elif isinstance(value,dict):
+                for item in value.values():
+                    yield from symbols(item)
+        for op_name,arguments,result in operations:
+            seen = {}
+            for key,value in arguments.items():
+                for symbol in symbols(value):
+                    name = str(symbol)
+                    if name in seen:
+                        raise RuntimeError(
+                            "TFDL op {} uses tensor {} for both {} and {}; "
+                            "operators do not support two identical inputs, "
+                            "insert Pow/Identity or a dedicated op instead "
+                            "(result {})".format(op_name,name,seen[name],key,result))
+                    seen[name] = key
 
     def _buildTFmodel(self,inputshape=None,std=None,mean=None):
         self.renames = {}

@@ -492,8 +492,47 @@ SEBlock 及其普通转换流程继续保留。
 - 同目录 `model.nncf.onnx`、`import.json`：内部量化图及整数权重/激活参数映射，留作复现。
 
 `--quant-workdir DIR` 可指定报告和中间文件目录。NNCF 使用打包的 `quantize`，
-启用 Fast Bias Correction；因当前原生导入器只支持标量 scale，显式采用逐张量量化。
-不再用 SDK 重采范围或重新量化 NNCF 权重。
+启用 Fast Bias Correction。**2026-11-06 起，`--nncf` 默认使用权重 per-channel、
+激活 per-tensor**，无需额外参数。不再用 SDK 重采范围或重新量化 NNCF 权重。
+
+- Conv 权重按输出通道（ONNX `axis=0`，包括等价负轴）保存各自的 scale/zero-point；
+  普通、分组和 depthwise 卷积均走原生整数输入/权重路径。INT8 权重码和零点同时加 128，
+  转成 SDK 的 UINT8 存储，不把权重改回浮点重新量化。
+- 浮点分支中的常量权重按 ONNX `axis` 正确反量化，包括 Gemm 的非零轴；该分支仍使用
+  原有浮点算子，不因逐通道权重支持就新增整数 Gemm/MatMul 内核。
+- 激活量化仍仅接受标量参数；原生整数 Conv 的逐通道权重仅接受输出通道轴，其他轴明确报错。
+- 对 opset < 13 的原始模型，先用 ONNX version converter 转到 13，随后在全部校准输入上
+  对比转换前后的浮点输出（`rtol=1e-5, atol=1e-6`）；不满足就停止。不是直接修改版本号。
+  opset >= 13 保留原版本，普通非 NNCF 转换流程不做此升级。
+- `report.json` 的 `quantization.activations_per_channel/weights_per_channel` 区分两种配置，
+  `opset_conversion` 记录版本转换与浮点检查，`native_weight_granularity` 记录实际原生卷积
+  权重粒度。`import.json` 的 `integer_weights` 保存 `axis`、源 scale、SDK 注册后的 scale、
+  zero-point 和整数码哈希。SDK 通过逐通道 min/max 序列化权重，导入时核对零点相同、
+  scale 相对误差不超过 `2e-7`（FP32 范围重建的舍入），并在保存后测试参数和输出。
+
+此前文档中的 SE-Inception、COCO 结果使用旧 per-tensor 权重配置，不能代替本次配置的验证。
+输入 qscale 也应从实际导出的 FB 读取，前面的数值是历史模型示例。
+
+本次 SE-Inception 实测（2026-11-06）：同一源模型、同一 20 张校准图和 500 张验证图；
+校准与验证无归一化图像内容重叠。opset 11→13 在校准图上的浮点输出最大绝对误差为 0。
+
+| 模型 | 验证正确数 | Top1 准确率 |
+|---|---:|---:|
+| FP32 ONNX | 482/500 | 96.4% |
+| 历史 per-tensor FB | 479/500 | 95.8% |
+| 本次 per-channel FB，CPU / 12.65 NPU | 480/500 | 96.0% |
+
+132 个原生整数卷积权重全部采用 per-channel，共 40,592 组参数；其中 112 个卷积输出
+为 UINT8、20 个为 FP32。12.65 日志对应 112 个 Hardware、20 个 Software 卷积；
+所有整数权重码、零点和参数读回检查通过。500 图 CPU/NPU 的 2,500 个 logits 逐位一致。
+SDK 范围重建的 scale 最大相对误差为 `1.1869e-7`。52 项转换回归测试通过，包含
+分组/depthwise、INT8/UINT8、负轴、Gemm 权重广播和保存后重载。
+
+新 FB 相比浮点的分类损失为 0.4 个百分点，通过本次 `--max-accuracy-loss 1.99`，
+但默认余弦门槛仍未通过（平均距离 `0.00338505`、最低余弦 `0.85909346`）。
+本轮分类正确数仅比旧 FB 多 1 张，且沿用已有回归集，不代表客户新数据上的收益。
+[完整转换与 NPU 汇总](../../Doc/benchmark_data/se_inception_nncf_per_channel_20261106/summary.json)、
+[转换命令及日志目录](../../Doc/benchmark_data/se_inception_nncf_per_channel_20261106/)。
 
 NNCF 导入默认接入 `OnnxConvertor.optmize(preserve_quantization=True)`，无需额外开关：
 

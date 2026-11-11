@@ -133,6 +133,10 @@ class PoolingParser(OnnxParser):
     def _impl_v11(cls,*args,node:NodeConvertor):
         if node.op == "GlobalAveragePool":
             return GlobalAvePooling(args[0])
+        elif node.op == "GlobalMaxPool":
+            # NCHW global max pooling is a maximum over both spatial axes;
+            # keepdims preserves the (N,C,1,1) output that the ONNX node defines.
+            return ReduceMax(args[0],(2,3),True)
         else:
             kernel_shape = node.attr["kernel_shape"]
             if len(kernel_shape) == 1:
@@ -840,6 +844,33 @@ class ReduceMinParser(OnnxParser):
     @classmethod
     def _impl_v11(cls,*args,node:NodeConvertor):
         return ReduceMin(args[0],tuple(node.attr["axes"]),bool(node.attr["keepdims"]))
+
+class ReduceL2Parser(OnnxParser):
+    @classmethod
+    def _impl_v11(cls,*args,node:NodeConvertor):
+        # axes may be an attribute (<= opset 17) or an int64 input constant (>= 18)
+        if "axes" in node.attr:
+            axes = tuple(int(axis) for axis in np.asarray(node.attr["axes"]).reshape(-1))
+        elif len(node.inputs) > 1 and node.inputs[1] and node.inputs[1] in node.graph.params:
+            axes = tuple(int(axis) for axis in np.asarray(node.graph.params[node.inputs[1]]).reshape(-1))
+        else:
+            raise NotImplementedError("ReduceL2 without a constant axes input")
+        keep_dims = bool(node.attr["keepdims"]) if "keepdims" in node.attr else True
+        # A dedicated Pow keeps the graph free of self-duplicated inputs, which
+        # TFDL operators do not support (see TFConvertor._reject_duplicate_inputs).
+        return Sqrt(ReduceSum(Pow(args[0],2), axes, keep_dims))
+
+class ClipParser(OnnxParser):
+    @classmethod
+    def _impl_v11(cls,*args,node:NodeConvertor):
+        if "min" in node.attr or "max" in node.attr:
+            raise NotImplementedError("Clip with attribute bounds (pre-opset 11) is not supported")
+        result = args[0]
+        if len(args) > 1 and node.inputs[1]:
+            result = Max(result, args[1])
+        if len(args) > 2 and node.inputs[2]:
+            result = Min(result, args[2])
+        return result
     
 
 
@@ -865,6 +896,11 @@ class MathOpParser(OnnxParser):
             return MathOp(args[0],MathOpType.MathCos)
         elif node.op == "Sin":
             return MathOp(args[0],MathOpType.MathSin)
+        elif node.op == "Log":
+            # ONNX natural log: Depth Anything style heads reconstruct depth as
+            # exp/clip -> log, so this operator is on the critical path for the
+            # YOLO26 depth models.
+            return MathOp(args[0],MathOpType.MathLog)
         else:
             raise NotImplementedError("{} not implemented".format(node.op))
 
@@ -941,6 +977,7 @@ def _get_convert_map(opset):
     return {
         "Conv":ConvolutionParser.get_converter(opset),
         "GlobalAveragePool":PoolingParser.get_converter(opset),
+        "GlobalMaxPool":PoolingParser.get_converter(opset),
         "MaxPool":PoolingParser.get_converter(opset),
         "AveragePool":PoolingParser.get_converter(opset),
         "MatMul":MatMulParser.get_converter(opset),
@@ -985,6 +1022,7 @@ def _get_convert_map(opset):
         "Mod":MathOpParser.get_converter(opset),
         "Cos":MathOpParser.get_converter(opset),
         "Sin":MathOpParser.get_converter(opset),
+        "Log":MathOpParser.get_converter(opset),
         "Split":SplitParser.get_converter(opset),
         "InstanceNormalization":LayerNormalParser.get_converter(opset),
         "LayerNorm":LayerNormalParser.get_converter(opset),
@@ -1005,6 +1043,8 @@ def _get_convert_map(opset):
         "Expand":ExpandParser.get_converter(opset),
         "ReduceMax":ReduceMaxParser.get_converter(opset),
         "ReduceMin":ReduceMinParser.get_converter(opset),
+        "ReduceL2":ReduceL2Parser.get_converter(opset),
+        "Clip":ClipParser.get_converter(opset),
     }
 
 class OnnxNodeConvertor(NodeConvertor):

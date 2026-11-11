@@ -72,6 +72,20 @@ def _preprocessing(mean, std, channels):
     return mean, std
 
 
+def _prepare_per_channel_model(model):
+    """Use the ONNX adapter, rather than just changing the opset number."""
+    version = next(v.version for v in model.opset_import if v.domain in ('', 'ai.onnx'))
+    target = max(version, 13)
+    if version < target:
+        try:
+            model = onnx.version_converter.convert_version(model, target)
+        except Exception as error:
+            raise ValueError(f'per-channel weights require ONNX opset >= 13; '
+                             f'could not convert opset {version} to {target}: {error}') from error
+        onnx.checker.check_model(model)
+    return model, dict(source=version, target=target, converted=version < target)
+
+
 def _input_qparams(images, mean, std, has_preprocessing):
     """Image input range for float inputs or SDK channel-preprocessing boundaries."""
     if has_preprocessing:
@@ -158,6 +172,8 @@ def convert_with_nncf(args, destination, select_images):
     if any(n.op_type in ('QuantizeLinear', 'DequantizeLinear', 'FakeQuantize') for n in model.graph.node):
         raise ValueError('--nncf expects the original floating ONNX, not an already quantized model')
     name, shape = _input_spec(model, args.input_shapes)
+    original_model = model
+    model, opset_conversion = _prepare_per_channel_model(model)
     mean, std = _preprocessing(args.mean, args.std, shape[1])
     spec = SimpleNamespace(shape=shape, mean=mean.reshape(1, -1, 1, 1),
                            scale=(1. / std).reshape(1, -1, 1, 1))
@@ -181,9 +197,11 @@ def convert_with_nncf(args, destination, select_images):
                          binary_sha256=_sha256(args.calibration_bin) if args.calibration_bin else None,
                          cvtype=args.cvtype, mean=mean.tolist(), std=std.tolist(),
                          backend='NNCF ONNX / ORT CPU', threads='NNCF/ORT defaults'),
-        quantization=dict(per_channel=False, fast_bias_correction=True,
+        quantization=dict(activations_per_channel=False, weights_per_channel=True,
+                          fast_bias_correction=True,
                           target_device='ANY', sdk_recalibration=False,
                           remove_float_qdq_roundtrips=True),
+        opset_conversion=opset_conversion,
         input_dtype='uint8',input_quantization=input_qparams,
         input_contract='UINT8 codes of normalized input; SetInput stores mean/scale; encode normalized pixels with the actual input scale/zero-point before fromNumpy; UINT8 DumpImgData writes raw pixels',
         qdq_model=str(qdq_path), exported_model=str(fb_path))
@@ -195,12 +213,22 @@ def convert_with_nncf(args, destination, select_images):
 
     save()
     try:
+        if opset_conversion['converted']:
+            before = _ort_outputs(original_model, images, args.calibration_threads)
+            after = _ort_outputs(model, images, args.calibration_threads)
+            check = compare(before, after)
+            check['allclose'] = all(np.allclose(x, y, rtol=1e-5, atol=1e-6)
+                                    for x, y in zip(before, after))
+            check['max_abs_error'] = max(float(np.max(np.abs(x-y))) for x,y in zip(before,after))
+            report['opset_conversion']['float_check'] = check
+            if not check['valid'] or not check['allclose']:
+                raise RuntimeError('ONNX opset conversion changed floating outputs; refusing per-channel PTQ')
         print(f'NNCF {nncf.__version__}: {len(images)} calibration images, ONNX/ORT CPU PTQ', flush=True)
-        # TFDL's native importer currently supports scalar scale/zero-point.
-        # Explicit per-tensor settings also cover ONNX opset >= 13.
+        # Integer Conv weights use output-channel scales; activations keep
+        # scalar quantization parameters for native W8A8 execution.
         advanced = nncf.AdvancedQuantizationParameters(
             activations_quantization_params=QuantizationParameters(per_channel=False),
-            weights_quantization_params=QuantizationParameters(per_channel=False))
+            weights_quantization_params=QuantizationParameters(per_channel=True))
         dataset = nncf.Dataset(images, lambda image: {name: np.ascontiguousarray(image[None])})
         quantized = nncf.quantize(model, dataset, subset_size=len(images),
             target_device=nncf.TargetDevice.ANY, fast_bias_correction=True, advanced_parameters=advanced)
@@ -223,6 +251,8 @@ def convert_with_nncf(args, destination, select_images):
         report['fb_sha256'] = _sha256(fb_path)
         report['native_conv_count'] = len(imported['native_conv_regions'])
         report['native_conv_output_dtypes'] = imported['native_conv_output_dtypes']
+        report['native_weight_granularity'] = dict(Counter(
+            row['granularity'] for row in imported['integer_weights']))
         report['sdk_layer_types'] = imported['sdk_layer_types']
         report['optimization'] = imported['optimization']
         report['graph_audit'] = imported['graph_audit']
@@ -233,7 +263,7 @@ def convert_with_nncf(args, destination, select_images):
             print(f'Native W8A8 Conv with FP32 output: {float_outputs}; '
                   'check the target SDK execution log for hardware placement.', flush=True)
 
-        reference_model = onnx.load(args.testonnxpath) if args.testonnxpath else model
+        reference_model = onnx.load(args.testonnxpath) if args.testonnxpath else original_model
         if args.check:
             reference = _ort_outputs(reference_model, images, args.calibration_threads)
             qdq_outputs = _ort_outputs(quantized, images, args.calibration_threads)

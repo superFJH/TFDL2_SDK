@@ -197,7 +197,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--fp16", action="store_true", help="将fp32模型降为半精度")
     parser.add_argument("--nncf", action="store_true",
-                        help="enable optional NNCF ONNX PTQ and export a native TFDL .quant.fb; requires user-installed nncf")
+                        help="enable optional NNCF PTQ (per-channel weights, per-tensor activations) and native .quant.fb export; requires user-installed nncf")
     parser.add_argument(
         "--stoptensor", type=str, nargs="+", help="模型转化停止节点名称", default=None
     )

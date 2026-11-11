@@ -27,7 +27,7 @@ def scalar_qparams(node, initializers):
     if len(node.input) < 2 or node.input[1] not in initializers:
         raise ValueError(f"QDQ requires constant scale: {node.name}")
     scale = np.asarray(initializers[node.input[1]])
-    zero = (np.asarray(initializers[node.input[2]]) if len(node.input) > 2
+    zero = (np.asarray(initializers[node.input[2]]) if len(node.input) > 2 and node.input[2]
             else np.array(0, np.uint8))
     if scale.dtype != np.float32 or scale.size != 1 or zero.size != 1:
         raise ValueError(f"strict QDQ import currently requires scalar FP32 scale: {node.name}")
@@ -38,6 +38,37 @@ def scalar_qparams(node, initializers):
         raise ValueError(f"invalid QDQ scale: {node.name}")
     offset = 128 if zero.dtype == np.int8 else 0
     return value, int(zero.reshape(-1)[0]) + offset, offset
+
+
+def weight_qparams(node, initializers):
+    """Read constant weight Q/DQ, retaining the ONNX per-channel axis."""
+    if len(node.input) < 2 or node.input[1] not in initializers:
+        raise ValueError(f"QDQ requires constant weight scale: {node.name}")
+    codes = np.asarray(initializers[node.input[0]])
+    if codes.dtype not in (np.dtype('uint8'), np.dtype('int8')):
+        raise ValueError("unsupported QDQ weight dtype: " + node.name)
+    scale = np.asarray(initializers[node.input[1]])
+    zero = (np.asarray(initializers[node.input[2]]) if len(node.input) > 2 and node.input[2]
+            else np.zeros(scale.shape, codes.dtype))
+    if zero.dtype != codes.dtype:
+        raise ValueError("weight zero-point dtype differs from integer weights: " + node.name)
+    if scale.size == 1 and zero.size == 1:
+        value = float(scale.reshape(-1)[0])
+        if scale.dtype != np.float32 or not np.isfinite(value) or value <= 0:
+            raise ValueError("weight QDQ requires positive FP32 scale: " + node.name)
+        offset = 128 if codes.dtype == np.int8 else 0
+        return value, int(zero.reshape(-1)[0]) + offset, offset, None
+    if (scale.dtype != np.float32 or scale.ndim != 1 or not scale.size
+            or zero.shape != scale.shape or not np.isfinite(scale).all() or np.any(scale <= 0)):
+        raise ValueError("per-channel weight QDQ requires positive FP32 scale and matching zero-point vectors: " + node.name)
+    axis = next((int(attr.i) for attr in node.attribute if attr.name == 'axis'), 1)
+    if not -codes.ndim <= axis < codes.ndim:
+        raise ValueError("per-channel weight axis is out of range: " + node.name)
+    axis %= codes.ndim
+    if scale.size != codes.shape[axis]:
+        raise ValueError("per-channel weight scale count differs from the axis dimension: " + node.name)
+    offset = 128 if codes.dtype == np.int8 else 0
+    return scale.copy(), zero.astype(np.int32) + offset, offset, axis
 
 
 def import_qdq(path, name, input_shapes=None, mean=None, std=None, input_quantization=None):
@@ -75,16 +106,21 @@ def import_qdq(path, name, input_shapes=None, mean=None, std=None, input_quantiz
     for node in original.graph.node:
         if node.op_type not in ('QuantizeLinear', 'DequantizeLinear'):
             continue
-        scale, zero, offset = scalar_qparams(node, initializers)
         if node.op_type == 'DequantizeLinear' and node.input[0] in initializers:
             codes = initializers[node.input[0]]
-            if codes.dtype not in (np.dtype('uint8'), np.dtype('int8')):
-                raise ValueError("unsupported QDQ weight dtype: " + node.name)
+            scale, zero, offset, axis = weight_qparams(node, initializers)
             physical = (codes.astype(np.int16) + offset).astype(np.uint8)
-            value = (physical.astype(np.float32) - np.float32(zero)) * np.float32(scale)
-            quantized_weights[node.output[0]] = (physical, scale, zero)
+            broadcast = [1] * codes.ndim
+            if axis is not None:
+                broadcast[axis] = len(scale)
+            value = ((physical.astype(np.float32) - np.asarray(zero, np.float32).reshape(broadcast))
+                     * np.asarray(scale, np.float32).reshape(broadcast))
+            quantized_weights[node.output[0]] = (physical, scale, zero, axis)
             prepared.graph.initializer.append(numpy_helper.from_array(value, node.output[0]))
             constant_dq.add(node.output[0])
+        else:
+            # Activation quantization remains per-tensor, independently of weights.
+            scalar_qparams(node, initializers)
     kept = [node for node in prepared.graph.node if node.output[0] not in constant_dq]
     del prepared.graph.node[:]
     prepared.graph.node.extend(kept)
@@ -155,6 +191,8 @@ def import_qdq(path, name, input_shapes=None, mean=None, std=None, input_quantiz
         output = conv.output[0]
         view = integer_view(conv.input[0])
         if view is not None and conv.input[1] in quantized_weights:
+            if quantized_weights[conv.input[1]][3] not in (None, 0):
+                raise ValueError('native integer Conv requires per-output-channel weight axis 0: ' + conv.name)
             region = conv_regions.get(output)
             integer_convs[output] = region
             dependencies[output] = integer_dependencies(conv.input[0]) + list(conv.input[1:])
@@ -290,17 +328,31 @@ def import_qdq(path, name, input_shapes=None, mean=None, std=None, input_quantiz
 
     def integer_weight(node, index):
         weight_name = node.inputs[1]
-        codes, scale, zero = quantized_weights[weight_name]
+        codes, scale, zero, axis = quantized_weights[weight_name]
         codes = np.ascontiguousarray(codes)
+        scales = np.asarray(scale, np.float32).reshape(-1)
+        zeros = np.asarray(zero, np.float32).reshape(-1)
         private_name = f'__onnx_integer_weight_{index}'
         if not context.RegisterQuantizedParamToContext(private_name, codes,
-                [(255-zero)*scale], [-zero*scale]):
+                ((np.float32(255)-zeros)*scales).tolist(), (-zeros*scales).tolist()):
             raise RuntimeError('could not register integer weight: ' + weight_name)
-        if not context.SetQuantization(private_name, scale, zero):
+        # Parameter tensors serialize per-channel ranges, separately from the
+        # activation q-info registry. The SDK rejects vector SetQuantization
+        # for parameters; read back the registered metadata instead.
+        if axis is None and not context.SetQuantization(private_name, scale, zero):
             raise RuntimeError('could not preserve weight qparams: ' + weight_name)
+        actual = context.GetParam(private_name)
+        actual_scales = np.asarray(actual.qscale, np.float32)
+        actual_zeros = np.asarray(actual.qzeropoint)
+        if (not np.allclose(actual_scales, scales, rtol=2e-7, atol=0)
+                or not np.all(actual_zeros == np.asarray(zero))):
+            raise RuntimeError('SDK changed per-channel weight qparams: ' + weight_name)
         report['integer_weights'].append({'onnx': weight_name, 'sdk': private_name,
-                                         'scale': scale, 'source_scale': scale,
-                                         'zero_point': zero,
+                                         'scale': actual_scales.tolist() if axis is not None else scale,
+                                         'source_scale': scales.tolist() if axis is not None else scale,
+                                         'zero_point': np.asarray(zero).tolist(),
+                                         'axis': axis,
+                                         'granularity': 'per_channel' if axis is not None else 'per_tensor',
                                          'shape': list(codes.shape),
                                          'codes_sha256': hashlib.sha256(codes.tobytes()).hexdigest()})
         return context.GetParamSymbol(private_name)

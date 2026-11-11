@@ -16,7 +16,7 @@ def MergeBatchNormOnnx(Model: TFConvertor):
     remove_names = []
 
     for node in nodes:
-        if node.op not in ("Conv", "ConvTranspose", "MatMul") or not node.outputs:
+        if node.op not in ("Conv", "ConvTranspose", "MatMul", "Gemm") or not node.outputs:
             continue
         users = consumers.get(node.outputs[0], [])
         if len(users) != 1 or users[0].op != "BatchNormalization":
@@ -25,8 +25,23 @@ def MergeBatchNormOnnx(Model: TFConvertor):
         if len(node.inputs) < 2 or node.inputs[1] not in Model.params:
             continue
 
+        if node.op == "Gemm":
+            # GemmParser only implements the default Y = X @ W^T + C layout;
+            # transA/transB with any other value is not converted either.
+            if node.attr.get("transB", 0) != 1 or node.attr.get("transA", 0) != 0:
+                continue
+            alpha = float(node.attr.get("alpha", 1.0))
+            beta = float(node.attr.get("beta", 1.0))
+        else:
+            alpha = beta = 1.0
+
         weight = Model.params[node.inputs[1]]
         old_bias = Model.params[node.inputs[2]] if len(node.inputs) >= 3 and node.inputs[2] in Model.params else None
+        if node.op == "Gemm":
+            # fold Gemm's alpha/beta into the BN-normalized parameters
+            weight = alpha * weight
+            if old_bias is not None:
+                old_bias = beta * old_bias
         eps = batchnorm.attr["epsilon"]
         scale = Model.params[batchnorm.inputs[1]]
         bias = Model.params[batchnorm.inputs[2]]
