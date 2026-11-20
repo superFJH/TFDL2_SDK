@@ -29,7 +29,8 @@ def npu_jit_cache_dir(cache_dir, manifest):
 
 def main(profile_build=False):
     parser = argparse.ArgumentParser(prog="tfllm_profile" if profile_build else "tfllm", description="Native TFLLM NPU prefill with llama.cpp CPU decode")
-    parser.add_argument("command", choices=["serve", "chat", "transcribe"])
+    parser.add_argument("command", choices=["serve", "chat", "transcribe", "speak"])
+    parser.add_argument("--task", choices=["auto", "tts"], default="auto", help="Select Breeze synthesis for serve; speak selects it automatically")
     parser.add_argument("model", help="Transformers directory, GGUF file/directory, prepared cache directory, or repository ID")
     parser.add_argument("--model-source", choices=["huggingface", "modelscope"])
     parser.add_argument("--revision")
@@ -39,6 +40,33 @@ def main(profile_build=False):
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
     parser.add_argument("--mmproj", default="auto", help="Vision/audio GGUF; auto discovers/converts it")
     parser.add_argument("--audio", type=Path, help="Local audio file for transcribe (WAV/FLAC/MP3/OGG)")
+    parser.add_argument("--text", help="Text for speak")
+    parser.add_argument("--instruction", help="Breeze voice/delivery description")
+    parser.add_argument("--output", type=Path, help="Output WAV for speak")
+    parser.add_argument("--ref-audio", type=Path, help="Reference WAV for Breeze voice cloning")
+    parser.add_argument("--ref-text", help="Exact reference-audio transcript")
+    parser.add_argument("--cfg-scale", type=float, default=1.0)
+    parser.add_argument("--chunk-first", type=int, default=1)
+    parser.add_argument("--chunk-max", type=int, default=25)
+    parser.add_argument("--npu-stages", default="te,bb", help="Breeze accelerated Linear stages: te,bb,dd,codec; default te,bb")
+    parser.add_argument("--tts-quantization", choices=["q4_0", "q8_0", "f16", "f32"], default="q8_0", help="Breeze HF export precision; existing GGUF is preserved")
+    parser.add_argument("--tts-vocoder-threads", type=int, help="Breeze vocoder CPU threads; default follows --threads")
+    parser.add_argument("--tts-text-threads", type=int, help="Breeze text encoder CPU threads; default follows --threads")
+    parser.add_argument("--tts-backbone-threads", type=int, help="Breeze backbone CPU threads; default follows --threads")
+    parser.add_argument("--tts-depth-threads", type=int, help="Breeze depth decoder CPU threads; default follows --threads")
+    parser.add_argument("--tts-lookahead", type=int, choices=[0,1,2,4], default=0, help="Breeze sentence batch size; 0 keeps the original sequential generation")
+    parser.add_argument("--tts-segment-chars", type=int, default=120, help="Breeze lookahead text budget; CJK characters count as 3")
+    parser.add_argument("--tts-first-segment-chars", type=int, default=60, help="Breeze first sentence budget for the shared voice reference")
+    parser.add_argument("--tts-startup-buffer-ms", type=int, default=0, help="Breeze initial audio buffer in milliseconds (0..10000); generation continues while it fills")
+    parser.add_argument("--tts-backbone-repack", choices=["on","off"], default="off", help="Pack CPU-only Breeze backbone weights for ARM matrix kernels")
+    parser.add_argument("--tts-vocoder-fusion", choices=["on","off"], default="off", help="Fuse CPU Breeze SnakeBeta activations")
+    parser.add_argument("--tts-dialogue", action="store_true", help="Overlap CPU speech-code generation and vocoder; requires zero startup buffer and lookahead=0")
+    parser.add_argument("--tts-pipeline-frames", type=int, choices=[1,2,4], default=2, help="Dialogue packet size in 80 ms frames")
+    parser.add_argument("--tts-cpu-repack", choices=["auto", "on", "off"], default="auto", help="Breeze DD Q4/Q8 CPU layout; auto enables below 16 threads on supported ARM CPUs")
+    parser.add_argument("--tts-projection-fusion", choices=["on", "off"], default="on", help="Combine Breeze QKV and gate/up NPU projections")
+    parser.add_argument("--tts-backbone-decode", choices=["npu", "cpu"], default="npu", help="Breeze backbone decode route; CPU retains GGUF weights while NPU handles prefill")
+    parser.add_argument("--depth-quantization", choices=["preserve", "q4_0", "q8_0", "f16", "f32"], default="preserve", help="Breeze HF depth precision override; sensitive F32 tensors remain F32")
+    parser.add_argument("--backbone-quantization", choices=["preserve", "q4_0", "q8_0", "f16", "f32"], default="preserve", help="Breeze HF backbone precision override; sensitive F32 tensors remain F32")
     parser.add_argument("--language", help="Transcription language (e.g. zh, en, Chinese); omitted means auto detection")
     parser.add_argument("--response-format", choices=["text", "json", "verbose_json"], default="text")
     parser.add_argument("--max-audio-seconds", type=int, default=120, help="Maximum audio duration per request (1..120)")
@@ -78,6 +106,11 @@ def main(profile_build=False):
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, interrupt)
     try:
+        from . import tts
+        if args.command == "speak" or args.task == "tts" or tts.is_local_breeze(args.model):
+            return tts.run(args, profile_build)
+        if args.text or args.instruction or args.output or args.ref_audio or args.ref_text:
+            raise ValueError("--text/--instruction/--output/--ref-audio/--ref-text require Breeze speak or serve --task tts")
         if not 1 <= args.max_audio_seconds <= 120:
             raise ValueError("--max-audio-seconds must be in 1..120")
         if args.command == "transcribe":

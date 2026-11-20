@@ -59,6 +59,9 @@ class NodeConvertor(object):
 
 def preprocess(img,inputsize,dtype:np.dtype):
     img = cv2.resize(img,inputsize)
+    if img.ndim == 2:
+        # grayscale (single channel) models: cv2 returns HxW, add the channel axis
+        img = img[:, :, None]
     img = img.transpose(2, 0, 1)
     img = img[np.newaxis,:]
     img = img.astype(dtype)

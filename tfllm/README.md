@@ -1,5 +1,7 @@
 # TFLLM
 
+Breeze-TTS-2 的 Q8 GGUF / 原始 HF 导入、`speak`、语音 HTTP 接口和分阶段 NPU Linear 接入见 [语音合成](TTS.md)。
+
 MiniCPM-V 4.7 35B-A3B 的原生 MoE、视觉压缩、canvas MRoPE 与 CPU decode 接力见 [MiniCPM-V 4.7](MINICPM_V47.md)。
 
 SAM/SAM2/SAM3/EfficientTAM 与 Depth Anything V1/V2/V3 的 Python 模型加载、图像/视频/多视图入口、

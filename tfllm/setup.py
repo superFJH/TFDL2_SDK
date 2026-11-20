@@ -18,7 +18,7 @@ from setuptools.command.sdist import sdist as _sdist
 HERE = Path(__file__).resolve().parent
 SDK = HERE.parent
 SDK_SUBDIRS = ("bin", "lib", "include", "schema", "llama", "share")
-SDK_FILES = ("README.md", "MINICPM_V47.md", "TORCH.md", "VISION.md", "PIP.md", "OCR.md", "ASR.md", "ASR_QUANTIZATION.md")
+SDK_FILES = ("README.md", "MINICPM_V47.md", "TORCH.md", "VISION.md", "PIP.md", "OCR.md", "ASR.md", "ASR_QUANTIZATION.md", "TTS.md")
 DRIVERS = ("libNPU40T.so", "libNPU40T.dylib")
 PYTHON_TREE = HERE / "share" / "tfllm" / "python"
 
@@ -117,7 +117,8 @@ setup(
     extras_require={"torch": ["torch>=2.4", "safetensors>=0.4"],
                     "vision": ["torch>=2.4", "torchvision", "numpy>=1.26,<2", "pillow>=10",
                                "transformers>=5.19,<6", "opencv-python-headless>=4.8,<4.12"],
-                    "audio": ["numpy>=1.26,<3", "soundfile>=0.13,<1", "scipy>=1.11,<2"]},
+                    "audio": ["numpy>=1.26,<3", "soundfile>=0.13,<1", "scipy>=1.11,<2"],
+                    "tts": ["numpy>=1.26,<3", "pyyaml>=6", "tqdm>=4.27", "huggingface-hub>=0.24,<2"]},
     python_requires=">=3.9",
     include_package_data=False,
     zip_safe=False,
